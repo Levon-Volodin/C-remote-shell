@@ -37,7 +37,17 @@
 #define SECRET_KEY_LEN   32         /* decoded binary length (not file size)  */
 
 /* ── Response buffer sizes ───────────────────────────────────────────────── */
-#define SHELL_LINE_BUF    1024      /* single fgets() line from _popen        */
-#define SHELL_RESP_BUF   18384      /* accumulated command output             */
+#define SHELL_LINE_BUF    4096      /* single fgets() line from _popen        */
+#define SHELL_RESP_BUF   65536      /* accumulated command output (64 KB)     */
+
+/* ── Inject / migrate limits ─────────────────────────────────────────────── */
+/* Maximum shellcode size accepted by the "inject" verb (32 KB).
+ * Larger payloads must be staged: inject a small stager that pulls the
+ * full payload over a second channel.                                        */
+#define INJECT_MAX_SHELLCODE  (32 * 1024)
+
+/* Maximum number of processes listed by "ps" before output is truncated.
+ * Prevents a 10 MB response if something very unusual is running.           */
+#define PS_MAX_PROCS          512
 
 #endif /* CLIENT_CONFIG_H */
