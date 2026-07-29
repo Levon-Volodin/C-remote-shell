@@ -67,7 +67,7 @@ CLIENT_SRCS := client/main.c   \
                client/shell.c   \
                tls/tls_client.c
 
-# Legacy single-file build (Source.c + root-level tls_client.c)
+# Legacy single-file build (Source.c + shared tls/tls_client.c)
 LEGACY_SRCS := Source.c tls/tls_client.c
 
 # Refactored POSIX server (server/main.c + server/server.c + server/prompt.c)
@@ -145,13 +145,21 @@ endif
 # These targets are compiler-agnostic and always use the system gcc.
 # They are intentionally NOT part of the default `all` target because they
 # produce Linux ELFs, not Windows EXEs.
+#
+# Override the listen port via:
+#   make server-posix LISTEN_PORT=4444
+
+LISTEN_PORT ?= 50005
+
+POSIX_CFLAGS := -O2 -Wall -Wextra -Werror=implicit-function-declaration \
+                -DLISTEN_PORT=$(LISTEN_PORT)
 
 server-posix:
-	gcc -O2 -Wall $(SERVER_REFACTORED_SRCS) -o serverShell_refactored
+	gcc $(POSIX_CFLAGS) $(SERVER_REFACTORED_SRCS) -o serverShell_refactored
 	@echo "[+] Refactored server built: serverShell_refactored"
 
 server-posix-legacy:
-	gcc -O2 -Wall $(SERVER_LEGACY_SRCS) -o serverShell_legacy
+	gcc $(POSIX_CFLAGS) $(SERVER_LEGACY_SRCS) -o serverShell_legacy
 	@echo "[+] Legacy server built: serverShell_legacy"
 
 # ---------------------------------------------------------------------------

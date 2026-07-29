@@ -11,7 +11,10 @@
 #include <netinet/in.h>
 
 /* ── Listen address / port ───────────────────────────────────────────────── */
-#define LISTEN_PORT   50005       /* must match C2_PORT in client/config.h    */
+/* May be overridden at compile time: gcc -DLISTEN_PORT=4444 ...              */
+#ifndef LISTEN_PORT
+#  define LISTEN_PORT   50005     /* must match C2_PORT in client/config.h    */
+#endif
 #define LISTEN_ADDR   INADDR_ANY  /* 0.0.0.0 – accept on all interfaces       */
 
 /* ── I/O buffer sizes ────────────────────────────────────────────────────── */

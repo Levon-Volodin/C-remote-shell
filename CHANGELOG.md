@@ -44,10 +44,9 @@ Megaploit C2 server defined in `megaploit/server/listener.py`,
 C-remote-shell/
 ├── definitions.h   ← Windows platform guard + globals (sPort, sIP, wData)
 ├── Source.c        ← everything: WinMain, shell loop, NT calls, key loader
-├── serverShell.c   ← everything: socket setup, accept, prompt loop
-├── tls_client.h    ← TLS API header (new, added in previous session)
-└── tls_client.c    ← TLS implementation (new, added in previous session)
+└── serverShell.c   ← everything: socket setup, accept, prompt loop
 ```
+*(The root-level `tls_client.h` / `tls_client.c` existed briefly here before being moved into `tls/` and deleted.)*
 
 ### After (split by responsibility)
 
@@ -618,9 +617,9 @@ will compile the client. If any required signal is missing, the build is
 aborted with a full report.
 
 ```
-[+] AEAD-only cipher suite enforcement  (tls_client.c, tls/tls_client.c)
-[+] BCrypt HMAC flag                    (tls_client.c, tls/tls_client.c)
-[+] v2 protocol magic byte (0x4d)       (tls_client.c, Source.c)
+[+] AEAD-only cipher suite enforcement  (tls/tls_client.c)
+[+] BCrypt HMAC flag                    (tls/tls_client.c)
+[+] v2 protocol magic byte (0x4d)       (tls/tls_client.c, Source.c)
 ...
 Summary: 33/33 required signals found  (46/46 total)
 Verdict: [+] COMPLIANT

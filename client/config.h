@@ -20,12 +20,21 @@
 #define RECONNECT_DELAY_SEC   10
 
 /* ── Shared secret key ───────────────────────────────────────────────────── */
-/* Path to the 32-byte raw binary key file used for HMAC-SHA256 auth.
+/* Path to the key file used for HMAC-SHA256 auth.
+ *
+ * BUG (comment-only): the previous comment said to write os.urandom(32) raw
+ * bytes.  That is WRONG.  load_secret_key() reads 64 ASCII hex characters
+ * and hex-decodes them to 32 bytes — the same format megaploit.core.crypto
+ * produces via binascii.hexlify(os.urandom(32)).
+ *
  * Generate with:
- *   python -c "import os; open('secret.key','wb').write(os.urandom(32))"
- * The same key must be loaded by the Megaploit server.                       */
+ *   python -c "import os,binascii; \
+ *       open('secret.key','wb').write(binascii.hexlify(os.urandom(32)))"
+ *
+ * The resulting file contains exactly 64 ASCII hex chars (no newline needed).
+ * The same hex file must be loaded by the Megaploit server.                  */
 #define SECRET_KEY_PATH  "secret.key"
-#define SECRET_KEY_LEN   32         /* bytes — must match server expectation  */
+#define SECRET_KEY_LEN   32         /* decoded binary length (not file size)  */
 
 /* ── Response buffer sizes ───────────────────────────────────────────────── */
 #define SHELL_LINE_BUF    1024      /* single fgets() line from _popen        */

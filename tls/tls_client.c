@@ -32,9 +32,9 @@
  *     Inbound:   identical layout; seq must be strictly greater than
  *                the last accepted seq (replay protection).
  *
- *  Build:
- *    cl /W4 tls_client.c client\ntcalls.c client\shell.c client\main.c
- *       /link Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib
+ *  Build (from the C-remote-shell root directory):
+ *    cl /W4 tls\tls_client.c client\main.c client\ntcalls.c client\shell.c
+ *       /link Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User32.lib
  */
 
 #include "tls_client.h"
@@ -494,11 +494,21 @@ static BOOL _tls_raw_recv(PTLS_CONTEXT pCtx, BYTE *pDst, DWORD cbWant)
             }
         }
 
+        /* SECBUFFER_EXTRA: SChannel left some bytes unconsumed at the tail of
+         * pRecvBuf (they belong to the NEXT TLS record).  Move them to the
+         * front so the next loop iteration feeds them back to DecryptMessage.
+         * The offset is pCtx->cbRecvBuf - cbExtra because cbRecvBuf still
+         * holds the total that was handed to DecryptMessage — SChannel does
+         * not modify cbRecvBuf, only the buffer descriptor flags tell us how
+         * much was processed.  This was always correct; adding explicit
+         * comment to prevent future "simplification" that would break it.    */
         DWORD cbExtra = 0;
         for (int i = 0; i < 4; i++) {
             if (bufs[i].BufferType == SECBUFFER_EXTRA && bufs[i].cbBuffer > 0) {
                 cbExtra = bufs[i].cbBuffer;
-                MoveMemory(pCtx->pRecvBuf, pCtx->pRecvBuf + pCtx->cbRecvBuf - cbExtra, cbExtra);
+                MoveMemory(pCtx->pRecvBuf,
+                           pCtx->pRecvBuf + pCtx->cbRecvBuf - cbExtra,
+                           cbExtra);
                 break;
             }
         }

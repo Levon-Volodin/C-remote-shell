@@ -51,8 +51,41 @@
 #include <arpa/inet.h>
 
 /* ── Configuration ─────────────────────────────────────────────────────── */
-#define LISTEN_PORT  50005
+/* May be overridden at compile time: gcc -DLISTEN_PORT=4444 ...             */
+#ifndef LISTEN_PORT
+#  define LISTEN_PORT  50005
+#endif
 #define LISTEN_ADDR  INADDR_ANY   /* listen on all interfaces */
+
+/* ── recv_full ──────────────────────────────────────────────────────────── */
+/* BUG: the original code called recv() once and printed whatever arrived.
+ * TCP is a stream protocol — a response may span multiple recv() calls.
+ * recv_full() reads with a 200 ms SO_RCVTIMEO and loops until the socket
+ * goes quiet, collecting all data for one command response.                 */
+static ssize_t recv_full(int fd, char *buf, size_t bufsz)
+{
+    struct timeval tv;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 200 * 1000;   /* 200 ms */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    size_t total = 0;
+    while (total < bufsz - 1) {
+        ssize_t n = recv(fd, buf + total, bufsz - 1 - total, 0);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n == 0) {
+            if (total == 0) { tv.tv_sec = tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); return -1; }
+            break;
+        } else {
+            break;  /* EAGAIN / EWOULDBLOCK — no more data yet */
+        }
+    }
+
+    tv.tv_sec = tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return (ssize_t)total;
+}
 
 int main(void)
 {
@@ -143,11 +176,9 @@ int main(void)
         }
         else {
             /* General command — wait for and print the response */
-            /* FIX: MSG_WAITALL blocks until sizeof(cResp)-1 bytes arrive —
-             * a 50-byte shell response would make this hang forever.
-             * Use plain recv() which returns on first available data.     */
-            ssize_t nRecv = recv(iSock_Client, cResp, sizeof(cResp) - 1, 0);
-            if (nRecv <= 0) {                  /* FIX 10 */
+            /* BUG: plain recv() was used — replaced with recv_full()     */
+            ssize_t nRecv = recv_full(iSock_Client, cResp, sizeof(cResp));
+            if (nRecv <= 0) {
                 if (nRecv < 0) perror("recv");
                 break;
             }

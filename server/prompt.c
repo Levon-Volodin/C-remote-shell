@@ -24,6 +24,21 @@
  *  FIX 5: Unreachable jmp: label removed (was never jumped to).
  *
  *  FIX 6: Unused variable `n` removed.
+ *
+ *  BUG 7: Single recv() call races against TCP fragmentation.  TCP is a
+ *          stream protocol — a single logical response may arrive in multiple
+ *          recv() calls, or multiple responses may be coalesced into one.
+ *          The legacy plain-socket server has no length framing, so the
+ *          safest heuristic for interactive use is: read in a tight loop
+ *          with a short SO_RCVTIMEO timeout and stop when the socket goes
+ *          quiet.  This is not a perfect protocol but it matches what
+ *          the client sends (one _popen output per command) for interactive
+ *          one-liner shells.
+ *
+ *          For production use the server should implement the same
+ *          uint32-BE length framing as the TLS layer (see tls_client.c).
+ *          The legacy serverShell.c/server/ pair intentionally omit TLS
+ *          and are kept for development/testing only.
  */
 
 #include "prompt.h"
@@ -33,6 +48,40 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+
+/* Helper: read the full response from the client into buf[0..RESP_BUF_SIZE-1].
+ * Returns the total number of bytes received, or -1 on hard error.
+ * Uses a 200 ms receive timeout to detect end-of-response.                   */
+static ssize_t recv_full(int fd, char *buf, size_t bufsz)
+{
+    /* Set a short receive timeout so we stop blocking when the client has
+     * finished sending its response for this command.                         */
+    struct timeval tv;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 200 * 1000;  /* 200 ms */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    size_t total = 0;
+    while (total < bufsz - 1) {
+        ssize_t n = recv(fd, buf + total, bufsz - 1 - total, 0);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n == 0) {
+            /* Peer closed connection */
+            if (total == 0) return -1;
+            break;
+        } else {
+            /* EAGAIN / EWOULDBLOCK from the timeout — no more data */
+            break;
+        }
+    }
+
+    /* Remove the timeout so future write() calls are not affected */
+    tv.tv_sec = tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    return (ssize_t)total;
+}
 
 void run_prompt_loop(int clientFd, const struct sockaddr_in *clientAddr)
 {
@@ -66,8 +115,7 @@ void run_prompt_loop(int clientFd, const struct sockaddr_in *clientAddr)
          * must NOT call recv() — the client exits without sending anything.
          * ─────────────────────────────────────────────────────────────── */
 
-        /* FIX: strncmp("q",buffer,1) matches any command starting with 'q'.
-         * "q" is exactly one character; require cmdLen == 1.              */
+        /* "q" is exactly one character; require cmdLen == 1.              */
         if (cmdLen == 1 && buffer[0] == 'q') {
             /* Clean disconnect — client will close */
             break;
@@ -81,13 +129,9 @@ void run_prompt_loop(int clientFd, const struct sockaddr_in *clientAddr)
             break;
         }
         else {
-            /* General command — read and print the response */
-            /* FIX: do NOT use MSG_WAITALL — it blocks until the buffer is
-             * completely full (18382 bytes).  A normal response is much
-             * shorter; MSG_WAITALL would hang forever.  Use a plain recv()
-             * which returns as soon as any data is available.              */
-            ssize_t nRecv = recv(clientFd, cResp, sizeof(cResp) - 1, 0);
-            if (nRecv <= 0) { /* FIX 4 */
+            /* BUG 7: use recv_full() instead of a bare recv() */
+            ssize_t nRecv = recv_full(clientFd, cResp, sizeof(cResp));
+            if (nRecv <= 0) {
                 if (nRecv < 0) perror("recv");
                 break;
             }
