@@ -1,0 +1,65 @@
+# .github/workflows/notify-parent.yml
+#
+# Notify the Megaploit parent repo to update its submodule pointer
+# whenever this (C-remote-shell) repo pushes to main.
+#
+# How it works
+# ------------
+# After a successful push to main, this workflow fires a
+# repository_dispatch event on the Megaploit repo.  The Megaploit repo's
+# update-submodule.yml workflow receives that event and bumps the
+# C-remote-shell submodule pointer to the new HEAD commit.
+#
+# Setup required (one-time)
+# -------------------------
+# 1.  Generate a Personal Access Token (PAT) with scope  repo
+#     (classic PAT) or, for fine-grained PAT:
+#       - Repository: Josefifir/Megaploit
+#       - Permissions: Contents → Read and write
+#
+# 2.  In C-remote-shell repo → Settings → Secrets and variables → Actions:
+#     Create a secret named  PAT_MEGAPLOIT  and paste the PAT value.
+#
+# That's all — every push to C-remote-shell/main will automatically
+# update the submodule pointer in Megaploit within a few seconds.
+
+name: Notify Megaploit of new commit
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  notify:
+    name: Trigger submodule update in Megaploit
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Dispatch a repository_dispatch event to Megaploit ────────────────
+      - name: Send repository_dispatch to Megaploit
+        uses: actions/github-script@v7
+        with:
+          # Use the PAT stored in C-remote-shell's secrets.
+          # This token must have write access to Josefifir/Megaploit.
+          github-token: ${{ secrets.PAT_MEGAPLOIT }}
+          script: |
+            const newCommit = context.sha.slice(0, 7);
+            const refName   = context.ref.replace('refs/heads/', '');
+
+            await github.rest.repos.createDispatchEvent({
+              owner: 'Josefifir',
+              repo:  'Megaploit',
+              event_type: 'c-remote-shell-updated',
+              client_payload: {
+                commit:  context.sha,
+                short:   newCommit,
+                ref:     refName,
+                message: `New commit ${newCommit} on ${context.repo.repo}/${refName}`
+              }
+            });
+
+            core.info(
+              `[+] Dispatched c-remote-shell-updated to Josefifir/Megaploit ` +
+              `(commit ${newCommit} on ${refName})`
+            );
