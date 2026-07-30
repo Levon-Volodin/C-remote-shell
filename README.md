@@ -4,6 +4,8 @@
 > All traffic is protected by four stacked security layers that exactly mirror the Megaploit listener protocol.  
 > Compiled to a **single EXE** with no runtime dependencies — just copy and run.
 
+> **This is an active Work In Progress**. We recently decided to revive this codebase, it will take a while to get all the bugs ironed out and all units working properly.
+
 ---
 
 ## Table of Contents
