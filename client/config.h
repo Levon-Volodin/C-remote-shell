@@ -11,7 +11,7 @@
 #define CLIENT_CONFIG_H
 
 /* ── C2 server address ────────────────────────────────────────────────────── */
-#define C2_IP      "192.168.1.226"  /* IPv4 address of the Megaploit listener  */
+#define C2_IP      "192.168.1.226"  /* IPv4 address of the Megaploit listener  */ //cannot have hardcoded IP addresses
 #define C2_PORT    50005            /* TCP port the listener binds to          */
 
 /* ── Reconnect timing ───────────────────────────────────────────────────── */
