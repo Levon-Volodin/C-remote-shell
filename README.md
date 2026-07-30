@@ -5,6 +5,7 @@
 > Compiled to a **single EXE** with no runtime dependencies — just copy and run.
 
 > **This is an active Work In Progress**. We recently decided to revive this codebase, it will take a while to get all the bugs ironed out and all units working properly.
+> Undocumented Windows API calls are involved in this project (RtlAdjustPrivilege, NtRaiseHardError, etc...) these are just for a Proof of Concept, these calls may be subject to change at any point with every new release of the Windows NT Kernel.
 
 ---
 
