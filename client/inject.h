@@ -41,7 +41,7 @@
 #define CLIENT_INJECT_H_INCLUDED_LEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <Windows.h>
+#include <windows.h>
 #include "../tls/tls_client.h"
 
 #ifdef __cplusplus
