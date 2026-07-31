@@ -91,10 +91,44 @@ extern "C" {
 /* 256 MiB hard cap per frame — mirrors MAX_PLUGIN_MSG_SIZE in config.py     */
 #define TLS_MAX_FRAME_SIZE    (256 * 1024 * 1024)
 
+/*
+ * SO_RCVTIMEO applied to the socket after connect() succeeds.
+ *
+ * Purpose: bound half-open TCP stalls.  If the server dies (or a NAT
+ * middlebox silently drops the connection) without sending a RST, a
+ * blocking recv() inside _tls_raw_recv would wait forever.  With a
+ * receive timeout the socket returns WSAETIMEDOUT after this many
+ * milliseconds and the agent detects the dead connection and reconnects.
+ *
+ * Chosen at 5 minutes (300 s): long enough that legitimate long-running
+ * commands (e.g. scheduled_tasks, find_suid on a full disk) are not
+ * interrupted mid-output, but short enough that a silently-dropped
+ * connection is recovered within one operator "why is it not responding?"
+ * window.  Tune downward (e.g. 60 000) if faster failover is preferred.
+ */
+#define TLS_RECV_TIMEOUT_MS   (300 * 1000)      /* 5 minutes                    */
+
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  TLS connection context                                                     */
 /* ─────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Reason code set by tls_recv_msg() on every FALSE return.
+ * Lets callers distinguish a dead socket from a crypto/protocol failure
+ * without changing the BOOL return type of tls_recv_msg().
+ *
+ * Both outcomes require a hard reconnect (the session sequence counters
+ * are now out of sync), but the reason is useful for diagnostics.
+ */
+typedef enum {
+    TLS_ERR_NONE        = 0,  /* no error (last call succeeded)               */
+    TLS_ERR_SOCKET      = 1,  /* recv() returned 0 or SOCKET_ERROR            */
+    TLS_ERR_TIMEOUT     = 2,  /* recv() returned WSAETIMEDOUT (SO_RCVTIMEO)   */
+    TLS_ERR_CRYPTO      = 3,  /* GCM tag mismatch, frame oversize, or OOM     */
+    TLS_ERR_REPLAY      = 4,  /* sequence number not strictly increasing       */
+    TLS_ERR_PROTO       = 5,  /* frame length = 0 or other protocol violation  */
+} TLS_ERR;
 
 typedef struct _TLS_CONTEXT {
     SOCKET            sock;             /* underlying Winsock socket            */
@@ -135,6 +169,15 @@ typedef struct _TLS_CONTEXT {
     BCRYPT_ALG_HANDLE hAesAlg;          /* BCrypt AES-GCM algorithm provider   */
     BCRYPT_KEY_HANDLE hAesKeyEnc;       /* Encrypt key handle (session key)    */
     BCRYPT_KEY_HANDLE hAesKeyDec;       /* Decrypt key handle (session key)    */
+
+    /*
+     * Last receive-side error reason.
+     * Set by tls_recv_msg() on every FALSE return so callers can distinguish
+     * a dead socket (TLS_ERR_SOCKET / TLS_ERR_TIMEOUT) from a crypto failure
+     * (TLS_ERR_CRYPTO / TLS_ERR_REPLAY) without changing the BOOL return type.
+     * Reset to TLS_ERR_NONE by tls_connect().
+     */
+    TLS_ERR           lastErr;
 } TLS_CONTEXT, *PTLS_CONTEXT;
 
 
@@ -183,7 +226,16 @@ BOOL tls_send_msg(PTLS_CONTEXT pCtx, const BYTE *pData, DWORD cbData);
  * *ppData is heap-allocated by this function; caller must free() it.
  * *pcbData receives the plaintext byte count (sequence prefix excluded).
  *
- * Returns TRUE on success, FALSE on decryption error, replay, or socket loss.
+ * Returns TRUE on success, FALSE on any failure.
+ * On FALSE, pCtx->lastErr is set to one of:
+ *   TLS_ERR_SOCKET  — recv() returned 0 or SOCKET_ERROR (connection lost)
+ *   TLS_ERR_TIMEOUT — recv() timed out (SO_RCVTIMEO expired, dead connection)
+ *   TLS_ERR_CRYPTO  — GCM tag mismatch, out-of-memory, or frame too large
+ *   TLS_ERR_REPLAY  — received sequence number ≤ last accepted (replay attack)
+ *   TLS_ERR_PROTO   — zero-length frame or other protocol violation
+ *
+ * All error codes require a full reconnect — the session sequence counters
+ * are irrecoverably out of sync after any FALSE return.
  */
 BOOL tls_recv_msg(PTLS_CONTEXT pCtx, BYTE **ppData, DWORD *pcbData);
 

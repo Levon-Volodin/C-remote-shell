@@ -100,14 +100,25 @@ void _handle_os_info(TLS_CONTEXT *pTls)
         DWORD cbVal = sizeof(dwInstall);
         if (RegQueryValueExA(hKey, "InstallDate", NULL, NULL,
                              (LPBYTE)&dwInstall, &cbVal) == ERROR_SUCCESS) {
-            __int64 ft = ((__int64)dwInstall + 11644473600LL) * 10000000LL;
-            FILETIME ftFile;
-            ftFile.dwLowDateTime  = (DWORD)(ft & 0xFFFFFFFF);
-            ftFile.dwHighDateTime = (DWORD)(ft >> 32);
-            SYSTEMTIME st = {0};
-            FileTimeToSystemTime(&ftFile, &st);
-            _snprintf(installDate, sizeof(installDate) - 1,
-                "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+            /*
+             * dwInstall is a Unix epoch timestamp (seconds since 1970-01-01).
+             * Convert to FILETIME (100-nanosecond intervals since 1601-01-01):
+             *   ft = (unix_epoch + 11644473600) * 10000000
+             * Use LONGLONG (== __int64) for 64-bit arithmetic on all targets;
+             * guard against an obviously bogus value (0 or before 1970) before
+             * doing any arithmetic to avoid UB.
+             */
+            if (dwInstall > 0) {
+                LONGLONG ft = ((LONGLONG)(DWORD)dwInstall + 11644473600LL)
+                              * 10000000LL;
+                FILETIME ftFile;
+                ftFile.dwLowDateTime  = (DWORD)((ULONGLONG)ft & 0xFFFFFFFFUL);
+                ftFile.dwHighDateTime = (DWORD)((ULONGLONG)ft >> 32);
+                SYSTEMTIME st = {0};
+                if (FileTimeToSystemTime(&ftFile, &st))
+                    _snprintf(installDate, sizeof(installDate) - 1,
+                        "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+            }
         }
         RegCloseKey(hKey);
     }
@@ -293,12 +304,17 @@ void _handle_ps(TLS_CONTEXT *pTls)
                 arch = "?";
             }
 
+            /* Convert wide process name to narrow for the ASCII output buffer */
+            char exeName[MAX_PATH] = {0};
+            WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1,
+                                exeName, sizeof(exeName) - 1, NULL, NULL);
+
             char line[512];
             int lineLen = _snprintf(line, sizeof(line) - 1,
                 "  %-8lu %-8lu %-40s %-6s %s\n",
                 (unsigned long)pid,
                 (unsigned long)pe.th32ParentProcessID,
-                pe.szExeFile, arch, ownerBuf);
+                exeName, arch, ownerBuf);
 
             if (lineLen > 0) {
                 if ((size_t)(off + lineLen + 2) >= bufSize) {

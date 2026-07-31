@@ -16,8 +16,11 @@
  *      string that Process Hacker reads for its "Image" column.
  *
  *  unlink_self_from_ldr()
- *      Currently a no-op stub (LDR pointer arithmetic was unstable across
- *      Windows builds).  Kept as a hook for future implementation.
+ *      Removes the current module's LDR_DATA_TABLE_ENTRY from the three
+ *      PEB loader lists so in-process module scanners cannot find us.
+ *      Version-aware: on Windows 8+ (build >= 9200) only InLoadOrder and
+ *      InMemoryOrder are touched (InInitializationOrder is absent for EXEs
+ *      on those builds).  Silent no-op on any failure.
  */
 
 #pragma once

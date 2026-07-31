@@ -22,9 +22,17 @@
  *   6. Write g_key_path into the mapped image at the provided offset
  *   7. Create a new thread at (base + agentRunRva)
  *
- * Build: compiled with -fpic -O0 -nostdlib -fno-stack-protector
- *        The function must be the FIRST symbol in the .text section.
- *        Extract bytes: objcopy --only-section=.text -O binary loader.o loader.bin
+ * Build: compiled with -fpic -O0 -fno-stack-protector by tools/build_blob.py
+ *        or by the Makefile.  rfl_loader and rfl_loader_end are placed in
+ *        a dedicated COMDAT section ".text$rfl_loader" via the section
+ *        attribute below.  objcopy extracts ONLY that section, so the binary
+ *        is exactly the bytes between the function prologue and the sentinel.
+ *
+ * Portability:
+ *   - The attribute is GCC/Clang-only.  loader.c is NEVER compiled with MSVC.
+ *   - LOADER_CC in the Makefile is always set to a GCC/MinGW binary.
+ *   - The resulting blob is pure x64 machine code with no ABI dependencies.
+ *     It works on any x64 Windows target regardless of which machine built it.
  *
  * Constraints:
  *   - NO external calls except through the function pointers in RflData.
@@ -100,7 +108,12 @@ typedef struct { u32 pageRVA; u32 blockSz; } RelocBlock;
 
 /* ── The loader function ──────────────────────────────────────────────────── */
 
-__attribute__((noinline))
+/* Place rfl_loader and its sentinel in a dedicated named COMDAT section.
+ * This makes the objcopy --only-section='.text$rfl_loader' extraction
+ * reliable and independent of any other code in this translation unit. */
+#define RFL_SECTION __attribute__((section(".text$rfl_loader"), noinline))
+
+RFL_SECTION
 DWORD WINAPI rfl_loader(RflData *pData)
 {
     u8  *raw   = pData->pRawPE;
@@ -216,6 +229,7 @@ DWORD WINAPI rfl_loader(RflData *pData)
     return 0;
 }
 
-/* Sentinel so we can measure the size of rfl_loader in the .text section */
-__attribute__((noinline))
+/* Sentinel — also placed in the same section so the extracted binary ends
+ * exactly at the byte boundary of the function, not at the end of .text. */
+RFL_SECTION
 void rfl_loader_end(void) {}

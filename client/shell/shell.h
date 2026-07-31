@@ -14,7 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
-#include "../tls/tls_client.h"
+#include "../../tls/tls_client.h"
 
 #ifdef __cplusplus
 extern "C" {

