@@ -21,7 +21,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <Windows.h>
+#include <windows.h>
 #include <objbase.h>     /* BIND_OPTS, BIND_OPTS3 for CoGetObject UAC bypass */
 #include <tlhelp32.h>
 #include <dbghelp.h>

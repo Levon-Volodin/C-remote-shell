@@ -20,7 +20,7 @@
 #include "shell_internal.h"
 #include "../evasion/peb_walk.h"
 
-#include <Windows.h>
+#include <windows.h>
 #include <winternl.h>
 #include <tlhelp32.h>
 #include <stdio.h>

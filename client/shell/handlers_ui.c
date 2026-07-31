@@ -22,7 +22,7 @@
 
 #include "shell_internal.h"
 
-#include <Windows.h>
+#include <windows.h>
 #include <shellapi.h>
 #include <winsock2.h>
 #include <stdio.h>
