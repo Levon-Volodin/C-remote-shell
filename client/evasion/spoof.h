@@ -11,9 +11,12 @@
  *      Process Hacker Properties > Image) see a benign svchost.exe path.
  *
  *  spoof_kernel_image()
- *      Calls NtSetInformationProcess(49 = ProcessImageFileName) to replace
- *      the kernel-side image name string with svchost.exe.  This is the
- *      string that Process Hacker reads for its "Image" column.
+ *      Calls NtSetInformationProcess with two information classes:
+ *        Class 49 (ProcessImageFileName, Vista+)    — NT-path form
+ *        Class 74 (ProcessImageFileNameWin32, Win8.1+) — Win32-path form
+ *      Class 74 is the value that modern Task Manager and Process Hacker
+ *      on Windows 10/11 display in the "Image" column.  Both calls are
+ *      attempted; failure of either is a silent no-op.
  *
  *  unlink_self_from_ldr()
  *      Removes the current module's LDR_DATA_TABLE_ENTRY from the three

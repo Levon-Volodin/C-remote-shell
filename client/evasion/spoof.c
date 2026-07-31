@@ -51,13 +51,28 @@ void spoof_peb(void)
 
 /* ── spoof_kernel_image ──────────────────────────────────────────────────── */
 /*
- * Calls NtSetInformationProcess with information class 49
- * (ProcessImageFileName / ProcessImageFileNameWin32) to replace the
- * kernel-side image-name string.  This is the value that Process Hacker
- * reads for its "Image" column via NtQueryInformationProcess.
+ * Replaces the kernel-side process image name visible to inspection tools.
  *
- * Works on Vista+, user-mode only.  Silently returns on failure.
+ * Two information classes are set via NtSetInformationProcess:
+ *
+ *   Class 49  ProcessImageFileName  (Vista+)
+ *     Updates the UNICODE_STRING stored in the kernel's OBJECT_NAME_INFORMATION
+ *     for this process.  Read by older Process Hacker builds and Sysinternals
+ *     tools via NtQueryInformationProcess(ProcessImageFileName).
+ *
+ *   Class 74  ProcessImageFileNameWin32  (Win8.1+ / Win10+)
+ *     Updates the Win32-path form of the image name.  This is the string that
+ *     modern Process Hacker (4.x), Process Explorer, and Task Manager on
+ *     Windows 10/11 display in their "Image" / "Image Name" column.
+ *     On older Windows the call is silently ignored by the kernel.
+ *
+ * Both calls are attempted independently; failure of either is a silent no-op
+ * so the function degrades gracefully on any Windows version from Vista to 11.
  */
+
+/* ProcessImageFileNameWin32 — available from Win 8.1 / Server 2012 R2 */
+#define ProcessImageFileNameWin32  74
+
 void spoof_kernel_image(void)
 {
     typedef NTSTATUS (NTAPI *NtSetInfoProcess_t)(HANDLE, ULONG, PVOID, ULONG);
@@ -69,14 +84,20 @@ void spoof_kernel_image(void)
         GetProcAddress(hNtdll, "NtSetInformationProcess");
     if (!pNtSIP) return;
 
-    static WCHAR wPath[] = SPOOF_IMAGE;  /* writable; kernel may NUL-terminate */
+    /* Use a single writable buffer; kernel may NUL-terminate in-place */
+    static WCHAR wPath[] = SPOOF_IMAGE;
     UNICODE_STRING us;
     us.Length        = (USHORT)(wcslen(wPath) * sizeof(WCHAR));
     us.MaximumLength = us.Length + sizeof(WCHAR);
     us.Buffer        = wPath;
 
-    /* class 49 = ProcessImageFileName */
+    /* Class 49 — Vista+: NT-path form (e.g. \Device\HarddiskVolume3\...) */
     pNtSIP(GetCurrentProcess(), 49, &us, (ULONG)sizeof(us));
+
+    /* Class 74 — Win8.1+/Win10+: Win32-path form (C:\...).
+     * Modern Task Manager and Process Hacker on Windows 10/11 read this
+     * class; class 49 alone is insufficient on those builds.             */
+    pNtSIP(GetCurrentProcess(), ProcessImageFileNameWin32, &us, (ULONG)sizeof(us));
 }
 
 
