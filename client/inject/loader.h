@@ -8,7 +8,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <Windows.h>
+#include <windows.h>
 
 /*
  * RflData — passed as the thread argument to the reflective loader.
