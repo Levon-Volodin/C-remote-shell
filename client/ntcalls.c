@@ -21,17 +21,23 @@ ULONG g_hardErrorResponse = 0;
 
 /* ── ntcalls_load ───────────────────────────────────────────────────────── */
 
-HMODULE ntcalls_load(void)
+BOOL ntcalls_load(void)
 {
-    HMODULE hNtdll = LoadLibraryW(L"ntdll.dll");
-    if (!hNtdll) return NULL;
+    /* ntdll is always already mapped — GetModuleHandle avoids bumping the
+     * reference count (no matching FreeLibrary needed).                   */
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return FALSE;
 
     RtlAdjustPrivilege    = (PVOID)GetProcAddress(hNtdll, "RtlAdjustPrivilege");
     NtShutdownSystem      = (PVOID)GetProcAddress(hNtdll, "NtShutdownSystem");
     NtSetSystemPowerState = (PVOID)GetProcAddress(hNtdll, "NtSetSystemPowerState");
     NtRaiseHardError      = (PVOID)GetProcAddress(hNtdll, "NtRaiseHardError");
 
-    return hNtdll;
+    if (!RtlAdjustPrivilege || !NtShutdownSystem ||
+        !NtSetSystemPowerState || !NtRaiseHardError)
+        return FALSE;
+
+    return TRUE;
 }
 
 

@@ -55,6 +55,10 @@ static BOOL  _gcm_encrypt      (const BYTE *pKey,  const BYTE *pPlain, DWORD cbP
                                  BYTE **ppOut, DWORD *pcbOut);
 static BOOL  _gcm_decrypt      (const BYTE *pKey,  const BYTE *pCipher, DWORD cbCipher,
                                  BYTE **ppOut, DWORD *pcbOut);
+static BOOL  _gcm_encrypt_ctx  (PTLS_CONTEXT pCtx, const BYTE *pPlain, DWORD cbPlain,
+                                 BYTE **ppOut, DWORD *pcbOut);
+static BOOL  _gcm_decrypt_ctx  (PTLS_CONTEXT pCtx, const BYTE *pCipher, DWORD cbCipher,
+                                 BYTE **ppOut, DWORD *pcbOut);
 static BOOL  _hmac_sha256      (const BYTE *pKey, DWORD cbKey,
                                  const BYTE *pMsg, DWORD cbMsg,
                                  BYTE *pOut /*[32]*/);

