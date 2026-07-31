@@ -188,16 +188,65 @@ On startup (before the C2 connect loop), the agent:
 The running copy is then `RuntimeBroker.exe` in `%TEMP%`, which is harder to
 associate with the drop path.
 
-### 4. Shellcode injection evasion (`client/inject.c`)
+### 4. IAT-free resolution (`client/peb_walk.c`)
 
-- Uses `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtProtectVirtualMemory`,
-  `NtCreateThreadEx` directly — avoids the high-signal `VirtualAllocEx` /
-  `CreateRemoteThread` Win32 wrappers that EDR products hook.
+`GetModuleHandleA`, `GetProcAddress`, and `LoadLibraryA` are high-signal
+imports that every EDR product monitors.  The agent avoids placing them in
+its IAT entirely by resolving all sensitive symbols at runtime through a
+direct PEB walk.
+
+| Function | What it does |
+|---|---|
+| `peb_get_module(hash)` | Walks `PEB→Ldr→InMemoryOrderModuleList`, returns the base address of the module whose lowercase name matches a ROR13-DJB2 hash. |
+| `peb_get_export(base, hash)` | Walks the PE export directory of a loaded module and returns the VA of the export whose lowercase name matches the hash. |
+| `peb_hash_str(s)` | Runtime ROR13-DJB2 hash of an ASCII string (same algorithm used by Metasploit and Cobalt Strike beacon stubs). |
+
+Pre-computed constants (`HASH_NTDLL`, `HASH_KERNEL32`) avoid any string
+literals for the most-watched module names.
+
+### 5. Direct syscalls — Hell's Gate / Halo's Gate (`client/syscall.c`)
+
+Even after `unhook_ntdll()` restores clean stubs, an EDR can re-hook at any
+time.  The direct-syscall layer bypasses the ntdll layer completely:
+
+**Hell's Gate (clean stub):**
+```
+[+0]  4C 8B D1        mov  r10, rcx
+[+3]  B8 XX XX XX XX  mov  eax, <SSN>   ← SSN read here
+[+8]  ...
+[+11] 0F 05           syscall
+[+13] C3              ret
+```
+`sc_init()` reads the 4-byte SSN at offset `+4` of each ntdll stub directly.
+
+**Halo's Gate (hooked stub):**
+If byte `[+0]` is `0xE9` (a `JMP` — an EDR hook), the SSN cannot be read.
+Adjacent stubs have consecutive SSNs, so the code scans neighbouring stubs
+at ±32-byte intervals and derives the target SSN as `SSN[neighbour] ± delta`.
+
+| Symbol | SC_ID | Description |
+|---|---|---|
+| `NtAllocateVirtualMemory` | `SSN_NtAllocateVirtualMemory` | Allocate memory in a remote process |
+| `NtWriteVirtualMemory` | `SSN_NtWriteVirtualMemory` | Write shellcode into the allocation |
+| `NtProtectVirtualMemory` | `SSN_NtProtectVirtualMemory` | Flip RW → RX after write |
+| `NtCreateThreadEx` | `SSN_NtCreateThreadEx` | Start the remote thread |
+| `NtReadVirtualMemory` | `SSN_NtReadVirtualMemory` | Read remote process memory |
+| `NtClose` | `SSN_NtClose` | Close handles |
+
+`sc_init()` is called once at startup (after `unhook_ntdll()`) and stores
+all resolved SSNs.  Inline wrapper functions (`SC_NtAllocateVirtualMemory`,
+etc.) provide drop-in replacements matching the standard Nt* signatures.
+
+### 6. Shellcode injection evasion (`client/inject.c`)
+
+- All NT calls go through the direct-syscall trampolines from `syscall.c` —
+  no `GetProcAddress`, no `VirtualAllocEx`, no `CreateRemoteThread` in the
+  import table.
 - Two-phase memory permissions: **RW** (write shellcode) → **RX** (execute). No
   RWX pages ever exist.
 - `NtCreateThreadEx` called with `HideFromDebugger` flag.
 
-### 5. Obfuscated sleep (`obfuscate_sleep`)
+### 7. Obfuscated sleep (`obfuscate_sleep`)
 
 During reconnect delays the agent XOR-scrambles all private RX pages so memory
 scanners see only ciphertext. Falls back to plain `Sleep()` on `BCryptGenRandom`
