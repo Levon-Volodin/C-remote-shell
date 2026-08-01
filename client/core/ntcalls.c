@@ -54,10 +54,10 @@ BOOL ntcalls_load(void)
 BOOL ntcalls_verify(void)
 {
     /* All four pointers must have resolved */
-    if (!RtlAdjustPrivilege)    return 0xDEAD1;
-    if (!NtShutdownSystem)      return 0xDEAD2;
-    if (!NtSetSystemPowerState) return 0xDEAD3;
-    if (!NtRaiseHardError)      return 0xDEAD4;
+    if(!RtlAdjustPrivilege)    return 0xDEAD1;
+    if(!NtShutdownSystem)      return 0xDEAD2;
+    if(!NtSetSystemPowerState) return 0xDEAD3;
+    if(!NtRaiseHardError)      return 0xDEAD4;
 
     /*
      * Attempt to acquire SeShutdownPrivilege (privilege index 19).
