@@ -10,6 +10,7 @@
  *
  * All four layers are performed inside tls_connect() before any shell
  * traffic flows, mirroring the Megaploit C2 listener.py handshake sequence.
+ * == THIS SOURCE CODE IS OBSOLETE ==
  */
 
 #include "definitions.h"
