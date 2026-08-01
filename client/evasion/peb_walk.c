@@ -114,43 +114,26 @@ PVOID peb_get_module(DWORD nameHash)
 
 /* ── peb_get_export ─────────────────────────────────────────────────────── */
 /*
- * Pivot-scan export name table.
+ * Walk the PE export name table and return the VA of the export whose
+ * lowercase name hashes to `nameHash`.  Returns NULL if not found or if
+ * the entry is a forwarder.
  *
- * Design rationale:
- *   A pure binary search over the lex-sorted name table requires the search
- *   key to be comparable in the same order as the data.  We only have the
- *   hash of the target name, not the name itself, so we cannot determine
- *   binary-search direction without also hashing the pivot.  Hash values are
- *   not monotonic with respect to lex order, so they cannot guide direction.
+ * Why a full linear scan (not skip/binary):
+ *   The export name table is sorted lexicographically by the linker, but
+ *   our hash values are a seeded non-linear transform of those names.
+ *   There is no monotonic relationship between hash values and table order,
+ *   so hash values cannot guide a binary or skip search — any attempt to use
+ *   `h < nameHash` to move a segment pointer will mis-navigate and miss
+ *   entries.  A full O(n) scan over ~2500 ntdll entries is ~10 µs and is
+ *   called only a handful of times at startup; correctness outweighs the
+ *   negligible speed difference.
  *
- *   Instead we use a pivot-halving scan:
- *     1. Pre-hash all export names into a fixed-size stack array (DWORD per
- *        name, max HASH_TABLE_MAX entries).  For large tables (ntdll ~2500
- *        names) we hash only every Kth name as a skip-table, then linear-scan
- *        the identified segment.  The resulting code shape — a skip loop
- *        followed by a segment scan — is structurally distinct from the
- *        classic 0..NumberOfNames sequential scan that EDR memory patterns
- *        target.
- *
- *     2. Within the segment, compare DWORD hashes rather than strings.  The
- *        equality test never touches name string bytes for the non-matching
- *        entries, so no sequential memcmp/strcmp pattern arises.
- *
- * Skip factor K = sqrt(NumberOfNames), chosen so:
- *   •  Skip loop: O(sqrt(n)) hash calls to identify the right segment.
- *   •  Segment scan: O(sqrt(n)) hash calls to find the entry.
- *   •  Total: O(sqrt(n)) — faster than O(n) for ntdll (~50 vs 2500 iterations).
- *   •  Stack: only SKIP_MAX DWORDs = 256 bytes maximum.  Safe.
+ * EDR evasion note:
+ *   The loop body compares DWORD hashes rather than strings, so no
+ *   sequential strcmp/memcmp pattern arises in the hot path.  The
+ *   characteristic "walk AddressOfNames and call GetProcAddress" IAT
+ *   pattern is absent because we never call GetProcAddress.
  */
-
-/* Integer square root (Newton's method, integer arithmetic) */
-static DWORD _isqrt(DWORD n)
-{
-    if (n == 0) return 0;
-    DWORD x = n, y = (n + 1) >> 1;
-    while (y < x) { x = y; y = (x + n / x) >> 1; }
-    return x;
-}
 
 /* Resolve a name-table index to a function VA; returns NULL for forwarders */
 static PVOID _resolve_idx(const BYTE *base, const DWORD *funcs,
@@ -159,7 +142,7 @@ static PVOID _resolve_idx(const BYTE *base, const DWORD *funcs,
 {
     DWORD funcRva = funcs[ordinals[idx]];
     if (funcRva >= expRva && funcRva < expRva + expSize)
-        return NULL;   /* forwarder */
+        return NULL;   /* forwarder — not a direct VA */
     return (PVOID)(base + funcRva);
 }
 
@@ -181,52 +164,16 @@ PVOID peb_get_export(PVOID moduleBase, DWORD nameHash)
 
     IMAGE_EXPORT_DIRECTORY *exp = (IMAGE_EXPORT_DIRECTORY *)(base + expRva);
 
-    DWORD        *names    = (DWORD *)(base + exp->AddressOfNames);
-    WORD         *ordinals = (WORD  *)(base + exp->AddressOfNameOrdinals);
-    DWORD        *funcs    = (DWORD *)(base + exp->AddressOfFunctions);
-    DWORD         nNames   = exp->NumberOfNames;
+    DWORD *names    = (DWORD *)(base + exp->AddressOfNames);
+    WORD  *ordinals = (WORD  *)(base + exp->AddressOfNameOrdinals);
+    DWORD *funcs    = (DWORD *)(base + exp->AddressOfFunctions);
+    DWORD  nNames   = exp->NumberOfNames;
 
     if (nNames == 0) return NULL;
 
-    /*
-     * Phase 1 — skip-table scan.
-     * Step through every K-th entry, hashing only that name.
-     * Identify the segment [seg_start, seg_end) that must contain the target.
-     *
-     * K = sqrt(nNames), clamped to [2, 64].
-     */
-    DWORD K = _isqrt(nNames);
-    if (K < 2)  K = 2;
-    if (K > 64) K = 64;
-
-    DWORD seg_start = 0;
-    DWORD seg_end   = nNames;
-
-    /* Walk skip-table: entries 0, K, 2K, 3K, … */
-    for (DWORD i = 0; i < nNames; i += K) {
-        DWORD h = peb_hash_str((const char *)(base + names[i]));
-        if (h == nameHash)
-            return _resolve_idx(base, funcs, ordinals, i, expRva, expSize);
-        /* Record last skip-entry whose hash <= nameHash as segment start.
-         * We use DWORD unsigned comparison which is consistent within a run
-         * because both sides use the same per-run seed. */
-        if (h < nameHash)
-            seg_start = i;
-        else {
-            seg_end = i + K;
-            if (seg_end > nNames) seg_end = nNames;
-            break;
-        }
-    }
-
-    /*
-     * Phase 2 — segment scan.
-     * Linear scan within [seg_start, seg_end), comparing DWORD hashes.
-     * The segment is at most K+1 entries wide.
-     */
-    for (DWORD i = seg_start; i < seg_end; i++) {
-        DWORD h = peb_hash_str((const char *)(base + names[i]));
-        if (h == nameHash)
+    /* Linear scan — hash each export name and compare to nameHash */
+    for (DWORD i = 0; i < nNames; i++) {
+        if (peb_hash_str((const char *)(base + names[i])) == nameHash)
             return _resolve_idx(base, funcs, ordinals, i, expRva, expSize);
     }
 

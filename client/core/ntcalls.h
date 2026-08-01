@@ -90,23 +90,38 @@ extern ULONG g_hardErrorResponse;
 /*
  * ntcalls_load
  * ------------
- * Resolves all NT function pointers from ntdll.dll via GetProcAddress.
- * Returns TRUE on success, FALSE if ntdll could not be loaded or any
- * pointer failed to resolve.
+ * Resolves all four NT function pointers from ntdll via PEB walk.
  * Must be called before ntcalls_verify() or any of the NT functions.
+ *
+ * Return value (DWORD — troubleshooting bitmask):
+ *   0xFF  all four functions resolved successfully
+ *   0x00  ntdll.dll not found in PEB (should never happen)
+ *   bit 0 (0x01) – RtlAdjustPrivilege    not exported by ntdll
+ *   bit 1 (0x02) – NtShutdownSystem      not exported by ntdll
+ *   bit 2 (0x04) – NtSetSystemPowerState not exported by ntdll
+ *   bit 3 (0x08) – NtRaiseHardError      not exported by ntdll
+ *   Multiple missing exports are OR'd; 0x0F = all four missing.
+ * Quick pass/fail: (ntcalls_load() == 0xFF)
  */
-BOOL ntcalls_load(void);
+DWORD ntcalls_load(void);
 
 /*
  * ntcalls_verify
  * --------------
- * Checks that all four NT function pointers are non-NULL, then attempts
- * to acquire SeShutdownPrivilege (non-fatal if it fails — the shell will
- * still work; only forceOff/blueScreen require it at call-time).
+ * Checks all four NT function pointers are non-NULL, then calls
+ * RtlAdjustPrivilege(19) to acquire SeShutdownPrivilege.
  *
- * Returns TRUE if all pointers resolved, FALSE if any is missing.
+ * Return value (DWORD — troubleshooting bitmask):
+ *   0x00  all checks passed (pointers valid, privilege acquired)
+ *   bit 0 (0x01) – RtlAdjustPrivilege    is NULL
+ *   bit 1 (0x02) – NtShutdownSystem      is NULL
+ *   bit 2 (0x04) – NtSetSystemPowerState is NULL
+ *   bit 3 (0x08) – NtRaiseHardError      is NULL
+ *   bit 4 (0x10) – RtlAdjustPrivilege returned non-STATUS_SUCCESS
+ *                  (SeShutdownPrivilege denied; forceOff/blueScreen will fail)
+ *   Multiple failures are OR'd; 0x00 is the only fully-passing result.
  */
-BOOL ntcalls_verify(void);
+DWORD ntcalls_verify(void);
 
 #ifdef __cplusplus
 }
