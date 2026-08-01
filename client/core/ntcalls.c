@@ -37,10 +37,14 @@ BOOL ntcalls_load(void)
     NtSetSystemPowerState = (PVOID)peb_get_export(hNtdll, peb_hash_str("NtSetSystemPowerState"));
     NtRaiseHardError      = (PVOID)peb_get_export(hNtdll, peb_hash_str("NtRaiseHardError"));
 
-    if (!RtlAdjustPrivilege || !NtShutdownSystem ||
+    /*if (!RtlAdjustPrivilege || !NtShutdownSystem || // #this comment out is being debugged, will be cleaned up when resolved
         !NtSetSystemPowerState || !NtRaiseHardError)
-        return FALSE;
-
+        return FALSE;*/
+    if(!RtlAdjustPrivilege)     return 0xBEEF1;
+    if(!NtShutdownSystem)       return 0xBEEF2;
+    if(!NtSetSystemPowerState)  return 0xBEEF3;
+    if(!NtRaiseHardError)       return 0xBEEF4;
+  
     return TRUE;
 }
 
@@ -50,10 +54,10 @@ BOOL ntcalls_load(void)
 BOOL ntcalls_verify(void)
 {
     /* All four pointers must have resolved */
-    if (!RtlAdjustPrivilege)    return FALSE;
-    if (!NtShutdownSystem)      return FALSE;
-    if (!NtSetSystemPowerState) return FALSE;
-    if (!NtRaiseHardError)      return FALSE;
+    if (!RtlAdjustPrivilege)    return 0xDEAD1;
+    if (!NtShutdownSystem)      return 0xDEAD2;
+    if (!NtSetSystemPowerState) return 0xDEAD3;
+    if (!NtRaiseHardError)      return 0xDEAD4;
 
     /*
      * Attempt to acquire SeShutdownPrivilege (privilege index 19).
