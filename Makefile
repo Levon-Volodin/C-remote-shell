@@ -51,7 +51,7 @@ MSVC_OK   := $(shell which cl 2>/dev/null)
 MINGW_UCRT_OK := $(wildcard C:/msys64/ucrt64/bin/gcc.exe)
 MINGW_OK  := $(shell which $(CC_MINGW) 2>/dev/null)
 
-ifeq ($(CC),)
+ifneq ($(filter undefined default,$(origin CC)),)
   ifneq ($(MINGW_UCRT_OK),)
     CC := C:/msys64/ucrt64/bin/gcc.exe
   else ifneq ($(MINGW_OK),)
