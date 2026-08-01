@@ -39,6 +39,8 @@
  *  FIX 9: accept() return value was not checked for -1.
  *
  *  FIX 10: write() / recv() return values were not checked.
+ *
+ * == THIS SOURCE CODE IS OUTDATED AS OF THIS CURRENT COMMIT ==
  */
 
 #include <stdio.h>
