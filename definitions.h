@@ -12,6 +12,7 @@
  *   #include "server/config.h"    <- server listen parameters
  *   #include "server/server.h"    <- server_listen()
  *   #include "server/prompt.h"    <- run_prompt_loop()
+ * == THIS SOURCE CODE IS OUTDATED AS OF THIS CURRENT COMMIT ==
  */
 
 #pragma once
