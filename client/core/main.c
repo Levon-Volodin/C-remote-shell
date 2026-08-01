@@ -280,6 +280,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         case 0xBEEF4:
             return 0xEEB4;
             break;
+        case 0x01:
+            return 0xEEB5;
+            break;
         default:
             break;
     }
