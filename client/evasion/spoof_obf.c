@@ -54,7 +54,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <Windows.h>
 #include <winternl.h>
 #include <string.h>
 #include <stddef.h>
