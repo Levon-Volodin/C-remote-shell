@@ -372,14 +372,14 @@ else
   ifneq ($(LOADER_CC),)
     # LOADER_CC found — real regeneration rule
     $(LOADER_BLOB): client/inject/loader.c client/inject/loader.h
- python tools/gen_loader_blob.py --cc "$(LOADER_CC)"
- @echo "[+] Loader blob regenerated: $(LOADER_BLOB)"
+	python tools/gen_loader_blob.py --cc "$(LOADER_CC)"
+    @echo "[+] Loader blob regenerated: $(LOADER_BLOB)"
 
     blob: client/inject/loader.c client/inject/loader.h
- python tools/gen_loader_blob.py --cc "$(LOADER_CC)"
+		python tools/gen_loader_blob.py --cc "$(LOADER_CC)"
 
     blob-verify:
-	python tools/gen_loader_blob.py --cc "$(LOADER_CC)" --verify
+		python tools/gen_loader_blob.py --cc "$(LOADER_CC)" --verify
 
   else
     # No LOADER_CC — use the committed blob, print a notice
