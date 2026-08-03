@@ -119,17 +119,21 @@ static int g_stub_stride = STUB_STRIDE_DEFAULT;
 
 /* Names we need to resolve — must match SC_ID order */
 static const char * const sc_names[SC_COUNT] = {
-    "NtAllocateVirtualMemory",   /* SSN_NtAllocateVirtualMemory  = 0 */
-    "NtWriteVirtualMemory",      /* SSN_NtWriteVirtualMemory     = 1 */
-    "NtProtectVirtualMemory",    /* SSN_NtProtectVirtualMemory   = 2 */
-    "NtCreateThreadEx",          /* SSN_NtCreateThreadEx         = 3 */
-    "NtClose",                   /* SSN_NtClose                  = 4 */
-    "NtReadVirtualMemory",       /* SSN_NtReadVirtualMemory      = 5 */
-    "NtCreateSection",           /* SSN_NtCreateSection          = 6 */
-    "NtMapViewOfSection",        /* SSN_NtMapViewOfSection       = 7 */
-    "NtUnmapViewOfSection",      /* SSN_NtUnmapViewOfSection     = 8 */
-    "NtOpenFile",                /* SSN_NtOpenFile               = 9 */
+    "NtAllocateVirtualMemory",   /* SSN_NtAllocateVirtualMemory  = 0  */
+    "NtWriteVirtualMemory",      /* SSN_NtWriteVirtualMemory     = 1  */
+    "NtProtectVirtualMemory",    /* SSN_NtProtectVirtualMemory   = 2  */
+    "NtCreateThreadEx",          /* SSN_NtCreateThreadEx         = 3  */
+    "NtClose",                   /* SSN_NtClose                  = 4  */
+    "NtReadVirtualMemory",       /* SSN_NtReadVirtualMemory      = 5  */
+    "NtCreateSection",           /* SSN_NtCreateSection          = 6  */
+    "NtMapViewOfSection",        /* SSN_NtMapViewOfSection       = 7  */
+    "NtUnmapViewOfSection",      /* SSN_NtUnmapViewOfSection     = 8  */
+    "NtOpenFile",                /* SSN_NtOpenFile               = 9  */
     "NtDelayExecution",          /* SSN_NtDelayExecution         = 10 */
+    "NtOpenProcess",             /* SSN_NtOpenProcess            = 11 */
+    "NtQuerySystemInformation",  /* SSN_NtQuerySystemInformation = 12 */
+    "NtQueryVirtualMemory",      /* SSN_NtQueryVirtualMemory     = 13 */
+    "NtFreeVirtualMemory",       /* SSN_NtFreeVirtualMemory      = 14 */
 };
 
 /* (no pre-computed hash table — SSNs are resolved at runtime by sc_init) */

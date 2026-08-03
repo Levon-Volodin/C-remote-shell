@@ -46,8 +46,25 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+
+/* Write all bytes in buf to fd, retrying on short writes (EINTR / partial).
+ * Returns 0 on success, -1 on hard error (EPIPE, ECONNRESET, etc.).       */
+static int write_all(int fd, const char *buf, size_t n)
+{
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = write(fd, buf + sent, n - sent);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        sent += (size_t)w;
+    }
+    return 0;
+}
 
 /* Helper: read the full response from the client into buf[0..RESP_BUF_SIZE-1].
  * Returns the total number of bytes received, or -1 on hard error.
@@ -104,7 +121,9 @@ void run_prompt_loop(int clientFd, const struct sockaddr_in *clientAddr)
         size_t cmdLen = strlen(buffer);
         if (cmdLen == 0) continue;
 
-        if (write(clientFd, buffer, cmdLen) < 0) { /* FIX 4 */
+        /* FIX 10: use write_all() so a partial write does not silently
+         * truncate the command sent to the agent.                           */
+        if (write_all(clientFd, buffer, cmdLen) < 0) {
             perror("write");
             break;
         }

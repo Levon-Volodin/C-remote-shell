@@ -39,8 +39,10 @@ def _obfuscate(raw_key: bytes) -> bytes:
 
 
 def _to_c_bytes_literal(data: bytes) -> str:
-    """Convert bytes to a C initialiser list string: {\\xAA,\\xBB,...}"""
-    return "{" + ",".join(f"\\x{b:02X}" for b in data) + "}"
+    """Convert bytes to a C initialiser list string: {0xAA,0xBB,...}
+    Use 0xNN hex integers rather than \\xNN escape sequences so the value
+    survives the make $(shell ...) / sh / compiler quoting chain unchanged."""
+    return "{" + ",".join(f"0x{b:02X}" for b in data) + "}"
 
 
 def _embed_flag(hex_key: str) -> str:
@@ -66,8 +68,8 @@ def _embed_flag(hex_key: str) -> str:
     literal = _to_c_bytes_literal(obf)
 
     # MSVC uses /D, MinGW/GCC uses -D; the Makefile uses -D so we emit that.
-    # The literal must be wrapped in double-quotes for the shell, but make
-    # already handles quoting when it calls $(shell ...).
+    # The literal uses 0xNN integers (no backslashes) so it survives the
+    # make $(shell ...) / sh quoting chain without any escaping needed.
     return f'-DSECRET_KEY_BYTES="{literal}"'
 
 

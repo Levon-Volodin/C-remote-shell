@@ -19,11 +19,16 @@
 #include "prompt.h"
 #include <stdio.h>
 #include <unistd.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
 int main(void)
 {
+    /* Ignore SIGPIPE so that write() to a disconnected agent socket returns
+     * EPIPE rather than terminating the server process with no diagnostic. */
+    signal(SIGPIPE, SIG_IGN);
+
     int                listenFd = -1;
     int                clientFd = -1;
     struct sockaddr_in clientAddr;

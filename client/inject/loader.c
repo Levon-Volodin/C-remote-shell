@@ -120,14 +120,23 @@ DWORD WINAPI rfl_loader(RflData *pData)
     u32  rawSz = pData->rawSize;
 
     /* ── 1. Parse PE headers ─────────────────────────────────────────── */
+    /* Minimum DOS header size is 64 bytes (e_lfanew at offset 0x3C).    */
+    if (rawSz < 64) return 1;
     Dos     *dos  = (Dos *)raw;
-    u8      *nth  = raw + dos->e_lfanew;
+    u32      lfanew = dos->e_lfanew;
+    /* PE signature + FileHeader + minimal OptionalHeader (2-byte magic) */
+    if (lfanew + 4 + sizeof(FileHdr) + 2 > rawSz) return 1;
+    u8      *nth  = raw + lfanew;
     FileHdr *fh   = (FileHdr *)(nth + 4);
     Opt64   *oh   = (Opt64  *)((u8 *)fh + sizeof(FileHdr));
+    if (lfanew + 4 + sizeof(FileHdr) + fh->optsz > rawSz) return 1;
     Sec     *secs = (Sec    *)((u8 *)oh + fh->optsz);
     u32  nSec  = fh->nsec;
     u64  imgSz = oh->imgsz;
     u32  hdrSz = oh->hdrsz;
+    /* Section array must also fit within the raw buffer */
+    if ((u8 *)secs + nSec * sizeof(Sec) > raw + rawSz) return 1;
+    if (hdrSz > rawSz) return 1;
 
     /* ── 2. Allocate memory for the mapped image ─────────────────────── */
     u8 *base = pData->pVirtualAlloc
@@ -143,6 +152,10 @@ DWORD WINAPI rfl_loader(RflData *pData)
     /* ── 4. Copy sections ────────────────────────────────────────────── */
     for (u32 i = 0; i < nSec; i++) {
         if (secs[i].rawsz == 0) continue;
+        /* Bounds-check: source range must fit inside the raw buffer, and
+         * destination range must fit inside the allocated image.        */
+        if ((u64)secs[i].rawoff + secs[i].rawsz > rawSz) continue;
+        if ((u64)secs[i].vaddr  + secs[i].rawsz > imgSz) continue;
         rfl_memcpy(base + secs[i].vaddr,
                    raw  + secs[i].rawoff,
                    secs[i].rawsz);
@@ -181,6 +194,11 @@ DWORD WINAPI rfl_loader(RflData *pData)
             char *dllName = (char *)(base + desc->nameRVA);
             HMODULE hDll  = (HMODULE)pData->pLoadLibraryA(dllName);
 
+            /* If the DLL couldn't be loaded skip its entire descriptor —
+             * writing NULLs into every thunk would guarantee a crash the
+             * moment any import from that DLL is called. */
+            if (!hDll) { desc++; continue; }
+
             /* OrigFirstThunk = name table (read), FirstThunk = IAT (write).
              * Both must be non-zero; skip descriptor if either is missing. */
             if (!desc->firstThunk || !desc->origFirstThunk)
@@ -199,7 +217,14 @@ DWORD WINAPI rfl_loader(RflData *pData)
                     /* Import by name — skip 2-byte hint */
                     funcName = (char *)(base + (u32)t + 2);
                 }
-                *iatThunk = (u64)pData->pGetProcAddress(hDll, funcName);
+                u64 resolved = (u64)pData->pGetProcAddress(hDll, funcName);
+                /* Only write the resolved address if non-NULL.  A NULL result
+                 * means the export no longer exists (API removed / renamed).
+                 * Leaving the thunk at its original PE value (the hint/name
+                 * RVA) is wrong but at least produces an obvious AV fault
+                 * rather than a silent null-deref at the call site.        */
+                if (resolved)
+                    *iatThunk = resolved;
                 nameThunk++;
                 iatThunk++;
             }

