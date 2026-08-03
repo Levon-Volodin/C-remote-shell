@@ -152,29 +152,64 @@ def transform(src: str, wchar_vars: list = None) -> str:
     src = RE_WCHAR_DCL.sub(sub_wchar, src)
 
     # 5. Fix refs to WCHAR vars outside their own getter bodies.
-    # Walk line by line; track brace depth, entering getter-protection when
-    # the getter signature is seen.  Count braces on the signature line too.
+    #
+    # We track brace depth and suppress substitution inside:
+    #   a) the generated _get() function bodies (they access the raw var directly)
+    #   b) any function whose name contains "init" — spoof_init_strings() owns
+    #      the raw pointer assignments and must not have them rewritten to calls
+    #
+    # A function body starts when we see a line matching /\w+\(/ at depth 0
+    # that opens a brace on the same line (or the next).  We use a simple
+    # "signature line contains known exclusion token" heuristic.
+    RE_FUNC_OPEN = re.compile(r'\b(\w+)\s*\(')
+
     for v in wchar_vars:
-        getter_start = f'static WCHAR *{v}_get(void)'
+        getter_sig  = f'static WCHAR *{v}_get(void)'
         lines2 = src.splitlines(keepends=True)
         result = []
-        in_getter = False
+        protected = False   # True while inside a body we must not rewrite
         depth = 0
+        pending_protect = False   # saw signature, waiting for opening {
         for line in lines2:
-            if getter_start in line:
-                in_getter = True
-                # Count braces ON the signature line (the { is on the same line)
-                depth = line.count('{') - line.count('}')
-                result.append(line)
-                continue
-            if in_getter:
+            # If previous line was a protected signature, this line should be {
+            if pending_protect:
+                pending_protect = False
+                if line.strip().startswith('{'):
+                    protected = True
+                    depth = line.count('{') - line.count('}')
+                    result.append(line)
+                    continue
+                # Didn't find {  — emit as-is and fall through to normal handling
+
+            # Detect entry into a protected body:
+            #   • the generated getter for this variable
+            #   • any function whose name contains "init"
+            if not protected and depth == 0:
+                m = RE_FUNC_OPEN.search(line)
+                is_protected_sig = getter_sig in line or (m and 'init' in m.group(1))
+                if is_protected_sig:
+                    if '{' in line:
+                        protected = True
+                        depth = line.count('{') - line.count('}')
+                        result.append(line)
+                        continue
+                    else:
+                        # Opening brace is on the next line
+                        pending_protect = True
+                        result.append(line)
+                        continue
+
+            if protected:
                 depth += line.count('{') - line.count('}')
                 result.append(line)
                 if depth <= 0:
-                    in_getter = False
+                    protected = False
+                    depth = 0
                 continue
-            # Outside getter — apply substitution
-            result.append(re.sub(rf'\b{v}\b(?!_get\b|\[)', f'{v}_get()', line))
+
+            # Outside protected body — apply substitution
+            # Skip raw-variable declaration lines (v followed by = or [)
+            result.append(re.sub(rf'\b{v}\b(?!_get\b|\[|\s*=)', f'{v}_get()', line))
         src = ''.join(result)
 
     # 6. Build sc_get_name() switch

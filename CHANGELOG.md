@@ -2,6 +2,210 @@
 
 ---
 
+## [Unreleased] — fix/c-agent-connect-and-hardening
+
+### Fixed — `g_key_path` wiped before reconnect reload (HIGH)
+
+**File:** `client/core/main.c` · `WinMain()`, `_agent_reconnect_loop()`
+
+`SecureZeroMemory(g_key_path, sizeof(g_key_path))` ran 100 lines before
+`load_secret_key(g_key_path, secretKey)`. In MODE B (file-based key) this
+caused a silent infinite reconnect loop — `fopen("")` always fails. Fixed by
+removing the `g_key_path` wipe entirely; only `secretKey` (the 32-byte buffer)
+is zeroed immediately after `tls_connect()` copies it.
+
+---
+
+### Fixed — `_agent_thread` same wipe-then-reload sequence (HIGH)
+
+**File:** `client/core/main.c` · `_agent_thread()`
+
+The same pattern existed in the thread entry point. Fixed as part of the
+`_agent_reconnect_loop` extraction — both `WinMain` and `_agent_thread` now
+delegate to the shared loop which never wipes `g_key_path`.
+
+---
+
+### Fixed — Infinite loop on `INVALID_SOCKET` after connect retry (HIGH)
+
+**File:** `client/core/main.c` · inner `for(;;)` retry loop
+
+`socket()` returning `INVALID_SOCKET` was logged and slept but then continued
+the loop, calling `connect()` on an invalid handle. After 3 consecutive
+`socket()` failures the inner loop now breaks out to the outer `while(1)`.
+
+---
+
+### Fixed — `g_key_path` race condition between entry points (MEDIUM)
+
+**File:** `client/core/main.c` · `resolve_key_path()`, `AgentRun()`, `DllMain()`
+
+All three write sites now acquire `g_key_path_cs` (a `CRITICAL_SECTION`
+initialised once by `_key_path_lock_init()`) before writing `g_key_path`.
+
+---
+
+### Fixed — `spoof_peb()` set `ImageBaseAddress` to a non-PE buffer (MEDIUM)
+
+**File:** `client/evasion/spoof.c`, `client/evasion/spoof_obf.c`
+
+`peb->ImageBaseAddress` was overwritten with `s_image` (a heap `WCHAR`
+string). Any subsequent `GetModuleHandleA(NULL)` returned a non-PE pointer,
+silently corrupting the reflective injector's `_read_self_pe()`. The
+overwrite is now removed entirely — `ImageBaseAddress` is left unchanged.
+`ProcessParameters->ImagePathName` still shows the spoofed path.
+
+---
+
+### Fixed — `_dump_lsass_snapshot` used wrong `SEC_IMAGE_NO_EXECUTE` constant (MEDIUM)
+
+**File:** `client/shell/handlers_lateral.c` · `_dump_lsass_snapshot()`
+
+The first snapshot attempt used `0x08000000 | 0x00400000`
+(`SEC_COMMIT | SEC_LARGE_PAGES`), not `SEC_IMAGE_NO_EXECUTE`. This generated
+a guaranteed failed kernel event before the correct fallback (`0x11000000`)
+was tried. The wrong first call is removed; only the correct constant remains.
+
+---
+
+### Fixed — `_job_kill` marked slot FREE before worker stopped writing (MEDIUM)
+
+**File:** `client/shell/shell.c` · `_job_kill()`
+
+For the threadpool path (`hTh == INVALID_HANDLE_VALUE`) the slot was freed
+immediately, creating a use-after-free window. Fixed with a `kill_pending`
+field in `_Job`: the slot is only marked `JOB_FREE` after `TerminateProcess`
+and a bounded `WaitForSingleObject` (5 s for thread handles, 500 ms for
+threadpool path). `_job_worker` checks `kill_pending` under the lock before
+writing output back into the slot.
+
+---
+
+### Fixed — `_handle_lateral_sc` spawned `cmd.exe` (OPSEC·HIGH)
+
+**File:** `client/shell/handlers_lateral.c` · `_handle_lateral_sc()`
+
+The handler called `_shell_exec(pTls, "sc \\\\... create ...")`, producing a
+Sysmon EID 1 event with full command-line arguments. Rewritten to use the SCM
+API directly (`OpenSCManagerA`, `CreateServiceA`, `StartServiceA`,
+`DeleteService`) resolved via `peb_get_export()` — no `cmd.exe`, no child
+process, no command-line telemetry.
+
+---
+
+### Fixed — `_handle_lateral_wmi` used `LoadLibraryA`/`GetProcAddress` (OPSEC·MEDIUM)
+
+**File:** `client/shell/handlers_lateral.c` · `_handle_lateral_wmi()`
+
+The handler called `LoadLibraryA("ole32.dll")` and `GetProcAddress(hOle32, ...)`
+directly, undoing the IAT hygiene of the rest of the file. Rewritten to use
+`_peb_load_library()` + `peb_get_export()` + `peb_hash_str()` for all COM
+function resolution. The strings `"ole32.dll"`, `"CoInitializeEx"` etc. no
+longer appear verbatim in the binary.
+
+---
+
+### Fixed — `getsystem` used a predictable service name (OPSEC·MEDIUM)
+
+**File:** `client/shell/handlers_lateral.c` · `_handle_getsystem()`
+
+`WinNetSvc%08lX` seeded from `GetTickCount() ^ GetCurrentProcessId()` was
+trivially matched by Sysmon EID 17 pattern rules. The prefix is now a
+more benign-looking name with the numeric suffix derived from `RDTSC` XOR'd
+into the seed, reducing static-pattern detectability.
+
+---
+
+### Fixed — Module-stomping used a single predictable candidate DLL (OPSEC·MEDIUM)
+
+**File:** `client/inject/inject.c` · `_alloc_stomped()`
+
+`xpsprint.dll` is specifically listed in threat-hunting playbooks as a
+module-stomping candidate. Replaced with a 4-entry pool
+(`xpsprint.dll`, `msls31.dll`, `tsprint.dll`, `npsm.dll`) selected randomly
+per invocation via `RDTSC`.
+
+---
+
+### Fixed — Sandbox username/hostname lists were plaintext in `.rdata` (OPSEC·LOW)
+
+**File:** `client/evasion/sandbox.c`
+
+The `_sb_usernames[]` and `_sb_hostnames[]` static arrays were `const char *`
+literals, trivially matchable by YARA. Replaced with inline `SLIT_BUF()`
+stack-decoded strings using the existing obfuscation infrastructure.
+
+---
+
+### Added — `_agent_reconnect_loop()` shared function (DESIGN)
+
+**File:** `client/core/main.c`
+
+`WinMain` and `_agent_thread` contained ~95% identical TCP/TLS/shell retry
+loops. Extracted into `static int _agent_reconnect_loop(const char *logPrefix,
+BOOL wsaCleanOnExit)`. Both callers reduced to setup + a single delegating call.
+Any future change to reconnect logic requires one edit, not two.
+
+---
+
+### Added — `client/evasion/nt_offsets.h` — canonical NT struct offset constants (DESIGN)
+
+**File:** `client/evasion/nt_offsets.h` (new)
+
+Hard-coded byte offsets for `PEB->ImageBaseAddress`, `PEB->OSBuildNumber`,
+`PEB->NtGlobalFlag`, `LDR_ENTRY->HashLinks`, `SYSTEM_PROCESS_INFORMATION->`
+`ImageName.{Length,Buffer}`, and `UniqueProcessId` appeared in seven separate
+source files. Consolidated into a single header included by `spoof.c`,
+`inject.c`, `sandbox.c`, and `sleep_obf.c`.
+
+---
+
+### Changed — Sleep obfuscation enabled by default (DESIGN)
+
+**File:** `Makefile`
+
+`SLEEP_OBF_ENABLE` was opt-in via `CFLAGS_EXTRA="-DSLEEP_OBF_ENABLE"`. The
+most impactful evasion feature should not require the operator to know a
+compile-time flag exists. Now enabled by default; opt out with `SLEEP_OBF=0`.
+
+---
+
+### Changed — Shell verb dispatcher replaced with O(1) table (DESIGN)
+
+**File:** `client/shell/shell.c`
+
+The ~700-line sequential `strncmp` if-else chain in `shell_run()` is replaced
+by a `_DispEntry` dispatch table and `_dispatch_verb()`. The table covers the
+large majority of verbs; the ~8 genuinely special-cased verbs (`ls`, `env`,
+`services`, `dns_query`, `find_files`, `tail`, `write_file`, `migrate`,
+`dll_inject`, `forceOff`, `blueScreen`, `exec_bof`, `stage_load`, `_NS`
+stubs) remain as explicit `if` blocks. All dead if-else branches (verbs
+now handled by the table) were removed — net reduction of ~270 lines.
+
+---
+
+### Fixed — `spoof_obf.c` missing `s_image_get()`/`s_cmdline_get()` (BUILD)
+
+**File:** `client/evasion/spoof.c`, `client/evasion/spoof_obf.c`
+
+`gen_obf.py` step 5 substitutes bare `s_image` references with `s_image_get()`
+calls, but because `spoof.c` uses heap pointer variables (not `static WCHAR
+arr[] = L"..."` literals), step 4 never generated the accessor functions,
+leaving dangling calls in the generated output. Added `s_image_get()` and
+`s_cmdline_get()` static inline accessors to `spoof.c`; all call-sites updated.
+
+---
+
+### Fixed — `sleep_obf.c` `peb->ImageBaseAddress` not a named field on MinGW (BUILD)
+
+**File:** `client/evasion/sleep_obf.c`
+
+MinGW's `winternl.h` `PEB` struct does not expose `ImageBaseAddress` as a named
+field. Added `#include "nt_offsets.h"` and replaced the bare field access with
+`*(PVOID *)((BYTE *)peb + PEB_ImageBaseAddress)`.
+
+---
+
 ## [Unreleased] — 2026-08-01
 
 ### Added — Runtime debugger (`client/debug/`)

