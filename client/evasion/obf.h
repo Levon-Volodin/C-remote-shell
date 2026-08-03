@@ -49,7 +49,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <Windows.h>
+#include <windows.h>
 
 /*
  * _obf_s — decode a narrow XOR-encoded blob into a caller-supplied buffer.
