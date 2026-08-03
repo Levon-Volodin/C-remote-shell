@@ -260,6 +260,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
      * runtime — the custom name will be visible in the binary but is short-lived
      * on the stack.  The default path (no override) is fully obfuscated.
      */
+    HANDLE hMutex = NULL;
     {
         char mutexName[128] = {0};
 #if MUTEX_NAME_LEN > 0
@@ -279,7 +280,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
             mutexName[_i] = rawMutex[_i];
         mutexName[mLen] = '\0';
 #endif
-        k32_CreateMutexA(NULL, FALSE, mutexName);
+        hMutex = k32_CreateMutexA(NULL, FALSE, mutexName);
         SecureZeroMemory(mutexName, sizeof(mutexName));
     }
     if (hMutex == NULL && GetLastError() != ERROR_ALREADY_EXISTS) return 0xEEB15;
